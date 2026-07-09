@@ -2271,14 +2271,40 @@ func doGetLog(sockPath, uuid string) ([]LogEntry, error) {
 // ts undo command
 // =====================================
 
-// cmdUndo jumps backward in time by one snap.
-func cmdUndo(args []string) {
+// undoArgs holds the parsed arguments for the "ts undo" command.
+type undoArgs struct {
+	command string // command to run (if -c specified)
+}
+
+// parseUndoArgs parses the arguments for "ts undo" and returns the parsed
+// values. Returns an error if the arguments are invalid. Unlike "ts go",
+// undo takes no positional arguments, so a single Getopt pass suffices:
+// parsing stops at the first non-option, which the NArgs check rejects.
+func parseUndoArgs(args []string) (*undoArgs, error) {
 	opts := getopt.New()
 	opts.SetProgram("ts undo")
-	opts.Parse(append([]string{"ts undo"}, args...))
+	opts.SetParameters("")
+	cmdFlag := opts.StringLong("command", 'c', "", "run shell command instead of interactive session")
 
+	if err := opts.Getopt(append([]string{"ts undo"}, args...), nil); err != nil {
+		return nil, err
+	}
 	if opts.NArgs() > 0 {
-		fmt.Fprintln(os.Stderr, "usage: ts undo")
+		return nil, fmt.Errorf("unexpected argument: %s", opts.Arg(0))
+	}
+
+	return &undoArgs{
+		command: *cmdFlag,
+	}, nil
+}
+
+// cmdUndo jumps backward in time by one snap.
+func cmdUndo(args []string) {
+	parsed, err := parseUndoArgs(args)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "ts undo: %v\n", err)
+		fmt.Fprintln(os.Stderr, "usage: ts undo                jump back one snap, enter new frame")
+		fmt.Fprintln(os.Stderr, "       ts undo -c 'cmd'       jump back one snap, run cmd, exit")
 		fmt.Fprintln(os.Stderr, "")
 		fmt.Fprintln(os.Stderr, "Jumps backward in time by one snap:")
 		fmt.Fprintln(os.Stderr, "1. Takes a snapshot of the current state")
@@ -2350,9 +2376,14 @@ func cmdUndo(args []string) {
 		fmt.Fprintf(os.Stderr, "warning: failed to prune history: %v\n", err)
 	}
 
-	// 7. Enter the new frame
+	// 7. Enter the new frame. With -c, run the command instead of an
+	// interactive session, mirroring ts go -c.
+	var cmdArgs []string
+	if parsed.command != "" {
+		cmdArgs = []string{"sh", "-c", parsed.command}
+	}
 	fmt.Fprintf(os.Stderr, "Undoing to snap %s...\n", prevSnap)
-	exitCode, err := runVsockSession(newUUID, nil)
+	exitCode, err := runVsockSession(newUUID, cmdArgs)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)

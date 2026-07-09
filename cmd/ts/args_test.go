@@ -108,6 +108,75 @@ func TestParseGoArgs(t *testing.T) {
 	}
 }
 
+// TestParseUndoArgs tests the argument parsing for "ts undo".
+func TestParseUndoArgs(t *testing.T) {
+	tests := []struct {
+		name    string
+		args    []string
+		wantCmd string
+		wantErr bool
+	}{
+		{
+			name:    "no args",
+			args:    []string{},
+			wantCmd: "",
+		},
+		{
+			name:    "command short flag",
+			args:    []string{"-c", "echo hello"},
+			wantCmd: "echo hello",
+		},
+		{
+			name:    "command long flag",
+			args:    []string{"--command", "echo hello"},
+			wantCmd: "echo hello",
+		},
+		{
+			name:    "command long flag with equals",
+			args:    []string{"--command=echo hello"},
+			wantCmd: "echo hello",
+		},
+		{
+			name:    "empty command string",
+			args:    []string{"-c", ""},
+			wantCmd: "",
+		},
+		{
+			name:    "stray positional arg",
+			args:    []string{"stray"},
+			wantErr: true,
+		},
+		{
+			name:    "stray positional after command",
+			args:    []string{"-c", "true", "stray"},
+			wantErr: true,
+		},
+		{
+			name:    "unknown flag",
+			args:    []string{"--unknown"},
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := parseUndoArgs(tt.args)
+			if tt.wantErr {
+				if err == nil {
+					t.Errorf("parseUndoArgs(%v) = %+v, want error", tt.args, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parseUndoArgs(%v) error = %v", tt.args, err)
+			}
+			if got.command != tt.wantCmd {
+				t.Errorf("command = %q, want %q", got.command, tt.wantCmd)
+			}
+		})
+	}
+}
+
 // TestGlobalArgsRejectSubcommandFlags tests that global argument parsing
 // rejects flags that belong to subcommands (like -c).
 func TestGlobalArgsRejectSubcommandFlags(t *testing.T) {
