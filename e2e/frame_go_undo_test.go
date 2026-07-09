@@ -509,18 +509,30 @@ func TestTsGoWithCommandToExistingFrame(t *testing.T) {
 	t.Logf("ts go goref2 -c output: %s", output)
 }
 
-// TestTsUndo tests ts undo behavior. Since ts undo enters an interactive
-// session, we test the components: it should create a new frame from the
-// previous snap. We verify by manually doing what undo does (create frame
-// from previous snap) and checking the state.
+// TestTsUndo tests that ts undo moves the session back to the previous snap:
+// it snapshots the current state, creates a new frame from the snap before
+// it, and enters that frame. The -c flag runs the verification commands
+// inside the undone frame in ONE invocation (each ts undo snapshots first
+// and creates a new frame, so a second invocation would undo a different,
+// newer state).
 func TestTsUndo(t *testing.T) {
 	env := newTestEnv(t)
 	d := startDaemon(t, env)
 
 	createFrameViaDaemon(t, d, "undotest")
 
-	// Create a marker file with state1 and snap
-	_, exitCode, err := sshExec(t, d, "root@undotest", "echo state1 > /marker")
+	// Capture the pre-undo frame UUID.
+	output, exitCode, err := sshExec(t, d, "root@undotest", "ts frame")
+	if err != nil {
+		t.Fatalf("ts frame failed: %v", err)
+	}
+	if exitCode != 0 {
+		t.Fatalf("ts frame: exit %d", exitCode)
+	}
+	preUndoUUID := strings.TrimSpace(output)
+
+	// Create a marker file with state1 and snap (this records state1)
+	_, exitCode, err = sshExec(t, d, "root@undotest", "echo state1 > /marker")
 	if err != nil {
 		t.Fatalf("create marker failed: %v", err)
 	}
@@ -528,7 +540,6 @@ func TestTsUndo(t *testing.T) {
 		t.Fatalf("create marker: exit %d", exitCode)
 	}
 
-	// Take a snapshot (this records state1)
 	snapStdout, _, exitCode, err := sshExecSplit(t, d, "root@undotest", "ts snap")
 	if err != nil {
 		t.Fatalf("ts snap failed: %v", err)
@@ -536,8 +547,7 @@ func TestTsUndo(t *testing.T) {
 	if exitCode != 0 {
 		t.Fatalf("ts snap: exit %d", exitCode)
 	}
-	snap1 := strings.TrimSpace(snapStdout)
-	t.Logf("snap1 (state1): %s", snap1)
+	t.Logf("snap (state1): %s", strings.TrimSpace(snapStdout))
 
 	// Modify to state2
 	_, exitCode, err = sshExec(t, d, "root@undotest", "echo state2 > /marker")
@@ -548,45 +558,33 @@ func TestTsUndo(t *testing.T) {
 		t.Fatalf("modify marker: exit %d", exitCode)
 	}
 
-	// Verify current state is state2 (use shell builtin, cat may not exist)
-	output, exitCode, err := sshExec(t, d, "root@undotest", "read line < /marker && echo $line")
+	// Run the real ts undo. Inside the undone frame, print its UUID and the
+	// marker content. Assert on stdout only: "Undoing to snap ..." goes to
+	// stderr, and command sessions suppress the greeting. Single quotes keep
+	// $line from being expanded before it reaches the undone frame's shell;
+	// 'read' is a shell builtin (cat may not exist in the minimal rootfs).
+	stdout, stderr, exitCode, err := sshExecSplit(t, d, "root@undotest",
+		`ts undo -c 'ts frame; read line < /marker && echo $line'`)
 	if err != nil {
-		t.Fatalf("read marker failed: %v", err)
+		t.Fatalf("ts undo -c failed: %v", err)
 	}
 	if exitCode != 0 {
-		t.Fatalf("read marker: exit %d", exitCode)
-	}
-	if !strings.Contains(output, "state2") {
-		t.Fatalf("expected marker to contain state2, got: %q", output)
+		t.Fatalf("ts undo -c: exit %d (stdout: %q, stderr: %q)", exitCode, stdout, stderr)
 	}
 
-	// Now simulate what ts undo does: create a new frame from the previous snap
-	// Extract root snap from triplet
-	snapParts := strings.SplitN(snap1, ":", 2)
-	rootSnap := snapParts[0]
-
-	// Create new frame from the snap (this is what undo does internally)
-	output, exitCode, err = sshExec(t, d, "root@undotest", "ts frame --ref=undone "+rootSnap+":nil:nil")
-	if err != nil {
-		t.Fatalf("ts frame from snap failed: %v", err)
+	fields := strings.Fields(stdout)
+	if len(fields) != 2 {
+		t.Fatalf("expected 2 stdout tokens (uuid, marker), got %d: %q", len(fields), stdout)
 	}
-	if exitCode != 0 {
-		t.Fatalf("ts frame from snap: exit %d: %s", exitCode, output)
+	undoneUUID, marker := fields[0], fields[1]
+	if len(undoneUUID) != 36 || strings.Count(undoneUUID, "-") != 4 {
+		t.Errorf("first stdout token does not look like a frame UUID: %q", undoneUUID)
 	}
-	undoneUUID := strings.TrimSpace(output)
-	t.Logf("undone frame: %s", undoneUUID)
-
-	// SSH to the undone frame and verify it has state1 (the snapped state)
-	// Use shell builtin 'read' since cat may not be available in minimal rootfs
-	output, exitCode, err = sshExec(t, d, "root@undone", "read line < /marker && echo $line")
-	if err != nil {
-		t.Fatalf("read marker in undone frame failed: %v", err)
+	if undoneUUID == preUndoUUID {
+		t.Errorf("ts undo should enter a NEW frame, but still in %s", preUndoUUID)
 	}
-	if exitCode != 0 {
-		t.Fatalf("read marker in undone: exit %d: %s", exitCode, output)
-	}
-	if !strings.Contains(output, "state1") {
-		t.Errorf("undone frame should have state1, got: %q", output)
+	if marker != "state1" {
+		t.Errorf("undone frame should have state1 in /marker, got %q", marker)
 	}
 }
 
