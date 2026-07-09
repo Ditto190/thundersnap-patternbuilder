@@ -1556,7 +1556,7 @@ func (c *controlServer) serve() {
 	}
 }
 
-// handleConn handles a single connection with vsock handshake then HTTP or vshd proxy.
+// handleConn handles a single connection with vsock handshake then HTTP control or /enter session.
 func (c *controlServer) handleConn(conn net.Conn) {
 	defer conn.Close()
 
@@ -1566,7 +1566,7 @@ func (c *controlServer) handleConn(conn net.Conn) {
 	// a "CONNECT <port>\n" / "OK <port>\n" text handshake before the real stream,
 	// so we emulate that handshake here and dispatch based on port:
 	//   - Port 5223: HTTP control protocol (snap, refs, etc.)
-	//   - Port 5222: vshd proxy (for ts go/undo from inside containers)
+	//   - Port 5224: /enter session protocol (ts go/undo from inside containers)
 	reader := bufio.NewReader(conn)
 	port, err := thunderproto.ParseConnectLine(reader)
 	if err != nil {
