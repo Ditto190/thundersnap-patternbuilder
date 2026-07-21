@@ -515,6 +515,29 @@ func setupDev(mountVsock bool) {
 		}
 		os.Remove(scratch)
 	}
+
+	// Propagate /dev/kvm into the container so nested VMs work. This is a
+	// bind mount from the host's /dev/kvm. If the host doesn't have /dev/kvm
+	// (no hardware virtualization, or running inside a container without KVM
+	// passthrough), this silently does nothing.
+	//
+	// TODO(container-isolation): When we lock down container isolation in the
+	// future, /dev/kvm access should be gated behind a capability or frame
+	// metadata flag. Giving every container direct KVM access is fine for the
+	// development/nested-thundersnap use case, but a hardened deployment would
+	// want to restrict which frames can spawn VMs. For now, this matches the
+	// --keep-dev-caps philosophy: we retain capabilities that enable nesting.
+	if _, err := os.Stat("/dev/kvm"); err == nil {
+		// Create the device node and bind-mount the host's /dev/kvm onto it.
+		// We use mknod + bind mount (like the vsock pattern) because /dev is a
+		// tmpfs, not devtmpfs, so device nodes don't appear automatically.
+		kvmPath := "/dev/kvm"
+		if err := unix.Mknod(kvmPath, unix.S_IFCHR|0666, int(unix.Mkdev(10, 232))); err != nil {
+			// Non-fatal: the bind mount below may still work if the node exists.
+			_ = err
+		}
+		_ = unix.Mount("/dev/kvm", kvmPath, "", unix.MS_BIND, "")
+	}
 }
 
 // cmdContainerInit is a minimal init process for container PID namespaces.

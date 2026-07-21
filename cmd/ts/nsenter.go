@@ -190,6 +190,22 @@ func cmdNsenterStage2(args []string) {
 	// This is the CGO-free equivalent of `fexecve(3)`: open the file, then
 	// exec via /proc/self/fd/N, which works because the kernel's exec path
 	// follows the fd to the inode, not the path.
+	//
+	// WHY THIS IS NEEDED (the "stale root dentry" problem):
+	//
+	// After setns(CLONE_NEWNS), the process's ns/mnt link points to the correct
+	// mount namespace (verified by comparing /proc/self/ns/mnt before and after).
+	// However, the process's ROOT DENTRY — the in-memory VFS dentry for "/" — is
+	// NOT updated. It still points to the root of the OLD mount namespace. Path
+	// resolution starts from this stale root, so any path that traverses a
+	// different filesystem (e.g. a btrfs subvolume boundary at /work in a nested
+	// thundersnap container) fails: the btrfs subvolume directory appears as a
+	// regular file (ENOTDIR) because the stale dentry doesn't know it's a mount
+	// point / subvolume root.
+	//
+	// The fd opened here bypasses this: the fd references the inode directly,
+	// and /proc/self/fd/<fd> is a procfs magic link that the kernel resolves
+	// through the fd table, not through the root dentry.
 	execFd, execPath := openExecutableForExec(cmdArgs[0])
 
 	// Similarly, find and open the --chroot= path before setns, so

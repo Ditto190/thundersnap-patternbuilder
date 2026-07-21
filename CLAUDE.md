@@ -20,6 +20,21 @@ experiment. Over time we need to improve the quality of all the components.
   `make e2e E2E_ARGS="-test.run=TestSSHContainerBasic" 2>&1 | tee e2e.log`
   Always log output to a file (e2e tests are verbose). Tests typically complete
   in ~30s; use a 1-2 minute timeout when waiting.
+- e2e test prerequisites (install if missing — tests will t.Fatal, not skip):
+  - `busybox-static` (NOT `busybox` — the dynamic one can't exec inside
+    nil:nil:nil frames which have no /lib64; `apt-get install busybox-static`)
+  - `virtiofsd` and `passt` for VM tests (`apt-get install virtiofsd passt`)
+  - `/dev/kvm` for VM tests (not available inside containers without KVM
+    passthrough; the outer host must propagate it)
+  - VM binaries (`cloud-hypervisor`, `vmlinux`) in `vm/` or set
+    `THUNDERSNAP_VM_DIR`
+- Running e2e tests inside a thundersnap container (nested development):
+  - Works, but requires the btrfs+setns fixes in `cmd/ts/` (see
+    `docs/nested-btrfs-setns.md` for the full explanation)
+  - The cgroup warnings (`failed to create parent cgroup`) are expected and
+    harmless — cgroup setup is best-effort and `/sys/fs/cgroup` is read-only
+    inside containers
+  - VM tests need `/dev/kvm` propagated into the container
 - This project workspace may be using the 'jj' tool instead of git. Always
   check for jj first. If using jj, when making a fix, always `jj describe` it
   when done and then `jj new` so you don't accidentally mix changes

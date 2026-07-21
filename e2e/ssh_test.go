@@ -342,10 +342,22 @@ func createFrameViaDaemon(t *testing.T, d *daemonInstance, refName string) strin
 func installBusyboxAppletInFrame(t *testing.T, d *daemonInstance, refName, applet string) {
 	t.Helper()
 
-	// Find busybox on the host.
-	busybox, err := exec.LookPath("busybox")
+	// Find busybox on the host. We prefer busybox-static over busybox because
+	// nil:nil:nil frames start as empty btrfs subvolumes with no /lib64 — a
+	// dynamically-linked busybox would fail to exec inside the container with
+	// "no such file or directory" (the kernel's ELF loader can't find the
+	// interpreter /lib64/ld-linux-x86-64.so.2, not the binary itself).
+	// busybox-static has no interpreter dependency and runs anywhere.
+	//
+	// On Debian, `apt-get install busybox-static` provides /usr/bin/busybox
+	// as a static binary. The `busybox` package provides a dynamic binary
+	// which won't work in minimal containers.
+	busybox, err := exec.LookPath("busybox-static")
 	if err != nil {
-		t.Fatalf("busybox required for this test: %v", err)
+		busybox, err = exec.LookPath("busybox")
+		if err != nil {
+			t.Fatalf("busybox required for this test (install busybox-static: %v)", err)
+		}
 	}
 	data, err := os.ReadFile(busybox)
 	if err != nil {
@@ -1261,22 +1273,35 @@ func startDaemonWithPolicy(t *testing.T, env *testEnv, policyPath string) *daemo
 
 // requireVMDeps fails the test if VM dependencies are not available.
 // e2e tests must never skip: missing VM deps is a misconfigured environment.
+//
+// VM tests require:
+//   - cloud-hypervisor and vmlinux in vm/ (or THUNDERSNAP_VM_DIR)
+//   - virtiofsd (for virtio-fs filesystem sharing)
+//   - passt (for user-space networking)
+//   - /dev/kvm (hardware virtualization — NOT available inside containers
+//     without KVM passthrough; running VM tests inside a thundersnap container
+//     requires the host to propagate /dev/kvm into the container)
 func requireVMDeps(t *testing.T) string {
 	t.Helper()
 
 	dir := vmDir()
 	if dir == "" {
-		t.Fatal("VM test requires cloud-hypervisor and vmlinux (not found in standard locations)")
+		t.Fatal("VM test requires cloud-hypervisor and vmlinux (not found in standard locations; set THUNDERSNAP_VM_DIR)")
 	}
 
 	// Also need virtiofsd and passt
 	if _, err := exec.LookPath("virtiofsd"); err != nil {
 		if _, err := os.Stat("/usr/libexec/virtiofsd"); err != nil {
-			t.Fatal("VM test requires virtiofsd")
+			t.Fatal("VM test requires virtiofsd (apt-get install virtiofsd)")
 		}
 	}
 	if _, err := exec.LookPath("passt"); err != nil {
-		t.Fatal("VM test requires passt")
+		t.Fatal("VM test requires passt (apt-get install passt)")
+	}
+	// Check for /dev/kvm — cloud-hypervisor needs hardware virtualization.
+	// This is NOT available inside containers without KVM passthrough.
+	if _, err := os.Stat("/dev/kvm"); err != nil {
+		t.Fatal("VM test requires /dev/kvm (not available inside containers without KVM passthrough)")
 	}
 
 	return dir
