@@ -472,6 +472,7 @@ func main() {
 	flagNfsPort = getopt.IntLong("nfs-port", 0, 2049, "Port for NFSv4 server")
 	testListen := getopt.StringLong("test-listen", 0, "", "Test mode: listen on this local TCP address (e.g. 127.0.0.1:2222) instead of tsnet")
 	testUser := getopt.StringLong("test-user", 0, "", "Test mode: use this identity for all SSH connections (e.g. test@example.com)")
+	testHTTPListen := getopt.StringLong("test-http-listen", 0, "", "Test mode: also serve the HTTP mux (metrics, bupdate, MCP) on this local TCP address (e.g. 127.0.0.1:7575)")
 	getopt.Parse()
 
 	// Set up the state directory now (rather than further down) since the
@@ -592,7 +593,7 @@ func main() {
 		}
 		testModeUser = *testUser
 		log.Printf("TEST MODE: listening on %s as user %q", *testListen, testModeUser)
-		runTestMode(*testListen, *stateDir)
+		runTestMode(*testListen, *testHTTPListen, *stateDir)
 		return
 	}
 
@@ -720,6 +721,10 @@ func main() {
 	// Prometheus metrics endpoint (OS-level + thundersnap counts).
 	registerMetrics(httpMux, *flagFsDir, *flagSnapsDir)
 
+	// MCP sandbox endpoint (thundersnap_bash/view/create_file/str_replace/
+	// list_frames/list_refs). See mcp.go.
+	mountMCP(httpMux)
+
 	httpServer := &http.Server{Handler: httpMux}
 	go func() {
 		log.Printf("HTTP server listening on port 7575")
@@ -782,7 +787,7 @@ func main() {
 // runTestMode runs the daemon in test mode: listening on a local TCP port
 // instead of tsnet, using testModeUser for identity. This enables e2e tests
 // to connect via SSH without a real Tailscale network.
-func runTestMode(listenAddr, stateDir string) {
+func runTestMode(listenAddr, httpListenAddr, stateDir string) {
 	// In test mode, use stateDir for the control socket instead of /run/thundersnap
 	// so each test daemon instance has its own socket path.
 	controlSocket = filepath.Join(stateDir, "control.sock")
@@ -802,6 +807,29 @@ func runTestMode(listenAddr, stateDir string) {
 
 	log.Printf("SSH server listening on %s (test mode)", listenAddr)
 
+	// Optionally serve the HTTP mux (metrics, bupdate, MCP) on a second local
+	// port. This is what gives the previously-untested HTTP handlers — and the
+	// MCP endpoint — e2e coverage. The mesh handlers are mounted with an
+	// empty-FQDN meshState (no tsnet in test mode); the tsnet-coupled ping loop
+	// is simply not started, so they serve stale/empty mesh data, which is fine
+	// for coverage purposes. The MCP and metrics/bupdate handlers are fully
+	// functional.
+	if httpListenAddr != "" {
+		httpLn, err := net.Listen("tcp", httpListenAddr)
+		if err != nil {
+			log.Fatalf("Failed to listen on %s: %v", httpListenAddr, err)
+		}
+		defer httpLn.Close()
+
+		testMux := buildTestHTTPMux()
+		go func() {
+			log.Printf("HTTP mux listening on %s (test mode)", httpListenAddr)
+			if err := (&http.Server{Handler: testMux}).Serve(httpLn); err != nil && err != http.ErrServerClosed {
+				log.Printf("HTTP server error: %v", err)
+			}
+		}()
+	}
+
 	// Create SSH server (no LocalClient needed - testModeUser is set)
 	sshServer := newSSHServer(nil)
 
@@ -815,6 +843,31 @@ func runTestMode(listenAddr, stateDir string) {
 	if err := sshServer.Serve(ln); err != nil {
 		log.Fatalf("SSH server error: %v", err)
 	}
+}
+
+// buildTestHTTPMux builds the HTTP mux used in test mode. It mirrors the
+// production httpMux for the handlers that do not require tsnet: metrics,
+// bupdate, and MCP. The mesh handlers are mounted with an empty-FQDN
+// meshState so they at least respond (the ping loop that populates them is
+// not started in test mode). This gives the existing-but-untested HTTP
+// handlers coverage alongside the MCP endpoint.
+func buildTestHTTPMux() *http.ServeMux {
+	mux := http.NewServeMux()
+
+	meshState := newMeshState("") // no FQDN in test mode
+	globalMeshState = meshState   // so the control-socket path works if hit
+	mux.HandleFunc("/ts/ping", meshState.handleTsPing)
+	mux.HandleFunc("/ts/servers.json", meshState.handleServersJSON)
+	mux.HandleFunc("/", meshState.handleIndex)
+
+	bupdateServer := &bupdateFileServer{root: *flagSnapsDir}
+	mux.Handle("/bupdate/", http.StripPrefix("/bupdate", bupdateServer))
+
+	registerMetrics(mux, *flagFsDir, *flagSnapsDir)
+
+	mountMCP(mux)
+
+	return mux
 }
 
 // newSSHServer creates an SSH server with the standard handler configuration.
