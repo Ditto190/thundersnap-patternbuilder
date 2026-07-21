@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -37,6 +38,7 @@ import (
 func cmdDropCapsAndRun(args []string) {
 	// Parse our flags manually since we need to pass remaining args to exec
 	var hostname, domainname, chrootPath string
+	var chrootFd int = -1
 	var skipMountSetup bool
 	var usePty bool
 	var mountVsock bool
@@ -59,6 +61,13 @@ func cmdDropCapsAndRun(args []string) {
 			i++
 		} else if strings.HasPrefix(args[i], "--chroot=") {
 			chrootPath = strings.TrimPrefix(args[i], "--chroot=")
+		} else if strings.HasPrefix(args[i], "--chroot-fd=") {
+			fd, err := strconv.Atoi(strings.TrimPrefix(args[i], "--chroot-fd="))
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "error: invalid --chroot-fd: %v\n", err)
+				os.Exit(1)
+			}
+			chrootFd = fd
 		} else if args[i] == "--skip-mount-setup" {
 			// Used when nsenter has already joined existing namespaces where
 			// container-init has set up mounts. We just need to chroot and drop caps.
@@ -107,15 +116,37 @@ func cmdDropCapsAndRun(args []string) {
 	// Chroot into the container rootfs if specified.
 	// This is needed both when creating new namespaces and when joining existing ones,
 	// because even after setns(CLONE_NEWNS), our root is still the host's "/".
-	if chrootPath != "" {
+	//
+	// In nested containers on btrfs, the chroot path may traverse btrfs subvolume
+	// boundaries (e.g. /work/...) that are inaccessible after setns due to a stale
+	// root dentry. When --chroot-fd is provided (opened by ts nsenter before
+	// setns), use fchdir + chroot(".") to resolve through the fd's dentry
+	// instead of the stale root.
+	if chrootFd >= 0 {
+		if err := unix.Fchdir(chrootFd); err != nil {
+			fmt.Fprintf(os.Stderr, "error: failed to fchdir to chroot fd: %v\n", err)
+			os.Exit(1)
+		}
+		if err := unix.Chroot("."); err != nil {
+			fmt.Fprintf(os.Stderr, "error: failed to chroot to . (via fd): %v\n", err)
+			os.Exit(1)
+		}
+	} else if chrootPath != "" {
 		if err := unix.Chroot(chrootPath); err != nil {
 			fmt.Fprintf(os.Stderr, "error: failed to chroot to %s: %v\n", chrootPath, err)
 			os.Exit(1)
 		}
+	}
+	if chrootFd >= 0 || chrootPath != "" {
 		if err := unix.Chdir("/"); err != nil {
 			fmt.Fprintf(os.Stderr, "error: failed to chdir to /: %v\n", err)
 			os.Exit(1)
 		}
+	}
+	// Close the chroot fd if we used it — it was opened by ts nsenter before
+	// setns and passed without O_CLOEXEC so it survived exec.
+	if chrootFd >= 0 {
+		unix.Close(chrootFd)
 	}
 
 	if !skipMountSetup {
@@ -499,6 +530,63 @@ func setupDev(mountVsock bool) {
 // 3. Writes "READY\n" to stdout to signal setup is complete
 // 4. Sits idle, waiting for stdin to close (which signals shutdown)
 // 5. As PID 1, reaps any orphaned zombie processes
+// btrfsFirstFreeObjectID is the inode number of every btrfs subvolume root
+// directory. We use it to detect btrfs subvolume boundaries without requiring
+// btrfs-specific ioctls.
+const btrfsFirstFreeObjectID = 256
+
+// bindMountSubvolumeAncestors walks the path from / to the given target and
+// bind-mounts each ancestor directory that is a btrfs subvolume root (inode
+// number 256) to itself. This creates explicit mount table entries for btrfs
+// subvolume boundaries, which are visible to processes that join the mount
+// namespace later via setns(CLONE_NEWNS). Without this, btrfs subvolume
+// directories appear as regular files to joining processes because the VFS
+// dentry cache is stale after setns.
+//
+// This is critical for nested thundersnap (frame inside a frame): the parent
+// container's /work is a btrfs subvolume, and the inner container-init's
+// nsenter path traverses /work to reach the frame rootfs.
+//
+// Failures are logged but not fatal: a failed bind mount just means the
+// subvolume traversal might not work for joining processes, which is the
+// pre-existing behavior.
+func bindMountSubvolumeAncestors(target string) {
+	// Clean the path and split into components. We walk from the root down to
+	// the target, accumulating the path.
+	target = filepath.Clean(target)
+	if !strings.HasPrefix(target, "/") {
+		return // relative path, nothing to do
+	}
+
+	// Walk from / down to the parent of target.
+	// E.g., for /work/thundersnap/.tmp-e2e/rootfs, we check:
+	// /, /work, /work/thundersnap, /work/thundersnap/.tmp-e2e
+	components := strings.Split(strings.TrimPrefix(target, "/"), "/")
+	path := ""
+	for i := 0; i < len(components); i++ {
+		path = path + "/" + components[i]
+		// Skip the target itself — it gets its own bind mount below.
+		if path == target {
+			break
+		}
+		var st unix.Stat_t
+		if err := unix.Stat(path, &st); err != nil {
+			continue // path doesn't exist, skip
+		}
+		// Check if this directory is a btrfs subvolume root (inode 256).
+		// On non-btrfs filesystems, directory inodes are rarely 256, so this
+		// is a safe heuristic. If a non-btrfs directory happens to have inode
+		// 256, bind-mounting it is still harmless.
+		if st.Ino == btrfsFirstFreeObjectID && st.Mode&unix.S_IFMT == unix.S_IFDIR {
+			if err := unix.Mount(path, path, "", unix.MS_BIND, ""); err != nil {
+				fmt.Fprintf(os.Stderr, "warning: failed to bind-mount subvolume %s: %v\n", path, err)
+			} else {
+				fmt.Fprintf(os.Stderr, "container-init: bind-mounted btrfs subvolume %s\n", path)
+			}
+		}
+	}
+}
+
 func cmdContainerInit(args []string) {
 	var hostname, domainname, chrootPath string
 
@@ -533,6 +621,32 @@ func cmdContainerInit(args []string) {
 		// Only log, don't exit - this is expected to fail in VM mode
 		fmt.Fprintf(os.Stderr, "warning: failed to make mounts private: %v (ok in VM mode)\n", err)
 	}
+
+	// Bind-mount btrfs subvolume boundaries in the path from / to chrootPath.
+	//
+	// When thundersnap runs nested (a frame inside a frame), the parent's /work
+	// is a btrfs subvolume. After CLONE_NEWNS + MS_REC|MS_PRIVATE, processes
+	// created in the new mount namespace can traverse btrfs subvolume boundaries
+	// normally. But processes that JOIN the namespace later via
+	// setns(CLONE_NEWNS) — like `ts nsenter` stage2 — cannot: the btrfs
+	// subvolume directory appears as a regular file (ENOTDIR) because the VFS
+	// dentry cache from the old namespace is stale and setns doesn't invalidate
+	// it. This breaks the nsenter path: findExecutable can't stat
+	// /work/.../bin/ts because /work isn't a directory.
+	//
+	// The fix: for each ancestor of chrootPath that is a btrfs subvolume, create
+	// an explicit bind mount to itself. A bind mount creates a real mount table
+	// entry, which IS visible after setns — the kernel resolves it through the
+	// mount table, not the btrfs subvolume dentry cache. This makes the path
+	// traversable for joining processes.
+	//
+	// We detect btrfs subvolumes by checking if the directory's inode number is
+	// BTRFS_FIRST_FREE_OBJECTID (256), which is the inode number of every
+	// btrfs subvolume root directory. This is a lightweight stat check, not a
+	// btrfs ioctl, so it works even on non-btrfs filesystems (where no
+	// directory will have inode 256, or if one does, bind-mounting it is still
+	// harmless).
+	bindMountSubvolumeAncestors(chrootPath)
 
 	// Bind-mount chrootPath to itself to ensure it's explicitly in this mount
 	// namespace's mount table. This is needed for nested containers: when running

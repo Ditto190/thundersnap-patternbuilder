@@ -8,6 +8,7 @@ import (
 	"os"
 	"runtime"
 	"strconv"
+	"strings"
 	"syscall"
 
 	"golang.org/x/sys/unix"
@@ -98,6 +99,10 @@ func cmdNsenter(args []string) {
 	stage2Args := []string{"nsenter", "--stage2"}
 	if wantMnt {
 		stage2Args = append(stage2Args, "--mnt-fd=3")
+		// Pass the target PID so stage2 can use /proc/<pid>/root as a fallback
+		// for path resolution if setns(CLONE_NEWNS) gives a stale root dentry
+		// (happens in nested containers on btrfs — see comment in stage2).
+		stage2Args = append(stage2Args, "--target-pid="+strconv.Itoa(targetPid))
 	}
 	stage2Args = append(stage2Args, "--")
 	stage2Args = append(stage2Args, cmdArgs...)
@@ -155,6 +160,9 @@ func cmdNsenterStage2(args []string) {
 				fatalNsenter("stage2: invalid --mnt-fd: %v", err)
 			}
 			mntFd = fd
+		case len(args[i]) > len("--target-pid=") && args[i][:len("--target-pid=")] == "--target-pid=":
+			// Parsed by stage1 for the fd-passing path; ignored here — we open
+			// the executable before setns instead of resolving via /proc after.
 		case args[i] == "--":
 			cmdArgs = args[i+1:]
 			i = len(args)
@@ -167,6 +175,24 @@ func cmdNsenterStage2(args []string) {
 	if len(cmdArgs) == 0 {
 		fatalNsenter("stage2: no command")
 	}
+
+	// Open the executable BEFORE setns(CLONE_NEWNS). In nested containers on
+	// btrfs, setns gives us a stale root dentry from the old mount namespace,
+	// so path resolution through "/" hits the wrong filesystem. By opening the
+	// executable file now (while we're still in the parent's mount namespace
+	// where the path resolves correctly), we get a file descriptor that remains
+	// valid after setns. We then exec via /proc/self/fd/<fd>.
+	//
+	// This is the CGO-free equivalent of `fexecve(3)`: open the file, then
+	// exec via /proc/self/fd/N, which works because the kernel's exec path
+	// follows the fd to the inode, not the path.
+	execFd, execPath := openExecutableForExec(cmdArgs[0])
+
+	// Similarly, find and open the --chroot= path before setns, so
+	// drop-caps-and-run can fchdir+chroot(".") via the fd instead of resolving
+	// the path through the stale root dentry. We inject --chroot-fd=N into the
+	// command args so drop-caps-and-run picks it up.
+	chrootFd := openChrootFd(cmdArgs)
 
 	if mntFd >= 0 {
 		// Pin to one OS thread and break its CLONE_FS sharing with the rest of
@@ -182,11 +208,23 @@ func cmdNsenterStage2(args []string) {
 		}
 	}
 
-	executable, err := findExecutable(cmdArgs[0])
-	if err != nil {
-		fatalNsenter("stage2: %v", err)
+	// Exec the target. If we opened a file descriptor before setns (the
+	// nested-btrfs case), exec via /proc/self/fd/<fd> to use the pre-setns
+	// inode rather than re-resolving the path through the (possibly stale)
+	// mount namespace root.
+	// Inject --chroot-fd=N into cmdArgs if we opened a chroot fd.
+	if chrootFd >= 0 {
+		cmdArgs = injectChrootFd(cmdArgs, chrootFd)
 	}
-	if err := syscall.Exec(executable, cmdArgs, os.Environ()); err != nil {
+	if execFd >= 0 {
+		defer unix.Close(execFd)
+		execPath := fmt.Sprintf("/proc/self/fd/%d", execFd)
+		if err := syscall.Exec(execPath, cmdArgs, os.Environ()); err != nil {
+			fatalNsenter("stage2: exec %s (via fd %d): %v", cmdArgs[0], execFd, err)
+		}
+	}
+	// Normal case: exec by path
+	if err := syscall.Exec(execPath, cmdArgs, os.Environ()); err != nil {
 		fatalNsenter("stage2: exec %s: %v", cmdArgs[0], err)
 	}
 }
@@ -204,4 +242,73 @@ func setnsPath(path string, nsType int) error {
 func fatalNsenter(format string, a ...any) {
 	fmt.Fprintf(os.Stderr, "error: nsenter: "+format+"\n", a...)
 	os.Exit(1)
+}
+
+// openExecutableForExec opens the executable file and returns (fd, path).
+// The fd can be used with /proc/self/fd/<fd> to exec the file even after
+// setns changes the mount namespace (the kernel follows the fd to the inode,
+// not the path). Returns (-1, path) if the file can't be opened but the path
+// exists (fall back to normal path-based exec). Returns (-1, "") if the
+// executable doesn't exist at all (fatal error).
+func openExecutableForExec(path string) (fd int, execPath string) {
+	resolved, err := findExecutable(path)
+	if err != nil {
+		fatalNsenter("stage2: %v", err)
+	}
+	// Open the file with O_PATH | O_CLOEXEC. O_PATH gives us a fd that can be
+	// used for execvia /proc/self/fd/<fd> but doesn't require read permission
+	// on the file itself (though exec does require exec permission). O_CLOEXEC
+	// ensures the fd doesn't leak to the exec'd process (though exec via
+	// /proc/self/fd closes it anyway).
+	f, err := os.OpenFile(resolved, unix.O_PATH|unix.O_CLOEXEC, 0)
+	if err != nil {
+		// Can't open the fd — fall back to path-based exec. This works in
+		// the non-nested case where setns gives the correct mount table.
+		return -1, resolved
+	}
+	return int(f.Fd()), resolved
+}
+
+// openChrootFd scans cmdArgs for a --chroot=<path> flag, opens the path as a
+// directory fd, and returns the fd number.
+// This fd is opened BEFORE setns so it references the correct btrfs dentry.
+// drop-caps-and-run can then fchdir+chroot(".") via this fd instead of
+// resolving the path through the stale root dentry after setns.
+//
+// The fd is opened WITHOUT O_CLOEXEC so it survives exec into drop-caps-and-run.
+// drop-caps-and-run must close it after use.
+// Returns -1 if no --chroot= flag is found or the path can't be opened.
+func openChrootFd(cmdArgs []string) int {
+	for _, arg := range cmdArgs {
+		if strings.HasPrefix(arg, "--chroot=") {
+			path := strings.TrimPrefix(arg, "--chroot=")
+			if path == "" {
+				return -1
+			}
+			// O_PATH: we only need the fd for fchdir, not for reading.
+			// No O_CLOEXEC: the fd must survive exec into drop-caps-and-run.
+			fd, err := unix.Open(path, unix.O_PATH|unix.O_DIRECTORY, 0)
+			if err != nil {
+				return -1 // fall back to path-based chroot
+			}
+			return fd
+		}
+	}
+	return -1
+}
+
+// injectChrootFd inserts --chroot-fd=<fd> into cmdArgs, right after the
+// --chroot=<path> flag if present, or at the beginning otherwise.
+func injectChrootFd(cmdArgs []string, fd int) []string {
+	fdArg := fmt.Sprintf("--chroot-fd=%d", fd)
+	for i, arg := range cmdArgs {
+		if strings.HasPrefix(arg, "--chroot=") {
+			result := make([]string, 0, len(cmdArgs)+1)
+			result = append(result, cmdArgs[:i+1]...)
+			result = append(result, fdArg)
+			result = append(result, cmdArgs[i+1:]...)
+			return result
+		}
+	}
+	return append([]string{fdArg}, cmdArgs...)
 }
