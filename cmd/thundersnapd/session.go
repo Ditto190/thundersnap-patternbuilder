@@ -148,7 +148,11 @@ func runSFTPSession(s ssh.Session, rootFS, targetUser string) error {
 func connectToVshd(vsockPath string, panicked <-chan struct{}) (net.Conn, error) {
 	var lastErr error
 
-	// Retry the full connection + handshake for up to 10 seconds while vshd starts up
+	// Retry the full connection + handshake for up to 10 seconds while vshd
+	// starts up. 10 seconds is enough for a non-nested VM boot on hardware
+	// KVM. Nested KVM (VM inside a VM) is significantly slower and not
+	// supported by this timeout — see TestNestedVMSession for the nesting
+	// infrastructure test, which checks /dev/kvm propagation without booting.
 	for i := 0; i < 100; i++ {
 		// Check if VM panicked before each attempt
 		select {

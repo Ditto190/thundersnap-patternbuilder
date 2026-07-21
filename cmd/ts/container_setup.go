@@ -516,10 +516,10 @@ func setupDev(mountVsock bool) {
 		os.Remove(scratch)
 	}
 
-	// Propagate /dev/kvm into the container so nested VMs work. This is a
-	// bind mount from the host's /dev/kvm. If the host doesn't have /dev/kvm
-	// (no hardware virtualization, or running inside a container without KVM
-	// passthrough), this silently does nothing.
+	// Propagate /dev/kvm into the container so nested VMs work. We create a
+	// device node with the same major:minor as the host's /dev/kvm (captured by
+	// cmdContainerInit before chrooting). The device node on the tmpfs
+	// references the same kernel KVM device — no bind mount needed.
 	//
 	// TODO(container-isolation): When we lock down container isolation in the
 	// future, /dev/kvm access should be gated behind a capability or frame
@@ -527,16 +527,11 @@ func setupDev(mountVsock bool) {
 	// development/nested-thundersnap use case, but a hardened deployment would
 	// want to restrict which frames can spawn VMs. For now, this matches the
 	// --keep-dev-caps philosophy: we retain capabilities that enable nesting.
-	if _, err := os.Stat("/dev/kvm"); err == nil {
-		// Create the device node and bind-mount the host's /dev/kvm onto it.
-		// We use mknod + bind mount (like the vsock pattern) because /dev is a
-		// tmpfs, not devtmpfs, so device nodes don't appear automatically.
-		kvmPath := "/dev/kvm"
-		if err := unix.Mknod(kvmPath, unix.S_IFCHR|0666, int(unix.Mkdev(10, 232))); err != nil {
-			// Non-fatal: the bind mount below may still work if the node exists.
-			_ = err
+	if kvmDeviceNumber != 0 {
+		if err := unix.Mknod("/dev/kvm", unix.S_IFCHR|0666, int(kvmDeviceNumber)); err != nil {
+			// Non-fatal: nested VMs won't work but the container is still usable.
+			fmt.Fprintf(os.Stderr, "setupDev: warning: failed to create /dev/kvm: %v\n", err)
 		}
-		_ = unix.Mount("/dev/kvm", kvmPath, "", unix.MS_BIND, "")
 	}
 }
 
@@ -553,6 +548,13 @@ func setupDev(mountVsock bool) {
 // 3. Writes "READY\n" to stdout to signal setup is complete
 // 4. Sits idle, waiting for stdin to close (which signals shutdown)
 // 5. As PID 1, reaps any orphaned zombie processes
+// kvmDeviceNumber holds the device number of the host's /dev/kvm, if it
+// exists. It is set by cmdContainerInit BEFORE chrooting (when /dev/kvm is
+// still visible from the host) and read by setupDev AFTER chrooting (when
+// /dev is a fresh tmpfs with no device nodes). A value of 0 means no /dev/kvm
+// on the host — skip creating the device node.
+var kvmDeviceNumber uint64
+
 // btrfsFirstFreeObjectID is the inode number of every btrfs subvolume root
 // directory. We use it to detect btrfs subvolume boundaries without requiring
 // btrfs-specific ioctls.
@@ -679,6 +681,16 @@ func cmdContainerInit(args []string) {
 	if err := unix.Mount(chrootPath, chrootPath, "", unix.MS_BIND|unix.MS_REC, ""); err != nil {
 		fmt.Fprintf(os.Stderr, "error: failed to bind-mount %s: %v\n", chrootPath, err)
 		os.Exit(1)
+	}
+
+	// Stat /dev/kvm BEFORE chrooting (while the host's /dev is still visible).
+	// We store the device number so setupDev can mknod it after chrooting (when
+	// /dev is a fresh tmpfs with no device nodes). This propagates KVM into
+	// containers so nested VMs work.
+	if st, err := os.Stat("/dev/kvm"); err == nil {
+		if sys, ok := st.Sys().(*syscall.Stat_t); ok && sys.Mode&unix.S_IFCHR != 0 {
+			kvmDeviceNumber = sys.Rdev
+		}
 	}
 
 	// Chroot into the container rootfs
