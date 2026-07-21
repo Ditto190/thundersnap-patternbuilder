@@ -151,6 +151,14 @@ func StartVM(cfg VMConfig) (*VMSession, error) {
 		"-g", "10.0.2.2", // gateway address
 		"-D", "none", // don't intercept DNS
 	)
+	// Note: passt creates a user namespace (CLONE_NEWUSER) for sandboxing
+	// regardless of --runas. This fails in containers that don't allow
+	// CLONE_NEWUSER (e.g., some thundersnap container configurations). When
+	// that happens, passt logs "Couldn't create user namespace" but may still
+	// create its socket — however, the vhost-user connection from
+	// cloud-hypervisor will fail because passt isn't functioning correctly.
+	// This is an environment limitation, not a thundersnap code bug. The fix
+	// is to allow CLONE_NEWUSER in the container (kernel/container config).
 	// Pdeathsig ensures passt exits when its parent (thundersnapd/test harness)
 	// dies, preventing orphaned passt processes.
 	passtCmd.SysProcAttr = &syscall.SysProcAttr{
