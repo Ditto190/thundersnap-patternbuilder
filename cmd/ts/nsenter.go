@@ -148,6 +148,7 @@ func cmdNsenter(args []string) {
 // target command. See cmdNsenter for the full rationale.
 func cmdNsenterStage2(args []string) {
 	var mntFd int = -1
+	var targetPid int = -1
 	var cmdArgs []string
 
 	for i := 0; i < len(args); i++ {
@@ -161,8 +162,11 @@ func cmdNsenterStage2(args []string) {
 			}
 			mntFd = fd
 		case len(args[i]) > len("--target-pid=") && args[i][:len("--target-pid=")] == "--target-pid=":
-			// Parsed by stage1 for the fd-passing path; ignored here — we open
-			// the executable before setns instead of resolving via /proc after.
+			pid, err := strconv.Atoi(args[i][len("--target-pid="):])
+			if err != nil {
+				fatalNsenter("stage2: invalid --target-pid: %v", err)
+			}
+			targetPid = pid
 		case args[i] == "--":
 			cmdArgs = args[i+1:]
 			i = len(args)
@@ -192,7 +196,7 @@ func cmdNsenterStage2(args []string) {
 	// drop-caps-and-run can fchdir+chroot(".") via the fd instead of resolving
 	// the path through the stale root dentry. We inject --chroot-fd=N into the
 	// command args so drop-caps-and-run picks it up.
-	chrootFd := openChrootFd(cmdArgs)
+	chrootFd := openChrootFd(cmdArgs, targetPid)
 
 	if mntFd >= 0 {
 		// Pin to one OS thread and break its CLONE_FS sharing with the rest of
@@ -269,32 +273,30 @@ func openExecutableForExec(path string) (fd int, execPath string) {
 	return int(f.Fd()), resolved
 }
 
-// openChrootFd scans cmdArgs for a --chroot=<path> flag, opens the path as a
-// directory fd, and returns the fd number.
-// This fd is opened BEFORE setns so it references the correct btrfs dentry.
-// drop-caps-and-run can then fchdir+chroot(".") via this fd instead of
-// resolving the path through the stale root dentry after setns.
+// openChrootFd opens a directory fd for the chroot path, using
+// /proc/<targetPid>/root to reference the container-init's root dentry.
 //
-// The fd is opened WITHOUT O_CLOEXEC so it survives exec into drop-caps-and-run.
-// drop-caps-and-run must close it after use.
-// Returns -1 if no --chroot= flag is found or the path can't be opened.
-func openChrootFd(cmdArgs []string) int {
-	for _, arg := range cmdArgs {
-		if strings.HasPrefix(arg, "--chroot=") {
-			path := strings.TrimPrefix(arg, "--chroot=")
-			if path == "" {
-				return -1
-			}
-			// O_PATH: we only need the fd for fchdir, not for reading.
-			// No O_CLOEXEC: the fd must survive exec into drop-caps-and-run.
-			fd, err := unix.Open(path, unix.O_PATH|unix.O_DIRECTORY, 0)
-			if err != nil {
-				return -1 // fall back to path-based chroot
-			}
-			return fd
-		}
+// This is critical: container-init bind-mounts chrootPath to itself before
+// chrooting and mounting /proc, /sys, /dev. Those mounts are on the bind
+// mount's dentry tree, not the original dentry tree. If we open the --chroot=
+// path directly, we get the original dentry tree (no proc/sys/dev). By opening
+// /proc/<targetPid>/root, we get the container-init's root dentry, which IS
+// the bind mount — so proc/sys/dev are visible after chroot.
+//
+// Must be called BEFORE setns(CLONE_NEWNS), while /proc is still accessible
+// from the outer mount namespace. The fd is opened without O_CLOEXEC so it
+// survives exec into drop-caps-and-run.
+// Returns -1 if the fd can't be opened (fall back to path-based chroot).
+func openChrootFd(cmdArgs []string, targetPid int) int {
+	if targetPid < 0 {
+		return -1
 	}
-	return -1
+	rootPath := fmt.Sprintf("/proc/%d/root", targetPid)
+	fd, err := unix.Open(rootPath, unix.O_PATH|unix.O_DIRECTORY, 0)
+	if err != nil {
+		return -1 // fall back to path-based chroot
+	}
+	return fd
 }
 
 // injectChrootFd inserts --chroot-fd=<fd> into cmdArgs, right after the
