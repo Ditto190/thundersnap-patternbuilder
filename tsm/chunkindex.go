@@ -406,17 +406,26 @@ func newTSCView(content []byte) *tscView {
 }
 
 // lookup binary-searches the sorted entries for sha and returns the chunk's
-// size if present.
+// size if present. It is bounds-defensive: a corrupted view whose count
+// exceeds its data never panics, it simply fails to find the chunk.
 func (v *tscView) lookup(sha [32]byte) (size uint32, ok bool) {
 	if v.count == 0 {
 		return 0, false
 	}
 	idx := sort.Search(v.count, func(i int) bool {
 		off := v.entriesOff + i*v.entrySize
+		if off+32 > len(v.data) {
+			// Out of bounds: treat as "greater than want" so the binary
+			// search narrows downward rather than panicking.
+			return true
+		}
 		return bytes.Compare(v.data[off:off+32], sha[:]) >= 0
 	})
 	if idx < v.count {
 		off := v.entriesOff + idx*v.entrySize
+		if off+TSCEntrySize > len(v.data) {
+			return 0, false
+		}
 		if bytes.Equal(v.data[off:off+32], sha[:]) {
 			return binary.BigEndian.Uint32(v.data[off+32 : off+36]), true
 		}
@@ -426,7 +435,7 @@ func (v *tscView) lookup(sha [32]byte) (size uint32, ok bool) {
 
 // entryByIndex returns the SHA and size of the entry at sorted TSC index i,
 // which is the index TSM ChunkRefs reference. Used when building a location
-// map.
+// map. It is bounds-defensive against a corrupted view.
 func (v *tscView) entryByIndex(i int) (sha [32]byte, size uint32, ok bool) {
 	if i < 0 || i >= v.count {
 		return [32]byte{}, 0, false
@@ -441,6 +450,13 @@ func (v *tscView) entryByIndex(i int) (sha [32]byte, size uint32, ok bool) {
 
 // readTSCChunkCount reads just a .tsc header and returns the chunk count,
 // without parsing entries. Used to size the Bloom filter cheaply.
+//
+// It sanity-checks the declared count against the file size so a corrupted or
+// malicious .tsc with an absurd header count cannot drive an enormous Bloom
+// allocation (or a later panic) before the full validation in pass 2 /
+// readTSCContentValidated gets a chance to reject it. The count must fit the
+// file: headerSize + count*entrySize + footerSize == fileSize for the current
+// no-slab format (slabs are not yet written; see TSCWriter.Write).
 func readTSCChunkCount(path string) (uint64, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -454,12 +470,26 @@ func readTSCChunkCount(path string) (uint64, error) {
 	if string(hdr[0:4]) != TSCMagic {
 		return 0, fmt.Errorf("invalid TSC magic")
 	}
-	return binary.BigEndian.Uint64(hdr[8:16]), nil
+	count := binary.BigEndian.Uint64(hdr[8:16])
+	fi, err := f.Stat()
+	if err != nil {
+		return 0, err
+	}
+	// checkTSCCountConsistent takes the content length (header+entries, no
+	// footer), so subtract the footer from the on-disk size.
+	if err := checkTSCCountConsistent(count, fi.Size()-TSCFooterSize); err != nil {
+		return 0, err
+	}
+	return count, nil
 }
 
-// readTSCContentValidated reads a .tsc file, verifies its footer checksum, and
+// readTSCContentValidated reads a .tsc file, verifies its footer checksum and
+// that the declared chunk count matches the actual entry-data length, and
 // returns the content bytes (header + entries, excluding the 32-byte footer).
-// Entries are not parsed into structs.
+// Entries are not parsed into structs. The count/length check mirrors
+// ParseTSC's `expectedEntries != ChunkCount` rejection, so a .tsc with a
+// valid footer but an inconsistent (e.g. inflated) header count is refused
+// rather than driving an out-of-bounds slice in tscView.lookup.
 func readTSCContentValidated(path string) ([]byte, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -471,6 +501,10 @@ func readTSCContentValidated(path string) ([]byte, error) {
 	if string(data[0:4]) != TSCMagic {
 		return nil, fmt.Errorf("invalid TSC magic")
 	}
+	count := binary.BigEndian.Uint64(data[8:16])
+	if err := checkTSCCountConsistent(count, int64(len(data)-TSCFooterSize)); err != nil {
+		return nil, err
+	}
 	footer := data[len(data)-TSCFooterSize:]
 	content := data[:len(data)-TSCFooterSize]
 	h := sha256.New()
@@ -479,6 +513,27 @@ func readTSCContentValidated(path string) ([]byte, error) {
 		return nil, fmt.Errorf("tsc checksum mismatch")
 	}
 	return content, nil
+}
+
+// checkTSCCountConsistent verifies that a declared chunk count fits the
+// available content length (header + entries, no footer): for the current
+// no-slab format it must be exactly headerSize + count*entrySize. Rejecting
+// both too-large and too-small counts prevents out-of-bounds reads in
+// tscView.lookup and absurd Bloom sizing from a bogus header count.
+func checkTSCCountConsistent(count uint64, contentLen int64) error {
+	if count > 1<<32 { // uint32 index space bound; also guards overflow below
+		return fmt.Errorf("tsc chunk count %d implausibly large", count)
+	}
+	entriesLen := contentLen - TSCHeaderSize
+	if entriesLen < 0 {
+		return fmt.Errorf("tsc content shorter than header")
+	}
+	expected := int64(count) * TSCEntrySize
+	if expected != entriesLen {
+		return fmt.Errorf("tsc chunk count %d inconsistent with entry data length %d",
+			count, entriesLen)
+	}
+	return nil
 }
 
 // streamTSCSHAs calls fn for each chunk SHA in validated .tsc content, in
