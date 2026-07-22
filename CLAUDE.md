@@ -40,3 +40,8 @@ experiment. Over time we need to improve the quality of all the components.
   when done and then `jj new` so you don't accidentally mix changes
   together. Be careful that `jj log` shows not just this branch, but other
   branches mixed into the hierarchy!
+- Before assuming you can't run a command for lack of privileges, try `sudo`
+  first. This environment has passwordless sudo (`sudo -n true` works), so
+  `make e2e` (which needs root for btrfs/container ops) and other root-only
+  tooling are available even though the shell user is non-root (UID 7575).
+  `sudo -E` preserves the environment (needed for `make e2e`).

@@ -107,6 +107,11 @@ func readFrameSidecar(framePath string) (*frames.Frame, error) {
 }
 
 // writeFrameSidecar writes a frame's metadata sidecar at <framePath>.jsonc.
+// It writes to a temp file and renames, so a reader never sees a truncated/
+// partial file (unlike a plain os.WriteFile truncate-then-write). Callers
+// that read-modify-write the sidecar (the snap-indexing worker, /taint, fork)
+// must still serialize among themselves to avoid lost updates — see
+// frameMetaLock in snapqueue.go.
 func writeFrameSidecar(framePath string, f *frames.Frame) error {
 	path := framePath + ".jsonc"
 
@@ -115,8 +120,13 @@ func writeFrameSidecar(framePath string, f *frames.Frame) error {
 		return fmt.Errorf("marshal frame meta %s: %w", framePath, err)
 	}
 
-	if err := os.WriteFile(path, data, 0644); err != nil {
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0644); err != nil {
 		return fmt.Errorf("write frame meta %s: %w", framePath, err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		os.Remove(tmp)
+		return fmt.Errorf("rename frame meta %s: %w", framePath, err)
 	}
 	return nil
 }

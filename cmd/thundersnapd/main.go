@@ -37,7 +37,6 @@ import (
 	"github.com/tailscale/thundersnap/frameid"
 	"github.com/tailscale/thundersnap/frames"
 	"github.com/tailscale/thundersnap/refs"
-	"github.com/tailscale/thundersnap/snaphash"
 	"github.com/tailscale/thundersnap/snapsubdir"
 	"github.com/tailscale/thundersnap/thunderproto"
 	"github.com/tailscale/thundersnap/thundersnap"
@@ -534,6 +533,9 @@ func main() {
 	// (NOT the fs dir, which would double the "fs" component).
 	initRefStore(*flagDataDir)
 	initFrameStore(*flagDataDir)
+
+	// Start the single background snap-indexing worker (see snapqueue.go).
+	initSnapQueue()
 
 	// Initialize the autorun manager and start any autorun processes.
 	initAutorunManager(*flagDataDir)
@@ -1578,6 +1580,7 @@ func startControlServer(sockPath, rootFS string) (*controlServer, error) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ping", handlePing)
 	mux.HandleFunc("/snap", cs.handleSnap)
+	mux.HandleFunc("/fork", makeForkHandler(cs.rootFS))
 	mux.HandleFunc("/create", cs.handleCreate)
 	mux.HandleFunc("/taint", cs.handleTaint)
 	mux.HandleFunc("/delete-snap", handleDeleteSnap)
@@ -2118,77 +2121,137 @@ func (p *threeSnapProgress) Final() {
 
 // makeSnapHandler creates a /snap handler for the given rootFS.
 // This is used by both container (controlServer) and VM handlers.
+//
+// By default the snap is captured synchronously (instant btrfs snapshot) and
+// indexed in the background: the response returns at once with no snap ID.
+// With wait=1 the handler blocks until indexing completes and returns the
+// content-addressable ID (streaming progress if stream=1). See snapqueue.go
+// and background-indexing.md.
 func makeSnapHandler(rootFS string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !requireMethod(w, r, http.MethodPost) {
 			return
 		}
 
-		// Check if client wants streaming progress
 		stream := r.URL.Query().Get("stream") == "1"
 		subdir := r.URL.Query().Get("subdir")
+		wait := r.URL.Query().Get("wait") == "1"
 
 		if stream {
-			handleSnapStreaming(w, rootFS, subdir)
+			handleSnapStreaming(w, rootFS, subdir, wait)
+			return
+		}
+		if wait {
+			handleSnapWait(w, rootFS, subdir)
 			return
 		}
 
-		// Non-streaming fallback: a single JSON response with no progress
-		// events. The in-tree `ts` client always requests stream=1, so this
-		// branch only serves plain HTTP clients that omit it.
-		snapshotID, err := createSnapshotSubdir(rootFS, subdir, nil)
-		if err != nil {
-			log.Printf("snap failed for %s: %v", rootFS, err)
+		// Default: capture now, index in the background, return immediately.
+		if _, err := captureSnapJob(rootFS, subdir, nil); err != nil {
+			log.Printf("snap capture failed for %s: %v", rootFS, err)
 			writeJSON(w, http.StatusInternalServerError, SnapResponse{
 				Status:  "error",
 				Message: err.Error(),
 			})
 			return
 		}
-
-		log.Printf("Created snapshot %s from %s", snapshotID, rootFS)
-		addSnapHistory(rootFS, snapshotID)
-
 		writeJSON(w, http.StatusOK, SnapResponse{
-			Status:     "ok",
-			SnapshotID: snapshotID,
+			Status:  "ok",
+			Message: "indexing in background",
 		})
 	}
 }
 
-// addSnapHistory adds a history entry for a new snapshot. It derives the user
-// and frame UUID from the rootFS path and calls frameStore.AddHistoryEntry.
-// Errors are logged but not returned since history is non-critical.
-func addSnapHistory(rootFS, snapshotID string) {
-	user, err := tailscaleUserFromRootFS(rootFS)
+// handleSnapWait is the non-streaming synchronous path: capture, wait for
+// background indexing to finish, and return the snap ID as a single JSON
+// response. Used by plain HTTP clients that pass wait=1 without stream=1.
+func handleSnapWait(w http.ResponseWriter, rootFS, subdir string) {
+	job, err := captureSnapJob(rootFS, subdir, nil)
 	if err != nil {
-		log.Printf("addSnapHistory: cannot determine user from %s: %v", rootFS, err)
+		log.Printf("snap failed for %s: %v", rootFS, err)
+		writeJSON(w, http.StatusInternalServerError, SnapResponse{
+			Status:  "error",
+			Message: err.Error(),
+		})
 		return
 	}
-	uuid, err := frameUUIDFromRootFS(rootFS)
-	if err != nil {
-		log.Printf("addSnapHistory: cannot determine UUID from %s: %v", rootFS, err)
+	<-job.done
+	if job.err != nil {
+		writeJSON(w, http.StatusInternalServerError, SnapResponse{
+			Status:  "error",
+			Message: job.err.Error(),
+		})
 		return
 	}
-	frameStore := userFrameStore(user)
-	if err := frameStore.AddHistoryEntry(uuid, snapshotID, ""); err != nil {
-		log.Printf("addSnapHistory: AddHistoryEntry(%s, %s) failed: %v", uuid, snapshotID, err)
+	log.Printf("Created snapshot %s from %s", job.resultID(), rootFS)
+	writeJSON(w, http.StatusOK, SnapResponse{
+		Status:     "ok",
+		SnapshotID: job.resultID(),
+	})
+}
+
+// ForkResponse is the response from /fork.
+type ForkResponse struct {
+	Status  string `json:"status"`
+	UUID    string `json:"uuid,omitempty"` // the new frame's UUID
+	Message string `json:"message,omitempty"`
+}
+
+// handleFork handles POST /fork - capture the current frame as a background
+// snap and create a new frame cloned from the current frame's live
+// filesystem. This is the fast path for `ts go ::` / `ts frame ::`: it avoids
+// blocking on content-addressable indexing (the current frame's snap is
+// recorded in the background) and avoids needing the snap ID to build the new
+// frame (the new frame is cloned directly from the live subvolumes).
+// makeForkHandler returns a /fork handler for the given rootFS, used by both
+// the container control server and the VM control handler. It captures the
+// current frame as a background snap and creates a new frame cloned from the
+// current frame's live filesystem. This is the fast path for `ts go ::` /
+// `ts frame ::`: it avoids blocking on content-addressable indexing (the
+// current frame's snap is recorded in the background) and avoids needing the
+// snap ID to build the new frame (the new frame is cloned directly from the
+// live subvolumes).
+func makeForkHandler(rootFS string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !requireMethod(w, r, http.MethodPost) {
+			return
+		}
+		uuid, err := forkFrame(rootFS)
+		if err != nil {
+			log.Printf("fork failed for %s: %v", rootFS, err)
+			writeJSON(w, http.StatusInternalServerError, ForkResponse{
+				Status:  "error",
+				Message: err.Error(),
+			})
+			return
+		}
+		writeJSON(w, http.StatusOK, ForkResponse{
+			Status: "ok",
+			UUID:   uuid.String(),
+		})
 	}
 }
 
-// handleSnapStreaming handles the streaming version of /snap
-func handleSnapStreaming(w http.ResponseWriter, rootFS, subdir string) {
+// handleSnapStreaming handles the streaming version of /snap. With wait=1 it
+// streams indexing progress and the final result event (the worker, which
+// owns the progress emitter, writes both); without wait it returns an
+// immediate ack and indexing continues in the background.
+func handleSnapStreaming(w http.ResponseWriter, rootFS, subdir string, wait bool) {
 	w.Header().Set("Content-Type", "application/x-ndjson")
 
-	// Enable streaming mode immediately by flushing
+	// Enable streaming mode immediately by flushing.
 	if f, ok := w.(http.Flusher); ok {
 		f.Flush()
 	}
 
-	progress := newThreeSnapProgress(w)
 	encoder := json.NewEncoder(w)
 
-	snapshotID, err := createSnapshotSubdir(rootFS, subdir, progress)
+	var progress *threeSnapProgress
+	if wait {
+		progress = newThreeSnapProgress(w)
+	}
+
+	job, err := captureSnapJob(rootFS, subdir, progress)
 	if err != nil {
 		log.Printf("snap failed for %s: %v", rootFS, err)
 		encoder.Encode(SnapStreamEvent{
@@ -2199,13 +2262,19 @@ func handleSnapStreaming(w http.ResponseWriter, rootFS, subdir string) {
 		return
 	}
 
-	log.Printf("Created snapshot %s from %s", snapshotID, rootFS)
-	addSnapHistory(rootFS, snapshotID)
-	encoder.Encode(SnapStreamEvent{
-		Type:       "result",
-		Status:     "ok",
-		SnapshotID: snapshotID,
-	})
+	if !wait {
+		// Indexing happens in the background; ack immediately with no ID.
+		encoder.Encode(SnapStreamEvent{
+			Type:    "result",
+			Status:  "ok",
+			Message: "indexing in background",
+		})
+		return
+	}
+
+	// The worker emits progress events and the final result event via the
+	// progress emitter; just wait for it to finish.
+	<-job.done
 }
 
 // handleSnap handles POST /snap - create a snapshot of the container's rootFS
@@ -2225,8 +2294,21 @@ type TaintResponse struct {
 	Taints  []string `json:"taints,omitempty"`
 }
 
-// handleTaint handles POST /taint - add a taint to the current frame
+// handleTaint handles /taint. GET lists the current frame's taints; POST
+// adds a taint (taint_name in the body). The POST read-modify-write of the
+// frame sidecar is serialized against the snap-indexing worker via the
+// per-frame sidecar lock (updateFrameMetaLocked) so a concurrent
+// background-snap finalize can't clobber the taint, and vice versa.
 func (c *controlServer) handleTaint(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodGet {
+		frameMeta, _ := readFrameSidecar(c.rootFS)
+		var taints []string
+		if frameMeta != nil {
+			taints = frameMeta.Taints
+		}
+		writeJSON(w, http.StatusOK, TaintResponse{Status: "ok", Taints: taints})
+		return
+	}
 	if !requireMethod(w, r, http.MethodPost) {
 		return
 	}
@@ -2245,39 +2327,27 @@ func (c *controlServer) handleTaint(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Read existing frame metadata
-	frameMeta, err := readFrameSidecar(c.rootFS)
+	// Read-modify-write the frame sidecar under the per-frame sidecar lock
+	// (shared with the snap-indexing worker) so a concurrent background-snap
+	// finalize can't clobber this taint, and vice versa.
+	frameMeta, err := globalSnapQueue.updateFrameMetaLocked(c.rootFS, func(m *frames.Frame) {
+		if m.Rootfs == "" {
+			// Create default frame metadata if none exists.
+			m.Rootfs = readStampFile(c.rootFS)
+		}
+		found := false
+		for _, t := range m.Taints {
+			if t == req.TaintName {
+				found = true
+				break
+			}
+		}
+		if !found {
+			m.Taints = append(m.Taints, req.TaintName)
+			m.Taints = UnionTaints(m.Taints)
+		}
+	})
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, TaintResponse{
-			Status:  "error",
-			Message: fmt.Sprintf("read frame meta: %v", err),
-		})
-		return
-	}
-
-	// Create default frame metadata if none exists
-	if frameMeta == nil {
-		frameMeta = &frames.Frame{
-			Rootfs: readStampFile(c.rootFS), // Use stamp file as rootfs ID
-		}
-	}
-
-	// Add the taint if not already present
-	found := false
-	for _, t := range frameMeta.Taints {
-		if t == req.TaintName {
-			found = true
-			break
-		}
-	}
-	if !found {
-		frameMeta.Taints = append(frameMeta.Taints, req.TaintName)
-		// Keep taints sorted
-		frameMeta.Taints = UnionTaints(frameMeta.Taints)
-	}
-
-	// Write updated frame metadata
-	if err := writeFrameSidecar(c.rootFS, frameMeta); err != nil {
 		writeJSON(w, http.StatusInternalServerError, TaintResponse{
 			Status:  "error",
 			Message: fmt.Sprintf("write frame meta: %v", err),
@@ -3661,174 +3731,21 @@ func createSnapshotWithTaints(source, parentStampID string, taints []string, pro
 }
 
 // createSnapshotWithTaintsSubdir creates a read-only snapshot in snaps-dir and
-// generates fidx and tsm files for it. The snapshot is named after the SHA-256
-// of its TSM manifest, so if a snapshot with the same SHA-256 already exists it
-// returns the existing ID and discards the new snapshot, performing taint
-// intersection on the metadata. The process is:
-//  1. Create btrfs snapshot to a random tmp name
-//  2. Create mfidx (with --ref to parent if exists)
-//  3. Create TSM/TSC manifests
-//  4. Load TSM to get its SHA-256, use that as the final snapshot ID
-//  5. If snapshot already exists with that ID, perform taint intersection and discard new one
-//  6. Otherwise rename all files to the SHA-256-based final names
-//  7. Create fidx of the fidx and write snap.jsonc metadata
+// generates its tsm/tsc manifests, returning the content-addressable snap ID.
+// It is the synchronous (capture + index + finalize in one call) path used by
+// callers that need the ID immediately (e.g. ts download-docker). The
+// interactive ts snap path instead captures and enqueues background indexing
+// via captureSnapJob (see snapqueue.go).
 //
-// When subdir is non-empty (a slash-relative path within the source subvolume),
-// only that subtree is snapshotted: for atomicity the whole subvolume is still
-// snapshotted first, then everything outside subdir is deleted and subdir's
-// contents are promoted to the snapshot root before the subvolume is made
-// read-only and indexed. The resulting snapshot ID is then the content hash of
-// just that subtree, so it can be dropped into a frame on its own.
+// When subdir is non-empty, only that subtree is snapshotted and indexed (the
+// whole subvolume is snapshotted first, then pruned to the subtree); the
+// resulting snapshot ID is the content hash of just that subtree.
 func createSnapshotWithTaintsSubdir(source, subdir, parentStampID string, taints []string, progressCallback func(tsm.IndexerStats)) (string, error) {
-	// Generate a random temporary ID for the work-in-progress snapshot
-	tmpID, err := generateRandomID()
+	tmpPath, err := captureSubvol(source, subdir)
 	if err != nil {
-		return "", fmt.Errorf("generating temporary ID: %w", err)
+		return "", err
 	}
-
-	tmpPath := filepath.Join(*flagSnapsDir, tmpID+".tmp")
-	tmpTSMPath := tmpPath + ".tsm"
-	tmpTSCPath := tmpPath + ".tsc"
-
-	// Cleanup helper
-	cleanupTmp := func() {
-		btrfsutil.DeleteSubvol(tmpPath) // best effort
-		os.Remove(tmpPath + ".stamp")
-		os.Remove(tmpTSMPath)
-		os.Remove(tmpTSCPath)
-	}
-
-	if subdir == "" {
-		// Step 1: Create read-only btrfs snapshot to tmp path
-		if err := btrfsSnapshot(source, tmpPath, true); err != nil {
-			return "", err
-		}
-	} else {
-		// Subdir snap: take a WRITABLE snapshot (so we can prune/promote),
-		// then reduce it to just the requested subtree before making it
-		// read-only.
-		if err := snapsubdir.Snapshot(source, subdir, tmpPath); err != nil {
-			cleanupTmp()
-			return "", err
-		}
-	}
-
-	// Write stamp file for the snapshot (in tmp location)
-	if err := writeStampFile(tmpPath, parentStampID); err != nil {
-		cleanupTmp()
-		return "", fmt.Errorf("write stamp file: %w", err)
-	}
-
-	// Step 2: Create TSM/TSC manifests in tmp location.
-	// Load the parent snapshot's manifest (if any) so the indexer can reuse
-	// chunk hashes for files that are unchanged since the parent, instead of
-	// re-reading and re-hashing every file. This makes a second consecutive
-	// snap of an unchanged tree do essentially no file I/O.
-	tsmOpts := tsm.IndexerOptions{
-		ProgressCallback: progressCallback,
-	}
-	// Incremental reuse only applies to a full-root snap, where the parent
-	// manifest's paths line up with this tree. A subdir snap re-roots the
-	// tree, so the parent's paths no longer match; index it in full.
-	if subdir == "" {
-		if parentTSM, parentTSC := loadParentManifest(parentStampID); parentTSM != nil && parentTSC != nil {
-			tsmOpts.ParentTSM = parentTSM
-			tsmOpts.ParentTSC = parentTSC
-		}
-	}
-	if err := tsm.Create(tmpPath, tmpPath, tsmOpts); err != nil {
-		cleanupTmp()
-		return "", fmt.Errorf("create tsm/tsc: %w", err)
-	}
-
-	// Step 3: Load TSM to get its SHA-256, which becomes the snapshot ID
-	tsmReader, err := tsm.ReadTSM(tmpTSMPath)
-	if err != nil {
-		cleanupTmp()
-		return "", fmt.Errorf("read tsm for checksum: %w", err)
-	}
-	snapshotID := snaphash.Encode(snaphash.Hash(tsmReader.SHA256))
-
-	finalPath := filepath.Join(*flagSnapsDir, snapshotID)
-	finalTSMPath := finalPath + ".tsm"
-	finalTSCPath := finalPath + ".tsc"
-
-	// Determine taints for this snapshot
-	if taints == nil {
-		// Inherit from parent if available
-		taints = getSnapTaints(*flagSnapsDir, parentStampID)
-	}
-
-	// Step 4: Check if a snapshot with this SHA-256 already exists
-	if _, err := os.Stat(finalPath); err == nil {
-		// Snapshot already exists! Perform taint intersection and discard the new one.
-		log.Printf("Snapshot %s already exists, checking taints", snapshotID)
-
-		existingMeta, _ := readSnapMeta(*flagSnapsDir, snapshotID)
-		if existingMeta != nil && len(taints) > 0 {
-			// Taint intersection: if we can produce the same content with fewer taints,
-			// the removed taints are not inherent to the content.
-			intersected := IntersectTaints(existingMeta.Taints, taints)
-			if !taintsEqual(existingMeta.Taints, intersected) {
-				existingMeta.Taints = intersected
-				if err := writeSnapMeta(*flagSnapsDir, snapshotID, existingMeta); err != nil {
-					log.Printf("Warning: failed to update snap meta for taint intersection: %v", err)
-				} else {
-					log.Printf("Taint intersection for %s: %v", snapshotID, intersected)
-				}
-			}
-		}
-
-		// Emit final progress stats as if the content was just indexed. The
-		// indexer ran but since we're discarding the duplicate, report the
-		// stats from what we indexed to ensure progress is consistent with the
-		// content. All entries are "unmodified" since nothing actually changed
-		// from the content's perspective.
-		if progressCallback != nil {
-			totalEntries := len(tsmReader.Entries)
-			var totalBytes int64
-			for _, e := range tsmReader.Entries {
-				totalBytes += int64(e.Size)
-			}
-			progressCallback(tsm.IndexerStats{
-				UnmodifiedEntries: totalEntries,
-				ModifiedEntries:   0,
-				ChunkCount:        uint64(len(tsmReader.Entries)),
-				TotalBytes:        totalBytes,
-			})
-		}
-
-		cleanupTmp()
-		return snapshotID, nil
-	}
-
-	// Step 5: Rename all to final names (order matters for consistency)
-	// First the directory, then stamp, then index files
-	if err := os.Rename(tmpPath, finalPath); err != nil {
-		cleanupTmp()
-		return "", fmt.Errorf("rename snapshot: %w", err)
-	}
-	// Also rename the stamp file
-	os.Rename(tmpPath+".stamp", finalPath+".stamp")
-
-	if err := os.Rename(tmpTSMPath, finalTSMPath); err != nil {
-		log.Printf("Warning: failed to rename tsm: %v", err)
-	}
-	if err := os.Rename(tmpTSCPath, finalTSCPath); err != nil {
-		log.Printf("Warning: failed to rename tsc: %v", err)
-	}
-
-	// Step 6: Write snap.jsonc metadata
-	snapMeta := &SnapMeta{
-		Parent: parentStampID,
-		Taints: taints,
-	}
-	if err := writeSnapMeta(*flagSnapsDir, snapshotID, snapMeta); err != nil {
-		log.Printf("Warning: failed to write snap.jsonc for %s: %v", snapshotID, err)
-	}
-
-	log.Printf("Created snapshot %s (SHA-256) with tsm/tsc", snapshotID)
-	return snapshotID, nil
+	return indexAndFinalizeSubvol(tmpPath, subdir, parentStampID, taints, progressCallback)
 }
 
 // meshPort is the HTTP port for mesh discovery (TSTS in leetspeak = 7575)

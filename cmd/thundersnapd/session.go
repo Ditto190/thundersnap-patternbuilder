@@ -382,6 +382,7 @@ func makeVMXControlHandler(frameRootFS string) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ping", handlePing)
 	mux.HandleFunc("/snap", makeSnapHandler(frameRootFS))
+	mux.HandleFunc("/fork", makeForkHandler(frameRootFS))
 	return mux
 }
 

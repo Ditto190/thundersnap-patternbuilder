@@ -91,7 +91,7 @@ func TestTsFrame(t *testing.T) {
 
 	// Test: ts frame <snap>:: creates a new frame (inheriting home/work)
 	// First, take a snapshot so we have a snap ID to use
-	snapStdout, _, exitCode, err := sshExecSplit(t, d, "root@frametest", "ts snap")
+	snapStdout, _, exitCode, err := sshExecSplit(t, d, "root@frametest", "ts snap --wait")
 	if err != nil {
 		t.Fatalf("ts snap failed: %v", err)
 	}
@@ -140,7 +140,7 @@ func TestTsLog(t *testing.T) {
 	t.Logf("ts log (initial): %s", output)
 
 	// Take a snap - this should add to history
-	snapStdout, _, exitCode, err := sshExecSplit(t, d, "root@logtest", "ts snap")
+	snapStdout, _, exitCode, err := sshExecSplit(t, d, "root@logtest", "ts snap --wait")
 	if err != nil {
 		t.Fatalf("ts snap failed: %v", err)
 	}
@@ -185,7 +185,7 @@ func TestTsFrameCreatesNewFrame(t *testing.T) {
 	parentUUID := strings.TrimSpace(output)
 
 	// Take a snap in the parent
-	snapStdout, _, exitCode, err := sshExecSplit(t, d, "root@parent", "ts snap")
+	snapStdout, _, exitCode, err := sshExecSplit(t, d, "root@parent", "ts snap --wait")
 	if err != nil {
 		t.Fatalf("ts snap failed: %v", err)
 	}
@@ -529,7 +529,7 @@ func TestTsUndo(t *testing.T) {
 	}
 
 	// Take a snapshot (this records state1)
-	snapStdout, _, exitCode, err := sshExecSplit(t, d, "root@undotest", "ts snap")
+	snapStdout, _, exitCode, err := sshExecSplit(t, d, "root@undotest", "ts snap --wait")
 	if err != nil {
 		t.Fatalf("ts snap failed: %v", err)
 	}

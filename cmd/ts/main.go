@@ -279,6 +279,7 @@ func cmdSnap(args []string) {
 	opts := getopt.New()
 	opts.SetProgram("ts snap")
 	deleteFlag := opts.BoolLong("delete", 'd', "delete a snapshot")
+	waitFlag := opts.BoolLong("wait", 'w', "wait for indexing to complete and print the snap ID (default: capture and return at once, indexing in the background)")
 	// Parse expects first element to be program name (like os.Args)
 	opts.Parse(append([]string{"ts snap"}, args...))
 
@@ -316,14 +317,23 @@ func cmdSnap(args []string) {
 		subdir = resolved
 	}
 
-	snapshotID, err := doSnap(*sockPath, subdir)
+	snapshotID, err := doSnap(*sockPath, subdir, *waitFlag)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
 
-	// Print just the snapshot ID to stdout
-	fmt.Println(snapshotID)
+	if *waitFlag {
+		// --wait: the content-addressable snap ID is known; print it to
+		// stdout for scripting (the historical default behavior).
+		fmt.Println(snapshotID)
+		return
+	}
+
+	// Default (fire-and-forget): the snap was captured and indexing runs in
+	// the background. Nothing on stdout (the ID isn't known yet); emit a
+	// short notice on stderr so the user knows it worked.
+	fmt.Fprintln(os.Stderr, "snap captured; indexing in background")
 }
 
 // resolveSnapSubdir turns a user-supplied path (absolute or relative to the
@@ -389,12 +399,17 @@ type SnapStreamEvent struct {
 	SnapshotID string `json:"snapshot_id,omitempty"` // snapshot ID (for result)
 }
 
-func doSnap(sockPath, subdir string) (string, error) {
+func doSnap(sockPath, subdir string, wait bool) (string, error) {
 	client := thunderclient.NewHTTPClient(sockPath)
 	render := newProgressRenderer()
 
-	// Build URL with streaming enabled
+	// Build URL with streaming enabled. wait=1 makes the server block until
+	// indexing completes and stream back progress + the snap ID; without it
+	// the server captures and returns immediately, indexing in the background.
 	url := "http://localhost/snap?stream=1"
+	if wait {
+		url += "&wait=1"
+	}
 	if render.tty {
 		url += "&tty=1"
 	}
@@ -458,6 +473,8 @@ func doSnap(sockPath, subdir string) (string, error) {
 		return "", fmt.Errorf("snap failed: %s", lastEvent.Message)
 	}
 
+	// In fire-and-forget mode the server returns no snapshot ID (indexing is
+	// still running in the background); return an empty string to signal that.
 	return lastEvent.SnapshotID, nil
 }
 
@@ -597,16 +614,19 @@ func cmdFrame(args []string) {
 	}
 
 	// Two colons: snap triplet
-	// Special case: :: snaps the current frame and creates a new frame from it
+	// Special case: :: snaps the current frame and creates a new frame from it.
+	// Fork does this without blocking on indexing: it captures the current
+	// frame as a background snap and clones a new frame from the live
+	// filesystem. (ts frame :: is otherwise identical to ts go :: minus the
+	// session entry.)
 	if spec == "::" {
-		// First snap the current state
-		snapTriplet, err := doSnap(*sockPath, "")
+		uuid, err := doFork(*sockPath)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "error snapping current frame: %v\n", err)
+			fmt.Fprintf(os.Stderr, "error forking current frame: %v\n", err)
 			os.Exit(1)
 		}
-		// The snapshot triplet is already a valid spec (root:home:work)
-		spec = snapTriplet
+		fmt.Println(uuid)
+		return
 	}
 
 	// Handle empty components by inheriting from current frame, then create
@@ -755,6 +775,29 @@ func doCreate(sockPath, snapshotSpec, isolation, refName string) (string, error)
 	}
 
 	return lastEvent.UUID, nil
+}
+
+// ForkResponse is the response from /fork.
+type ForkResponse struct {
+	Status  string `json:"status"`
+	UUID    string `json:"uuid,omitempty"`
+	Message string `json:"message,omitempty"`
+}
+
+// doFork captures the current frame as a background snap and creates a new
+// frame cloned from the current frame's live filesystem, returning the new
+// frame's UUID. This is the fast path for `ts go ::` / `ts frame ::`: it does
+// not block on content-addressable indexing (the current frame's snap is
+// recorded in the background). See background-indexing.md.
+func doFork(sockPath string) (string, error) {
+	result, err := thunderclient.PostJSON[struct{}, ForkResponse](sockPath, "/fork", struct{}{})
+	if err != nil {
+		return "", fmt.Errorf("request failed: %w", err)
+	}
+	if result.Status != "ok" {
+		return "", fmt.Errorf("%s", result.Message)
+	}
+	return result.UUID, nil
 }
 
 // DeleteFrameRequest is the request body for /delete-frame
@@ -1082,19 +1125,27 @@ func doWhoHas(sockPath, snapshotID string) ([]tsm.PeerResult, error) {
 func cmdTaint(args []string) {
 	opts := getopt.New()
 	opts.SetProgram("ts taint")
-	opts.SetParameters("<taint-name>")
+	opts.SetParameters("[<taint-name>]")
 	// Parse expects first element to be program name (like os.Args)
 	opts.Parse(append([]string{"ts taint"}, args...))
 
+	// No argument: list the current frame's taints.
+	if opts.NArgs() == 0 {
+		if err := doListTaints(*sockPath); err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
 	if opts.NArgs() != 1 {
-		fmt.Fprintln(os.Stderr, "error: taint requires exactly one argument: taint-name")
+		fmt.Fprintln(os.Stderr, "error: taint takes at most one argument: taint-name")
 		fmt.Fprintln(os.Stderr, "")
-		fmt.Fprintln(os.Stderr, "usage: ts taint <taint-name>")
+		fmt.Fprintln(os.Stderr, "usage: ts taint [<taint-name>]")
 		fmt.Fprintln(os.Stderr, "")
 		fmt.Fprintln(os.Stderr, "examples:")
-		fmt.Fprintln(os.Stderr, "  ts taint pii:customers")
+		fmt.Fprintln(os.Stderr, "  ts taint                  list current frame's taints")
+		fmt.Fprintln(os.Stderr, "  ts taint pii:customers    add a taint")
 		fmt.Fprintln(os.Stderr, "  ts taint unsafe-permissions")
-		fmt.Fprintln(os.Stderr, "  ts taint untrusted-code")
 		os.Exit(1)
 	}
 
@@ -1132,6 +1183,31 @@ func doTaint(sockPath, taintName string) error {
 	fmt.Printf("Added taint: %s\n", taintName)
 	if len(result.Taints) > 0 {
 		fmt.Printf("Current taints: %v\n", result.Taints)
+	}
+	return nil
+}
+
+// doListTaints lists the current frame's taints via GET /taint.
+func doListTaints(sockPath string) error {
+	client := thunderclient.NewHTTPClient(sockPath)
+	resp, err := client.Get("http://localhost/taint")
+	if err != nil {
+		return fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	var result TaintResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return fmt.Errorf("decode response: %w", err)
+	}
+	if result.Status != "ok" {
+		return fmt.Errorf("server error: %s", result.Message)
+	}
+	if len(result.Taints) == 0 {
+		fmt.Println("(no taints)")
+		return nil
+	}
+	for _, t := range result.Taints {
+		fmt.Println(t)
 	}
 	return nil
 }
@@ -1926,6 +2002,7 @@ func cmdGo(args []string) {
 
 	var targetUUID string
 	var createdNewFrame bool
+	var forkedFromCurrent bool // :: forks the current frame; history is already copied by /fork
 
 	if spec == "" {
 		// No args: stay in current frame (identity operation, but still enters session)
@@ -1951,18 +2028,22 @@ func cmdGo(args []string) {
 				os.Exit(1)
 			}
 		} else if spec == "::" {
-			// :: snaps current frame and creates a new frame from it
-			snapTriplet, err := doSnap(*sockPath, "")
+			// :: = save current state and branch from it. Fork captures the
+			// current frame as a background snap and clones a new frame from
+			// the live filesystem, without blocking on indexing. /fork already
+			// copies the source frame's history into the new frame, so we must
+			// NOT call doCloneHistory below (that would re-read the source's
+			// history — which may or may not yet include the fork-point snap,
+			// depending on background-indexing timing — and overwrite the new
+			// frame's history nondeterministically).
+			forkedUUID, err := doFork(*sockPath)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "error snapping current frame: %v\n", err)
+				fmt.Fprintf(os.Stderr, "error forking current frame: %v\n", err)
 				os.Exit(1)
 			}
-			targetUUID, err = doCreate(*sockPath, snapTriplet, parsed.isolation, "")
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "error: %v\n", err)
-				os.Exit(1)
-			}
+			targetUUID = forkedUUID
 			createdNewFrame = true
+			forkedFromCurrent = true
 		} else {
 			// Snap triplet - create new frame
 			snapshotSpec, err := resolveSnapTriplet(*sockPath, spec)
@@ -1979,8 +2060,10 @@ func cmdGo(args []string) {
 		}
 	}
 
-	// If we created a new frame, clone the parent's history
-	if createdNewFrame && currentUUID != "" {
+	// If we created a new frame from a snap triplet, clone the parent's
+	// history. Skip this for :: (fork), which already copied history in the
+	// daemon to avoid racing the background indexer.
+	if createdNewFrame && !forkedFromCurrent && currentUUID != "" {
 		if err := doCloneHistory(*sockPath, currentUUID, targetUUID); err != nil {
 			// Log but don't fail - history cloning is best-effort
 			fmt.Fprintf(os.Stderr, "warning: failed to clone history: %v\n", err)
@@ -2308,8 +2391,9 @@ func cmdUndo(args []string) {
 	// The most recent snap in the log is history[0] (newest first)
 	prevSnap := history[0].Snap
 
-	// 2. Run ts snap to record current state
-	currentSnap, err := doSnap(*sockPath, "")
+	// 2. Run ts snap to record current state (wait so the ID is known for
+	// history pruning below).
+	currentSnap, err := doSnap(*sockPath, "", true)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error taking snapshot: %v\n", err)
 		os.Exit(1)
