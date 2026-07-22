@@ -173,11 +173,15 @@ func Download(opts DownloadOptions) (*DownloadResult, error) {
 		}
 	}
 
-	// Step 6: Load local chunk map for deduplication
-	localChunks, err := LoadLocalChunkMap(opts.SnapsDir)
+	// Step 6: Open the local chunk index for cross-snapshot deduplication.
+	// This is cheap (it streams each .tsc once to build a Bloom filter and
+	// builds per-snapshot location maps lazily on first hit), so it is worth
+	// doing even on a large store, where the old eager LoadLocalChunkMap was
+	// too expensive to run on every download.
+	localChunks, err := OpenChunkIndex(opts.SnapsDir)
 	if err != nil {
 		// Non-fatal: just won't deduplicate
-		localChunks = &ChunkMap{}
+		localChunks = &ChunkIndex{}
 	}
 
 	// Step 7: Download files
@@ -267,7 +271,7 @@ type downloadFilesOpts struct {
 	snapshotID  string
 	tsm         *TSMReader
 	tsc         *TSCReader
-	localChunks *ChunkMap
+	localChunks *ChunkIndex
 	client      *http.Client
 	progress    io.Writer
 
@@ -356,7 +360,7 @@ type downloadFileOpts struct {
 	remotePath  string
 	entry       *TSMEntry
 	tsc         *TSCReader
-	localChunks *ChunkMap
+	localChunks *ChunkIndex
 	baseURL     string
 	client      *http.Client
 }

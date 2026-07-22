@@ -4,147 +4,279 @@
 package tsm
 
 import (
-	"bytes"
+	"crypto/sha256"
+	"encoding/binary"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
-func TestChunkMapFindChunk(t *testing.T) {
-	sha1 := [32]byte{0x01}
-	sha2 := [32]byte{0x02}
-	sha3 := [32]byte{0x03}
-
-	m := &ChunkMap{
-		Locations: []ChunkLocation{
-			{SHA256: sha1, Filename: "file1", Offset: 0, Size: 100},
-			{SHA256: sha2, Filename: "file2", Offset: 100, Size: 200},
-			{SHA256: sha3, Filename: "file3", Offset: 300, Size: 300},
-		},
+// TestBloomFilter covers the filter directly: it never produces false negatives
+// and its false-positive rate stays near the configured target.
+func TestBloomFilter(t *testing.T) {
+	// An empty filter (n==0) reports "not present" for everything.
+	empty := newBloomFilter(0, 0.01)
+	var anyKey [32]byte
+	if empty.test(anyKey) {
+		t.Error("empty bloom reported a hit")
 	}
 
-	// Test finding existing chunks
-	if loc, found := m.FindChunk(sha1); !found {
-		t.Error("sha1 not found")
-	} else if loc.Filename != "file1" {
-		t.Errorf("sha1 filename = %s, want file1", loc.Filename)
+	// Populate with 1000 keys derived from sha256(i).
+	const n = 1000
+	bf := newBloomFilter(n, 0.01)
+	keys := make([][32]byte, n)
+	for i := uint64(0); i < n; i++ {
+		var buf [8]byte
+		binary.BigEndian.PutUint64(buf[:], i)
+		keys[i] = sha256.Sum256(buf[:])
+		bf.add(keys[i])
 	}
 
-	if loc, found := m.FindChunk(sha2); !found {
-		t.Error("sha2 not found")
-	} else if loc.Size != 200 {
-		t.Errorf("sha2 size = %d, want 200", loc.Size)
+	// No false negatives: every added key must test true.
+	for i, k := range keys {
+		if !bf.test(k) {
+			t.Errorf("false negative for added key %d", i)
+		}
 	}
 
-	if loc, found := m.FindChunk(sha3); !found {
-		t.Error("sha3 not found")
-	} else if loc.Offset != 300 {
-		t.Errorf("sha3 offset = %d, want 300", loc.Offset)
+	// False positives among absent keys must stay near the 1% target; allow
+	// up to 3% (many standard deviations above the expectation) to avoid
+	// flakiness while still validating the rate is bounded.
+	const trials = 5000
+	var fp int
+	for i := uint64(0); i < trials; i++ {
+		var buf [8]byte
+		// Offset the input space so these keys were never added.
+		binary.BigEndian.PutUint64(buf[:], i+1_000_000)
+		if bf.test(sha256.Sum256(buf[:])) {
+			fp++
+		}
 	}
-
-	// Test not finding non-existent chunk
-	sha4 := [32]byte{0x04}
-	if _, found := m.FindChunk(sha4); found {
-		t.Error("sha4 should not be found")
-	}
-
-	// Test empty map
-	empty := &ChunkMap{}
-	if _, found := empty.FindChunk(sha1); found {
-		t.Error("empty map should not find anything")
+	if rate := float64(fp) / trials; rate > 0.03 {
+		t.Errorf("false-positive rate %g (%d/%d) exceeds 3%%", rate, fp, trials)
 	}
 }
 
-func TestLoadLocalChunkMap(t *testing.T) {
-	// Create a temp directory with test TSC/TSM files
-	tmpDir := t.TempDir()
-
-	// Create a minimal snapshot structure:
-	// tmpDir/
-	//   snap1.tsc
-	//   snap1.tsm
-	//   snap1/
-	//     testfile.txt
-
-	snapName := "snap1"
-	snapDir := filepath.Join(tmpDir, snapName)
+// makeTestSnap creates a snapshot directory under dir with the given files
+// (map of relpath->content) and indexes it, producing <dir>/<name>/.tsm/.tsc.
+// It returns the snap's base path (without extension).
+func makeTestSnap(t *testing.T, dir, name string, files map[string]string) string {
+	t.Helper()
+	snapDir := filepath.Join(dir, name)
 	if err := os.MkdirAll(snapDir, 0755); err != nil {
 		t.Fatal(err)
 	}
-
-	// Create a test file
-	testContent := []byte("Hello, World! This is test content for chunking.\n")
-	testFile := filepath.Join(snapDir, "testfile.txt")
-	if err := os.WriteFile(testFile, testContent, 0644); err != nil {
-		t.Fatal(err)
-	}
-
-	// Generate TSM/TSC for the snapshot
-	outBase := filepath.Join(tmpDir, snapName)
-	if err := Create(snapDir, outBase, IndexerOptions{}); err != nil {
-		t.Fatal(err)
-	}
-
-	// Verify files were created
-	tscPath := outBase + ".tsc"
-	tsmPath := outBase + ".tsm"
-	if _, err := os.Stat(tscPath); err != nil {
-		t.Fatalf("TSC not created: %v", err)
-	}
-	if _, err := os.Stat(tsmPath); err != nil {
-		t.Fatalf("TSM not created: %v", err)
-	}
-
-	// Load the chunk map
-	m, err := LoadLocalChunkMap(tmpDir)
-	if err != nil {
-		t.Fatalf("LoadLocalChunkMap: %v", err)
-	}
-
-	if len(m.Locations) == 0 {
-		t.Error("no chunks found")
-	}
-
-	t.Logf("Found %d chunk locations", len(m.Locations))
-
-	// Verify chunks are sorted
-	for i := 1; i < len(m.Locations); i++ {
-		if bytes.Compare(m.Locations[i-1].SHA256[:], m.Locations[i].SHA256[:]) > 0 {
-			t.Errorf("chunks not sorted at index %d", i)
+	for rel, content := range files {
+		full := filepath.Join(snapDir, rel)
+		if err := os.MkdirAll(filepath.Dir(full), 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte(content), 0644); err != nil {
+			t.Fatal(err)
 		}
 	}
-
-	// Verify we can find a chunk
-	if len(m.Locations) > 0 {
-		sha := m.Locations[0].SHA256
-		if loc, found := m.FindChunk(sha); !found {
-			t.Error("first chunk not found")
-		} else {
-			t.Logf("Found chunk: file=%s offset=%d size=%d", loc.Filename, loc.Offset, loc.Size)
-		}
+	base := filepath.Join(dir, name)
+	if err := Create(snapDir, base, IndexerOptions{}); err != nil {
+		t.Fatal(err)
 	}
+	return base
 }
 
-func TestLoadLocalChunkMapEmptyDir(t *testing.T) {
+// firstChunkSHA returns the SHA of the first chunk in a snapshot's .tsc.
+func firstChunkSHA(t *testing.T, tscPath string) [32]byte {
+	t.Helper()
+	r, err := ReadTSC(tscPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(r.Entries) == 0 {
+		t.Fatalf("%s has no chunks", tscPath)
+	}
+	return r.Entries[0].SHA256
+}
+
+// TestOpenChunkIndex builds an index over a real snapshot and verifies a chunk
+// can be found and read back with a matching hash. This replaces the former
+// TestLoadLocalChunkMap.
+func TestOpenChunkIndex(t *testing.T) {
 	tmpDir := t.TempDir()
+	base := makeTestSnap(t, tmpDir, "snap1", map[string]string{
+		"testfile.txt": "Hello, World! This is test content for chunking.\n",
+	})
 
-	m, err := LoadLocalChunkMap(tmpDir)
+	ci, err := OpenChunkIndex(tmpDir)
 	if err != nil {
-		t.Fatalf("LoadLocalChunkMap on empty dir: %v", err)
+		t.Fatalf("OpenChunkIndex: %v", err)
+	}
+	if ci.SnapCount() != 1 {
+		t.Errorf("SnapCount = %d, want 1", ci.SnapCount())
 	}
 
-	if len(m.Locations) != 0 {
-		t.Errorf("expected 0 locations, got %d", len(m.Locations))
+	sha := firstChunkSHA(t, base+".tsc")
+	loc, found := ci.FindChunk(sha)
+	if !found {
+		t.Fatal("FindChunk did not find a known chunk")
+	}
+	data, err := loc.VerifyAndRead()
+	if err != nil {
+		t.Fatalf("VerifyAndRead: %v", err)
+	}
+	if got := BlobSHA256(data); got != sha {
+		t.Errorf("VerifyAndRead returned data with sha %x, want %x", got, sha)
 	}
 }
 
-func TestLoadLocalChunkMapNonExistentDir(t *testing.T) {
-	m, err := LoadLocalChunkMap("/nonexistent/path")
+func TestOpenChunkIndexEmptyDir(t *testing.T) {
+	tmpDir := t.TempDir()
+	ci, err := OpenChunkIndex(tmpDir)
 	if err != nil {
-		t.Fatalf("LoadLocalChunkMap on nonexistent dir: %v", err)
+		t.Fatalf("OpenChunkIndex on empty dir: %v", err)
+	}
+	if ci.SnapCount() != 0 {
+		t.Errorf("SnapCount = %d, want 0", ci.SnapCount())
+	}
+	if _, found := ci.FindChunk([32]byte{0x01}); found {
+		t.Error("FindChunk on empty index returned a hit")
+	}
+}
+
+func TestOpenChunkIndexNonExistentDir(t *testing.T) {
+	ci, err := OpenChunkIndex("/nonexistent/path")
+	if err != nil {
+		t.Fatalf("OpenChunkIndex on nonexistent dir: %v", err)
+	}
+	if ci.SnapCount() != 0 {
+		t.Errorf("SnapCount = %d, want 0", ci.SnapCount())
+	}
+	if _, found := ci.FindChunk([32]byte{0x01}); found {
+		t.Error("FindChunk on missing-dir index returned a hit")
+	}
+}
+
+// TestChunkIndexMRUOrdering verifies that a successful lookup moves the serving
+// snapshot to the front, so a chunk present in multiple snapshots is served
+// from the most-recently-used one.
+func TestChunkIndexMRUOrdering(t *testing.T) {
+	tmpDir := t.TempDir()
+	// shared content X appears in both snaps; onlyB content is exclusive to
+	// snapB. Identical bytes produce identical chunk hashes.
+	const shared = "shared content that will be chunked identically everywhere it appears\n"
+	const onlyB = "this content exists only in snapB and gives snapB-exclusive chunks\n"
+
+	snapABase := makeTestSnap(t, tmpDir, "snapA", map[string]string{"shared.txt": shared})
+	snapBBase := makeTestSnap(t, tmpDir, "snapB", map[string]string{
+		"shared.txt": shared,
+		"onlyB.txt":  onlyB,
+	})
+	snapBDir := filepath.Join(tmpDir, "snapB")
+
+	ci, err := OpenChunkIndex(tmpDir)
+	if err != nil {
+		t.Fatalf("OpenChunkIndex: %v", err)
 	}
 
-	if len(m.Locations) != 0 {
-		t.Errorf("expected 0 locations, got %d", len(m.Locations))
+	// Find a chunk that is exclusive to snapB, which moves snapB to the front.
+	bOnlySHA := firstChunkSHA(t, snapBBase+".tsc")
+	// Make sure the first chunk of snapB is actually in snapA's set too, by
+	// accident; if so, pick a chunk we can prove is B-only by cross-checking.
+	aTSC, _ := ReadTSC(snapABase + ".tsc")
+	inA := make(map[[32]byte]bool, len(aTSC.Entries))
+	for _, e := range aTSC.Entries {
+		inA[e.SHA256] = true
+	}
+	if inA[bOnlySHA] {
+		// Fall back to scanning snapB's .tsc for a B-exclusive chunk.
+		bTSC, _ := ReadTSC(snapBBase + ".tsc")
+		found := false
+		for _, e := range bTSC.Entries {
+			if !inA[e.SHA256] {
+				bOnlySHA = e.SHA256
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatal("could not find a snapB-exclusive chunk; test setup is wrong")
+		}
+	}
+
+	if loc, found := ci.FindChunk(bOnlySHA); !found {
+		t.Fatal("FindChunk did not find snapB-exclusive chunk")
+	} else if !strings.HasPrefix(loc.Filename, snapBDir) {
+		t.Errorf("B-only chunk served from %q, want under %q", loc.Filename, snapBDir)
+	}
+
+	// Now look up a chunk present in both snaps. With snapB at the front, it
+	// must be served from snapB (the MRU snap), not snapA.
+	sharedSHA := firstChunkSHA(t, snapABase+".tsc")
+	loc, found := ci.FindChunk(sharedSHA)
+	if !found {
+		t.Fatal("FindChunk did not find the shared chunk")
+	}
+	if !strings.HasPrefix(loc.Filename, snapBDir) {
+		t.Errorf("shared chunk served from %q, want MRU snap under %q", loc.Filename, snapBDir)
+	}
+}
+
+// TestChunkIndexLRUEviction verifies that correctness is maintained when the
+// LRU caps force .tsc buffers and location maps to be evicted and reloaded.
+func TestChunkIndexLRUEviction(t *testing.T) {
+	tmpDir := t.TempDir()
+	snapABase := makeTestSnap(t, tmpDir, "snapA", map[string]string{
+		"a.txt": "content for snap A, distinct from snap B\n",
+	})
+	snapBBase := makeTestSnap(t, tmpDir, "snapB", map[string]string{
+		"b.txt": "completely different content for snap B\n",
+	})
+
+	// Caps of 1 force eviction on every cross-snap lookup.
+	ci, err := OpenChunkIndexWith(tmpDir, 1, 1)
+	if err != nil {
+		t.Fatalf("OpenChunkIndexWith: %v", err)
+	}
+
+	chunkA := firstChunkSHA(t, snapABase+".tsc")
+	chunkB := firstChunkSHA(t, snapBBase+".tsc")
+
+	// Alternate between the two snapshots so each lookup evicts the other's
+	// loaded state and must reload it. Each result must still verify.
+	for i := 0; i < 3; i++ {
+		for _, tc := range []struct {
+			name string
+			sha  [32]byte
+		}{
+			{"A", chunkA},
+			{"B", chunkB},
+			{"A", chunkA},
+			{"B", chunkB},
+		} {
+			loc, found := ci.FindChunk(tc.sha)
+			if !found {
+				t.Fatalf("pass %d %s: FindChunk miss", i, tc.name)
+			}
+			if _, err := loc.VerifyAndRead(); err != nil {
+				t.Fatalf("pass %d %s: VerifyAndRead: %v", i, tc.name, err)
+			}
+		}
+	}
+}
+
+// TestChunkIndexAbsentChunk verifies a chunk present in no snapshot is not
+// found (the Bloom filter short-circuits the common case, but the result must
+// be false regardless).
+func TestChunkIndexAbsentChunk(t *testing.T) {
+	tmpDir := t.TempDir()
+	makeTestSnap(t, tmpDir, "snap1", map[string]string{
+		"testfile.txt": "some content\n",
+	})
+	ci, err := OpenChunkIndex(tmpDir)
+	if err != nil {
+		t.Fatalf("OpenChunkIndex: %v", err)
+	}
+	var absent [32]byte
+	absent[0] = 0xff // arbitrary, almost certainly not in the snap
+	if _, found := ci.FindChunk(absent); found {
+		t.Error("FindChunk reported a hit for an absent chunk")
 	}
 }

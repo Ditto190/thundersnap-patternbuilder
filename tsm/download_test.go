@@ -321,3 +321,87 @@ func TestDownloadAlreadyExists(t *testing.T) {
 		t.Error("expected AlreadyExists=true")
 	}
 }
+
+// TestDownloadDedupFromOtherSnap proves that downloading a snapshot reuses
+// chunks already present in a *different* local snapshot, rather than fetching
+// them from the peer. It does so decisively: the peer serves the new snap's
+// metadata (.stamp/.tsm/.tsc) but refuses to serve any chunk data, so the
+// download can only succeed if every chunk is copied from the pre-existing
+// local snapshot.
+//
+// The two snapshots have different paths (hence different snapshot IDs) but
+// identical file *content*, so content-defined chunking produces an identical
+// chunk set, and every chunk of the new snap is locatable in the old one via
+// ChunkIndex.
+func TestDownloadDedupFromOtherSnap(t *testing.T) {
+	peerDir := t.TempDir()
+	localDir := t.TempDir()
+
+	// Identical content in both snapshots; different filename so the snapshot
+	// IDs (.tsm hashes) differ but the chunk hashes are identical.
+	content := []byte("shared file content for cross-snapshot chunk dedup test\n" +
+		strings.Repeat("the quick brown fox jumps over the lazy dog\n", 64))
+
+	// Local, pre-existing snapshot "snapA".
+	if err := os.MkdirAll(filepath.Join(localDir, "snapA"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(localDir, "snapA", "file.txt"), content, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := Create(filepath.Join(localDir, "snapA"), filepath.Join(localDir, "snapA"), IndexerOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Peer snapshot "snapB": same bytes, different path.
+	if err := os.MkdirAll(filepath.Join(peerDir, "snapB"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(peerDir, "snapB", "renamed.txt"), content, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := Create(filepath.Join(peerDir, "snapB"), filepath.Join(peerDir, "snapB"), IndexerOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(peerDir, "snapB.stamp"), []byte(""), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Server: serve metadata files fully; REFUSE all chunk-data requests.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path := strings.TrimPrefix(r.URL.Path, "/bupdate/")
+		fullPath := filepath.Join(peerDir, path)
+
+		switch {
+		case strings.HasSuffix(path, ".stamp"),
+			strings.HasSuffix(path, ".tsm"),
+			strings.HasSuffix(path, ".tsc"):
+			http.ServeFile(w, r, fullPath)
+		default:
+			// Chunk data: refuse. If the download needs any byte from the
+			// peer, it must fail.
+			http.Error(w, "chunk data not served by this peer", http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	result, err := Download(DownloadOptions{
+		SnapshotID: "snapB",
+		SnapsDir:   localDir,
+		BaseURL:    server.URL,
+	})
+	if err != nil {
+		t.Fatalf("Download: %v (expected pure local dedup; peer refuses data)", err)
+	}
+	if result.AlreadyExists {
+		t.Error("expected AlreadyExists=false")
+	}
+
+	got, err := os.ReadFile(filepath.Join(localDir, "snapB", "renamed.txt"))
+	if err != nil {
+		t.Fatalf("reading downloaded renamed.txt: %v", err)
+	}
+	if string(got) != string(content) {
+		t.Errorf("downloaded content mismatch (len got=%d want=%d)", len(got), len(content))
+	}
+}
