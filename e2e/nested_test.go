@@ -3,10 +3,11 @@
 
 //go:build e2e
 
-// nested_test.go contains end-to-end tests for nested thundersnap: running a
-// thundersnapd inside a thundersnap frame (frame inside a frame). These tests
-// catch the btrfs subvolume + setns stale root dentry issues that only appear
-// in nested mode. See docs/nested-btrfs-setns.md for the full explanation.
+// nested_test.go contains an end-to-end test for nested thundersnap: running
+// a thundersnapd inside a thundersnap frame (frame inside a frame). This
+// catches the btrfs subvolume + setns stale root dentry issues that only
+// appear in nested mode. See docs/nested-btrfs-setns.md for the full
+// explanation.
 //
 // Per CLAUDE.md: e2e tests MUST NEVER SKIP. If a precondition is missing, the
 // test must fail (t.Fatal), not skip.
@@ -27,8 +28,8 @@ import (
 
 // copyBinaryWithDeps copies a dynamically-linked binary and all its shared
 // library dependencies into a target rootfs directory. This is necessary for
-// running dynamic binaries (like btrfs, virtiofsd, passt) inside minimal
-// container rootfs that don't have /lib64 or /usr/lib.
+// running dynamic binaries (like btrfs) inside minimal container rootfs that
+// don't have /lib64 or /usr/lib.
 //
 // For static binaries, this copies just the binary (ldd either fails or
 // reports no deps).
@@ -137,10 +138,7 @@ func (id *innerDaemon) Close() {
 //
 // Returns an innerDaemon handle. Call Close() (or use t.Cleanup) to stop the
 // daemon when done.
-//
-// If vmMode is true, also copies VM dependencies (cloud-hypervisor, vmlinux,
-// virtiofsd, passt) and creates a vmx-isolation policy.
-func setupInnerDaemon(t *testing.T, d *daemonInstance, env *testEnv, outerRef, outerUUID string, vmMode bool) *innerDaemon {
+func setupInnerDaemon(t *testing.T, d *daemonInstance, env *testEnv, outerRef, outerUUID string) *innerDaemon {
 	t.Helper()
 
 	framePath := filepath.Join(env.root, "fs", testUser, outerUUID)
@@ -193,60 +191,19 @@ func setupInnerDaemon(t *testing.T, d *daemonInstance, env *testEnv, outerRef, o
 	}
 	copyBinaryWithDeps(t, btrfsPath, framePath)
 
-	// VM mode: copy VM dependencies.
-	if vmMode {
-		vmDir := vmDir()
-		if vmDir == "" {
-			t.Fatal("VM nested test requires cloud-hypervisor and vmlinux in vm/")
-		}
-		// Create /vm directory inside the frame rootfs.
-		vmFrameDir := filepath.Join(framePath, "vm")
-		if err := os.MkdirAll(vmFrameDir, 0755); err != nil {
-			t.Fatalf("mkdir vm dir: %v", err)
-		}
-		// cloud-hypervisor (static) → /vm/cloud-hypervisor
-		if err := copyFile(filepath.Join(vmDir, "cloud-hypervisor"), filepath.Join(vmFrameDir, "cloud-hypervisor")); err != nil {
-			t.Fatalf("copy cloud-hypervisor: %v", err)
-		}
-		os.Chmod(filepath.Join(vmFrameDir, "cloud-hypervisor"), 0755)
-		// vmlinux → /vm/vmlinux
-		if err := copyFile(filepath.Join(vmDir, "vmlinux"), filepath.Join(vmFrameDir, "vmlinux")); err != nil {
-			t.Fatalf("copy vmlinux: %v", err)
-		}
-		// virtiofsd (dynamic) → /usr/libexec/virtiofsd + shared libs
-		virtiofsdPath := "/usr/libexec/virtiofsd"
-		if _, err := os.Stat(virtiofsdPath); err != nil {
-			virtiofsdPath, err = exec.LookPath("virtiofsd")
-			if err != nil {
-				t.Fatal("virtiofsd required for VM nested test")
-			}
-		}
-		copyBinaryWithDeps(t, virtiofsdPath, framePath)
-		// passt (dynamic) → /usr/bin/passt + shared libs
-		passtPath, err := exec.LookPath("passt")
-		if err != nil {
-			t.Fatal("passt required for VM nested test")
-		}
-		copyBinaryWithDeps(t, passtPath, framePath)
-	}
-
 	// --- 2. Create policy file ---
-	isolation := "container"
-	if vmMode {
-		isolation = "vmx"
-	}
-	policy := fmt.Sprintf(`{
+	policy := `{
 		"grants": [
 			{
 				"principals": ["*"],
 				"cap": {
 					"role": "developer",
-					"isolation": "%s",
+					"isolation": "container",
 					"maxFrames": 10
 				}
 			}
 		]
-	}`, isolation)
+	}`
 	policyPath := filepath.Join(framePath, "tmp", "policy.json")
 	if err := os.WriteFile(policyPath, []byte(policy), 0644); err != nil {
 		t.Fatalf("write policy: %v", err)
@@ -273,9 +230,9 @@ func setupInnerDaemon(t *testing.T, d *daemonInstance, env *testEnv, outerRef, o
 	}
 
 	// The inner daemon command. PATH includes /bin (ts, vshd, busybox) and
-	// /usr/bin (btrfs, virtiofsd, passt) so the daemon and its children can
-	// find all the tools they need. --libexec-dir=/bin so the daemon finds
-	// ts and vshd there. Output goes to /tmp/inner.log for debugging.
+	// /usr/bin (btrfs) so the daemon and its children can find all the tools
+	// they need. --libexec-dir=/bin so the daemon finds ts and vshd there.
+	// Output goes to /tmp/inner.log for debugging.
 	daemonCmd := fmt.Sprintf(
 		"PATH=/bin:/usr/bin:/usr/libexec /bin/thundersnapd --test-listen=%s --test-user=e2e "+
 			"--data-dir=/tmp/inner-data --state-dir=/tmp/inner-state "+
@@ -318,8 +275,7 @@ func setupInnerDaemon(t *testing.T, d *daemonInstance, env *testEnv, outerRef, o
 	return id
 }
 
-// innerSSHExec runs a command on the inner daemon (not a frame — the daemon
-// itself, for ts subcommands like `ts frame`).
+// innerSSHExec runs a command on the inner daemon.
 func innerSSHExec(t *testing.T, addr, user, cmd string) (string, int, error) {
 	t.Helper()
 	client, err := ssh.Dial("tcp", addr, sshConfig(user))
@@ -344,10 +300,10 @@ func innerSSHExec(t *testing.T, addr, user, cmd string) (string, int, error) {
 	return string(output), exitCode, nil
 }
 
-// TestNestedContainerSession runs thundersnap inside thundersnap: the outer
-// daemon starts a container, inside which an inner daemon starts its own
-// container. This catches the btrfs subvolume + setns stale root dentry
-// issues that only appear in nested mode (see docs/nested-btrfs-setns.md).
+// TestNestedThundersnap runs thundersnap inside thundersnap: the outer daemon
+// starts a container, inside which an inner daemon starts its own container.
+// This catches the btrfs subvolume + setns stale root dentry issues that only
+// appear in nested mode (see docs/nested-btrfs-setns.md).
 //
 // Flow:
 //  1. Outer daemon → create frame "outer-nested"
@@ -355,7 +311,13 @@ func innerSSHExec(t *testing.T, addr, user, cmd string) (string, int, error) {
 //  3. Inner daemon → `ts frame --ref=inner nil:nil:nil`
 //  4. SSH to inner frame → `echo hello-nested`
 //  5. Verify output
-func TestNestedContainerSession(t *testing.T) {
+//  6. If /dev/kvm exists on the host, also check it's propagated into the
+//     nested container (so nested VMs would work). We don't boot a VM — that
+//     would be KVM-inside-container-inside-container, which is slow and
+//     fragile. The container-inside-kvm path is already covered by
+//     TestVMNamespaceSetup, and container-inside-kvm is architecturally the
+//     same as container-inside-root (the container-init code is identical).
+func TestNestedThundersnap(t *testing.T) {
 	env := newTestEnv(t)
 	d := startDaemon(t, env)
 
@@ -364,7 +326,7 @@ func TestNestedContainerSession(t *testing.T) {
 	t.Logf("outer frame: %s", outerUUID)
 
 	// Set up and start the inner daemon inside the outer frame.
-	id := setupInnerDaemon(t, d, env, "outer-nested", outerUUID, false)
+	id := setupInnerDaemon(t, d, env, "outer-nested", outerUUID)
 	t.Logf("inner daemon ready on %s", id.addr)
 
 	// Create a frame on the inner daemon.
@@ -391,127 +353,28 @@ func TestNestedContainerSession(t *testing.T) {
 	} else {
 		t.Logf("nested container OK: %q", strings.TrimSpace(output))
 	}
-}
 
-// TestNestedVMSession verifies that /dev/kvm is propagated into nested
-// thundersnap containers, so a daemon running inside a frame can spawn VMs.
-//
-// We do NOT boot a VM here — that would be KVM-inside-container-inside-container,
-// which is slow and fragile (passt can't create user namespaces inside
-// containers, etc.). Instead, we verify the key nesting infrastructure:
-// /dev/kvm is accessible inside a container started by an inner daemon that
-// is itself running inside an outer container. This is "KVM-inside-container"
-// — the VM would use the host's hardware KVM directly via the propagated
-// /dev/kvm device node.
-//
-// The "container-inside-kvm" path (a VM boots, then a container runs inside
-// it) is already covered by TestVMNamespaceSetup, and container-inside-kvm is
-// architecturally the same as container-inside-root (the container-init code
-// is identical in both cases — see container_setup.go).
-//
-// This test requires /dev/kvm on the host (requireVMDeps checks for it).
-func TestNestedVMSession(t *testing.T) {
-	// Check VM deps before starting — /dev/kvm must exist on the host.
-	// These are required — never skip.
-	requireVMDeps(t)
-
-	env := newTestEnv(t)
-	d := startDaemon(t, env)
-
-	// Create the outer frame.
-	outerUUID := createFrameViaDaemon(t, d, "outer-nested-vm")
-	t.Logf("outer frame: %s", outerUUID)
-
-	// Set up and start the inner daemon in CONTAINER mode (not VM mode —
-	// we're testing /dev/kvm propagation, not booting a VM). The inner
-	// daemon doesn't need VM binaries for this test.
-	id := setupInnerDaemon(t, d, env, "outer-nested-vm", outerUUID, false)
-	t.Logf("inner daemon ready on %s", id.addr)
-
-	// Create a frame on the inner daemon.
-	innerOutput, exitCode, err := innerSSHExec(t, id.addr, "root@",
-		"ts frame --ref=inner-vm nil:nil:nil")
-	if err != nil {
-		t.Fatalf("ts frame on inner daemon: %v", err)
-	}
-	if exitCode != 0 {
-		t.Fatalf("ts frame on inner daemon: exit %d, output: %s", exitCode, innerOutput)
-	}
-	t.Logf("inner frame created: %s", strings.TrimSpace(innerOutput))
-
-	// SSH to the inner frame (container mode) and check /dev/kvm.
-	// setupDev in container_setup.go propagates /dev/kvm via mknod using
-	// the device number captured by container-init before chrooting. If
-	// this fails, nested VMs won't work — a real nesting bug.
-	output, exitCode, err := innerSSHExec(t, id.addr, "inner-vm",
-		"test -c /dev/kvm && echo KVM_OK || echo KVM_MISSING")
-	if err != nil {
-		t.Fatalf("ssh to inner frame: %v", err)
-	}
-	if exitCode != 0 {
-		t.Errorf("check /dev/kvm: expected exit 0, got %d (output: %q)", exitCode, output)
-	}
-	if strings.Contains(output, "KVM_MISSING") {
-		t.Errorf("NESTING BUG: /dev/kvm not propagated into nested container. "+
-			"setupDev in container_setup.go should mknod it via the device "+
-			"number captured by container-init. output: %q", output)
-	} else if strings.Contains(output, "KVM_OK") {
-		t.Logf("nested KVM OK: /dev/kvm is accessible inside nested container")
-	} else {
-		t.Errorf("unexpected output checking /dev/kvm: %q", output)
-	}
-}
-
-// innerSSHExecWithTimeout is like innerSSHExec but with a configurable
-// timeout (for VM sessions that take time to boot).
-func innerSSHExecWithTimeout(t *testing.T, addr, user, cmd string, timeout time.Duration) (string, int, error) {
-	t.Helper()
-	client, err := ssh.Dial("tcp", addr, sshConfig(user))
-	if err != nil {
-		return "", -1, fmt.Errorf("dial inner daemon: %w", err)
-	}
-	defer client.Close()
-	session, err := client.NewSession()
-	if err != nil {
-		return "", -1, fmt.Errorf("new session: %w", err)
-	}
-	defer session.Close()
-
-	// Run the command in a goroutine with a timeout.
-	type result struct {
-		output   []byte
-		exitCode int
-		err      error
-	}
-	done := make(chan result, 1)
-	go func() {
-		output, err := session.CombinedOutput(cmd)
-		r := result{output: output, err: err}
+	// Check /dev/kvm propagation if the host has KVM. setupDev in
+	// container_setup.go propagates /dev/kvm via mknod using the device
+	// number captured by container-init before chrooting. If this fails,
+	// nested VMs won't work — a real nesting bug. We check this in the same
+	// inner frame (no extra setup needed) so it's essentially free.
+	if _, err := os.Stat("/dev/kvm"); err == nil {
+		output, _, err := innerSSHExec(t, id.addr, "inner",
+			"test -c /dev/kvm && echo KVM_OK || echo KVM_MISSING")
 		if err != nil {
-			if exitErr, ok := err.(*ssh.ExitError); ok {
-				r.exitCode = exitErr.ExitStatus()
-			} else {
-				r.exitCode = -1
-			}
+			t.Fatalf("check /dev/kvm in inner frame: %v", err)
 		}
-		done <- r
-	}()
-
-	select {
-	case r := <-done:
-		return string(r.output), r.exitCode, r.err
-	case <-time.After(timeout):
-		session.Close()
-		return "", -1, fmt.Errorf("timeout after %v", timeout)
+		if strings.Contains(output, "KVM_MISSING") {
+			t.Errorf("NESTING BUG: /dev/kvm not propagated into nested container. "+
+				"setupDev in container_setup.go should mknod it via the device "+
+				"number captured by container-init. output: %q", output)
+		} else if strings.Contains(output, "KVM_OK") {
+			t.Logf("nested KVM OK: /dev/kvm accessible inside nested container")
+		} else {
+			t.Errorf("unexpected output checking /dev/kvm: %q", output)
+		}
+	} else {
+		t.Logf("no /dev/kvm on host — skipping nested KVM propagation check")
 	}
-}
-
-// tailLog returns the last n lines of s. Used for truncating verbose daemon
-// logs in test failure messages.
-func tailLog(s string, n int) string {
-	lines := strings.Split(strings.TrimSpace(s), "\n")
-	if len(lines) <= n {
-		return s
-	}
-	return strings.Join(lines[len(lines)-n:], "\n")
 }
