@@ -481,6 +481,27 @@ func main() {
 	}
 	log.Printf("Loaded policy with %d grants", len(globalPolicy.Grants))
 
+	// Allow user namespace creation inside containers. Some Debian/Ubuntu
+	// kernels restrict CLONE_NEWUSER via AppArmor policy or sysctls, which
+	// breaks tools like passt (used for VM networking) that need user
+	// namespaces for sandboxing. We write to the relevant sysctls here, on
+	// the host, before any containers are started.
+	//
+	// Security analysis: allowing CLONE_NEWUSER inside thundersnap containers
+	// is safe because container users are already root (the container uses
+	// chroot + capability dropping, not user-namespace-based isolation). A
+	// user namespace gives them nothing they don't already have. The only
+	// thing it adds is the ability for programs inside the container (like
+	// passt) to sandbox themselves further, which is a security improvement,
+	// not a regression.
+	//
+	// TODO(container-isolation): For hardened isolation levels in the future,
+	// we may want to BLOCK CLONE_NEWUSER again (or use user namespaces FOR
+	// the container itself, mapping container-root to an unprivileged host
+	// UID). The current approach is appropriate for the development/nested-
+	// thundersnap use case where the container user is trusted.
+	enableUserNamespaces()
+
 	// Verify both directories are on btrfs and on the same filesystem
 	if err := checkBtrfsFilesystems(*flagFsDir, *flagSnapsDir); err != nil {
 		fatalWithStatus("%v", err)
@@ -1127,6 +1148,50 @@ func handleAdminConnection(conn net.Conn, lc *tailscale.LocalClient) {
 
 // ensureHostKey ensures an SSH host key exists at the given path.
 // If the file doesn't exist, generates a new ED25519 key pair and saves it.
+// enableUserNamespaces writes to kernel sysctls to allow user namespace
+// creation (CLONE_NEWUSER) from inside containers. This is needed because:
+//
+//   - passt (VM networking) creates a user namespace for sandboxing and dies
+//     with EPERM if it can't.
+//   - Other tools (podman, buildah, bubblewrap) also need user namespaces.
+//
+// On Debian/Ubuntu, two sysctls control this:
+//
+//   - kernel.unprivileged_userns_clone: 1 = allow unprivileged users to create
+//     user namespaces (root can always do it when this is 0, but some kernels
+//     also gate root on this).
+//   - kernel.unprivileged_userns_apparmor_policy: 0 = don't apply AppArmor
+//     restrictions to user namespace creation. When this is 1, AppArmor blocks
+//     user namespace creation even for root unless the process's AppArmor
+//     profile explicitly allows it.
+//
+// Both writes are best-effort: if the sysctl doesn't exist (non-Debian kernel)
+// or is read-only, we log and continue. The sysctls are per-kernel, not
+// per-container, so this write on the host affects all containers.
+//
+// TODO(container-isolation): For hardened isolation levels, consider blocking
+// CLONE_NEWUSER again or using user namespaces FOR the container (mapping
+// container-root to an unprivileged host UID) instead of allowing nested
+// user namespace creation.
+func enableUserNamespaces() {
+	sysctls := []struct {
+		path string
+		val  string
+	}{
+		{"/proc/sys/kernel/unprivileged_userns_clone", "1"},
+		{"/proc/sys/kernel/unprivileged_userns_apparmor_policy", "0"},
+	}
+	for _, s := range sysctls {
+		if err := os.WriteFile(s.path, []byte(s.val), 0644); err != nil {
+			if !os.IsNotExist(err) {
+				log.Printf("warning: failed to set %s=%s: %v", s.path, s.val, err)
+			}
+			continue
+		}
+		log.Printf("Set %s=%s (user namespace creation enabled)", s.path, s.val)
+	}
+}
+
 func ensureHostKey(keyPath string) error {
 	// Check if key already exists
 	if _, err := os.Stat(keyPath); err == nil {
