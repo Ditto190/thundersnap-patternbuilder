@@ -1,0 +1,9 @@
+# Flags for thundersnapd-dev. The dev daemon shares --data-dir with the main
+# thundersnapd (so frames and snaps are shared) but uses a separate --state-dir
+# (so it has its own Tailscale identity and can run simultaneously on the
+# tailnet). This enables blue/green deployment: install both packages, run the
+# dev daemon alongside the main one, test it, then switch.
+#
+# The dev daemon's binaries live in /usr/libexec/thundersnap-dev/ and
+# /usr/sbin/thundersnapd-dev, so both packages can coexist without conflicts.
+FLAGS="--data-dir=/var/lib/thundersnap --policy=/etc/thundersnap/policy-dev.jsonc"

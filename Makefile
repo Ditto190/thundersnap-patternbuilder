@@ -111,6 +111,10 @@ build:
 build-deb:
 	$(DIST_CMD) build --out "$(OUT)" "deb"
 
+# Build only the thundersnap-dev .deb package (for blue/green deployment)
+build-deb-dev:
+	$(DIST_CMD) build --out "$(OUT)" "deb-dev"
+
 # Build only .rpm packages
 build-rpm:
 	$(DIST_CMD) build --out "$(OUT)" "rpm"

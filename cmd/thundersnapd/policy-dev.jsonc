@@ -1,0 +1,19 @@
+{
+  // Development policy file for thundersnap-dev.
+  // This is a copy of policy.jsonc — edit as needed for testing.
+  // The dev daemon uses this instead of /etc/thundersnap/policy.jsonc so
+  // policy changes for testing don't affect the main daemon.
+  "grants": [
+    {
+      "src": ["autogroup:member"],
+      "dst": ["tag:thundersnap"],
+      "app": {
+        "tailscale.com/cap/thundersnap": [{
+          "role": "developer",
+          "isolation": "container",
+          "maxFrames": 10,
+        }],
+      },
+    },
+  ],
+}

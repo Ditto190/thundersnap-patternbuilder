@@ -410,6 +410,136 @@ func (t *rpmTarget) Build(b *Build) ([]string, error) {
 	return []string{filename}, nil
 }
 
+// debDevTarget builds a thundersnap-dev deb package: the same binaries as
+// the main package but installed to different paths so both can coexist on
+// the same machine. The dev package shares --data-dir (frames/snaps) with the
+// main package but uses a separate --state-dir (tsnet identity) and separate
+// service/config/libexec paths. This enables blue/green deployment: install
+// both, run the dev daemon alongside the main one, test, then switch.
+type debDevTarget struct {
+	goEnv map[string]string
+}
+
+func (t *debDevTarget) os() string   { return t.goEnv["GOOS"] }
+func (t *debDevTarget) arch() string { return t.goEnv["GOARCH"] }
+
+func (t *debDevTarget) String() string {
+	return fmt.Sprintf("linux/%s/deb-dev", t.arch())
+}
+
+func (t *debDevTarget) Build(b *Build) ([]string, error) {
+	if t.os() != "linux" {
+		return nil, errors.New("deb only supported on linux")
+	}
+
+	ts, err := b.BuildGoBinary("github.com/tailscale/thundersnap/cmd/ts", t.goEnv)
+	if err != nil {
+		return nil, err
+	}
+	tsd, err := b.BuildGoBinary("github.com/tailscale/thundersnap/cmd/thundersnapd", t.goEnv)
+	if err != nil {
+		return nil, err
+	}
+	vshd, err := b.BuildGoBinary("github.com/tailscale/thundersnap/cmd/vshd", t.goEnv)
+	if err != nil {
+		return nil, err
+	}
+	vsh, err := b.BuildGoBinary("github.com/tailscale/thundersnap/cmd/vsh", t.goEnv)
+	if err != nil {
+		return nil, err
+	}
+
+	thundersnapdDir, err := b.GoPkg("github.com/tailscale/thundersnap/cmd/thundersnapd")
+	if err != nil {
+		return nil, err
+	}
+
+	arch := debArch(t.arch())
+	contents, err := files.PrepareForPackager(files.Contents{
+		// Binaries installed to -dev paths so both packages coexist.
+		&files.Content{
+			Type:        files.TypeFile,
+			Source:      ts,
+			Destination: "/usr/libexec/thundersnap-dev/ts",
+		},
+		&files.Content{
+			Type:        files.TypeFile,
+			Source:      vshd,
+			Destination: "/usr/libexec/thundersnap-dev/vshd",
+		},
+		&files.Content{
+			Type:        files.TypeFile,
+			Source:      tsd,
+			Destination: "/usr/sbin/thundersnapd-dev",
+		},
+		&files.Content{
+			Type:        files.TypeFile,
+			Source:      vsh,
+			Destination: "/usr/bin/vsh-dev",
+		},
+		// Dev-specific service and config files.
+		&files.Content{
+			Type:        files.TypeFile,
+			Source:      filepath.Join(thundersnapdDir, "thundersnapd-dev.service"),
+			Destination: "/lib/systemd/system/thundersnapd-dev.service",
+		},
+		&files.Content{
+			Type:        files.TypeConfigNoReplace,
+			Source:      filepath.Join(thundersnapdDir, "thundersnapd-dev.defaults"),
+			Destination: "/etc/default/thundersnapd-dev",
+		},
+		&files.Content{
+			Type:        files.TypeConfigNoReplace,
+			Source:      filepath.Join(thundersnapdDir, "policy-dev.jsonc"),
+			Destination: "/etc/thundersnap/policy-dev.jsonc",
+		},
+	}, 0, "deb", false, b.Time)
+	if err != nil {
+		return nil, err
+	}
+	info := nfpm.WithDefaults(&nfpm.Info{
+		Name:        "thundersnap-dev",
+		Arch:        arch,
+		Platform:    "linux",
+		Version:     b.Version,
+		Maintainer:  "Tailscale Inc <info@tailscale.com>",
+		Description: "Thundersnap development daemon: runs alongside thundersnap for blue/green deployment",
+		Homepage:    "https://github.com/tailscale/thundersnap",
+		License:     "BSD-3-Clause",
+		Section:     "net",
+		Priority:    "extra",
+		Overridables: nfpm.Overridables{
+			Contents: contents,
+			Scripts: nfpm.Scripts{
+				PostInstall: filepath.Join(b.Repo, "release/deb/debian-dev.postinst.sh"),
+				PreRemove:   filepath.Join(b.Repo, "release/deb/debian-dev.prerm.sh"),
+				PostRemove:  filepath.Join(b.Repo, "release/deb/debian-dev.postrm.sh"),
+			},
+			Conflicts: []string{"thundersnap-dev"}, // can't install two copies of the dev package
+		},
+	})
+	pkg, err := nfpm.Get("deb")
+	if err != nil {
+		return nil, err
+	}
+
+	filename := fmt.Sprintf("thundersnap-dev_%s_%s.deb", b.Version, arch)
+	log.Printf("Building %s", filename)
+	f, err := os.Create(filepath.Join(b.Out, filename))
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	if err := pkg.Package(info, f); err != nil {
+		return nil, err
+	}
+	if err := f.Close(); err != nil {
+		return nil, err
+	}
+	symlinkLatest(b.Out, filename, arch, "deb")
+	return []string{filename}, nil
+}
+
 // debArch returns the debian arch name for the given Go arch name.
 func debArch(goarch string) string {
 	switch goarch {

@@ -27,6 +27,12 @@ func Targets() []Target {
 			goEnv: map[string]string{"GOOS": goos, "GOARCH": goarch},
 		})
 	}
+	for goosgoarch := range devDebs {
+		goos, goarch := splitGoosGoarch(goosgoarch)
+		ret = append(ret, &debDevTarget{
+			goEnv: map[string]string{"GOOS": goos, "GOARCH": goarch},
+		})
+	}
 	for goosgoarch := range rpms {
 		goos, goarch := splitGoosGoarch(goosgoarch)
 		ret = append(ret, &rpmTarget{
@@ -45,6 +51,10 @@ var (
 		"linux/arm64": true,
 	}
 	debs = map[string]bool{
+		"linux/amd64": true,
+		"linux/arm64": true,
+	}
+	devDebs = map[string]bool{
 		"linux/amd64": true,
 		"linux/arm64": true,
 	}
