@@ -23,13 +23,13 @@ different things; "same model, fresh session" is much weaker.
 
 Spawn a review as a one-shot, non-interactive sub-pi pointed at the commit.
 In this workspace the authed provider is `aperture` (the default), which
-fronts many model families. The exact command that worked on the second real
+fronts many model families. The command shape that worked on the second real
 use (reviewing the `ChunkIndex` change) was:
 
 ```sh
 pi --print \
   --provider aperture \
-  --model gpt-5.4-pro \
+  --model <review-model> \
   --no-context-files \
   --name "<short-review-name>" \
   @<review-prompt-file> \
@@ -42,6 +42,33 @@ adds latency, and it improved the review in at most a minor way. The review
 quality comes from the prompt specifics and the reviewer using the tools,
 not from a thinking budget.
 
+### Which `<review-model>` to use
+
+Pick a strong model from a **different family** than the one that authored
+the code — the whole point of a sub-pi review is a model that starts with no
+attachment to the author's reasoning (see the "different model" section
+above). All of these are verified to work with `--provider aperture` (each
+was smoke-tested with a trivial "say OK" prompt) and come from five distinct
+families, so there's always a valid cross-family pick:
+
+| model                | family           |
+| -------------------- | ---------------- |
+| `claude-opus-4-8`    | Anthropic        |
+| `gpt-5.5`            | OpenAI           |
+| `glm-5.2`            | Z.ai / GLM       |
+| `deepseek-v4-flash`  | DeepSeek         |
+| `kimi-k3`            | Moonshot (kimi)  |
+
+The default authoring model in this workspace is `glm-5.2` (see
+`~/.pi/agent/settings.json`), so when you're reviewing a change *you* wrote
+here, pick anything from the pool except `glm-5.2` — e.g. `gpt-5.5` or
+`claude-opus-4-8`. If you authored the change with a different model (say a
+Claude), drop the matching row. `deepseek-v4-flash` and `kimi-k3` are
+cross-family to all three of the others, so they're safe picks when you're
+not sure what authored the code. `gpt-5.5` (not `-pro`) is preferred over
+`gpt-5.4-pro` — it's cheaper and works just as well for review. Run
+`pi --list-models` to see the current catalog.
+
 - `--print` / `-p`: non-interactive; process the prompt and exit. Pipe to a
   log file so you can grep/reread it. Caveat: `--print` emits only the
   *final* answer, not the intermediate tool calls, so a long review can hit
@@ -52,16 +79,13 @@ not from a thinking budget.
   (newest `*.jsonl` there); resume it with `--session <id>` and a "write the
   review now" follow-up — it picks up where it left off and finishes in well
   under a minute.
-- `--provider aperture --model gpt-5.4-pro`: the model that worked here, and
-  a good default for this workspace. Pick a strong model from a *different
-  family* than the one that wrote the code (the authoring model in this
-  project is Anthropic-family, so a GPT-5.x via `aperture` is a good
-  cross-family pick; `pi --list-models` shows what's configured). **Pass
-  `--provider aperture` explicitly.** A bare `--model gpt-5.4-pro` mis-
-  resolves to an `azure-openai-responses` provider that isn't logged in here
-  and fails with `No API key found for azure-openai-responses`; forcing
-  `--provider aperture` routes it to the authed gateway. Don't reuse the
-  authoring model.
+- `--provider aperture`: the authed provider in this workspace and the one
+  every pool model above was smoke-tested against. **Pass it explicitly.** A
+  bare `--model <gpt-5.5|gpt-5.4-pro|...>` mis-resolves to an
+  `azure-openai-responses` provider that isn't logged in here and fails with
+  `No API key found for azure-openai-responses`; forcing `--provider aperture`
+  routes the model name to the authed gateway. (The `--model <review-model>`
+  bullet point and pool table above cover which model to choose.)
 - `--no-context-files`: do **not** auto-load `CLAUDE.md`/`AGENTS.md`. You want
   the reviewer judging the code on its merits, not parroting project
   conventions; and you're feeding it a self-contained prompt. (Leave context
