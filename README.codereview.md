@@ -21,26 +21,47 @@ different things; "same model, fresh session" is much weaker.
 
 ## The recipe
 
-Spawn a review as a one-shot, non-interactive sub-pi pointed at the commit:
+Spawn a review as a one-shot, non-interactive sub-pi pointed at the commit.
+In this workspace the authed provider is `aperture` (the default), which
+fronts many model families. The exact command that worked on the second real
+use (reviewing the `ChunkIndex` change) was:
 
 ```sh
 pi --print \
-  --model <a-different-strong-model> \
-  --thinking high \
+  --provider aperture \
+  --model gpt-5.4-pro \
   --no-context-files \
   --name "<short-review-name>" \
   @<review-prompt-file> \
-  "<one-line instruction referencing the commit id>"
+  "Review commit <id> ... <one-line instruction>"
 ```
 
+Do **not** add `--thinking high`: for the models available here it was
+silently turned off (the session log showed `thinkingLevel: "off"`), it just
+adds latency, and it improved the review in at most a minor way. The review
+quality comes from the prompt specifics and the reviewer using the tools,
+not from a thinking budget.
+
 - `--print` / `-p`: non-interactive; process the prompt and exit. Pipe to a
-  log file so you can grep/reread it.
-- `--model`: pick a strong model from a *different family* than the one that
-  wrote the code. `pi --list-models` shows what's configured. Good picks for
-  adversarial review are the strongest reasoning models available (e.g. a
-  latest opus, or gpt-5.x). Don't reuse the authoring model.
-- `--thinking high`: code review benefits from longer reasoning. Worth the
-  latency.
+  log file so you can grep/reread it. Caveat: `--print` emits only the
+  *final* answer, not the intermediate tool calls, so a long review can hit
+  your shell's timeout with an empty log even though the reviewer is still
+  working. Use a generous timeout (the second real use did ~19 min of file
+  reading and `go test` before writing its review). If it gets killed
+  mid-review, the session is still saved under `~/.pi/agent/sessions/`
+  (newest `*.jsonl` there); resume it with `--session <id>` and a "write the
+  review now" follow-up — it picks up where it left off and finishes in well
+  under a minute.
+- `--provider aperture --model gpt-5.4-pro`: the model that worked here, and
+  a good default for this workspace. Pick a strong model from a *different
+  family* than the one that wrote the code (the authoring model in this
+  project is Anthropic-family, so a GPT-5.x via `aperture` is a good
+  cross-family pick; `pi --list-models` shows what's configured). **Pass
+  `--provider aperture` explicitly.** A bare `--model gpt-5.4-pro` mis-
+  resolves to an `azure-openai-responses` provider that isn't logged in here
+  and fails with `No API key found for azure-openai-responses`; forcing
+  `--provider aperture` routes it to the authed gateway. Don't reuse the
+  authoring model.
 - `--no-context-files`: do **not** auto-load `CLAUDE.md`/`AGENTS.md`. You want
   the reviewer judging the code on its merits, not parroting project
   conventions; and you're feeding it a self-contained prompt. (Leave context
@@ -113,9 +134,11 @@ what make it bite.
   spec-vs-intent gaps, things outside the diff). Use it as a first pass to
   catch the obvious-before-human-review, and to surface the concurrency and
   "did you think about X" questions a careful human would ask.
-- Not free. Spawning a strong model with `--thinking high` on a
-  ~1600-line diff took a few minutes and non-trivial tokens. Worth it for
-  non-trivial changes; overkill for a one-line fix.
+- Not free. A strong model on a ~1600-line diff spent ~19 minutes reading
+  files and running the tests before writing its review, plus non-trivial
+  tokens. Worth it for non-trivial changes; overkill for a one-line fix.
+  (We deliberately dropped `--thinking high`: it was silently ignored for the
+  model we used and just adds latency without reliably helping.)
 - Not a substitute for the test suite. The whole point is that the tests
   can't catch the class of bugs you're asking about (races, crash states,
   cross-tenant interactions). Run both.
