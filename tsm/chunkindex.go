@@ -61,6 +61,15 @@ type ChunkIndex struct {
 	snaps []*snapIdx // MRU order: snaps[0] is most-recently-used
 	bloom *bloomFilter
 
+	// absentCache remembers SHAs the Bloom let through but a full scan did not
+	// find, so a repeated lookup of the same absent chunk (common when a chunk
+	// present in no local snap is referenced by many files of the download) is
+	// O(1) instead of re-scanning every snap and re-loading evicted .tsc
+	// buffers. A nil map (the &ChunkIndex{} fallback) behaves as an empty
+	// cache. Bounded by maxAbsentCache.
+	absentCache    map[[32]byte]struct{}
+	maxAbsentCache int
+
 	maxOpenTSC int // max .tsc byte buffers held in memory
 	maxLocMaps int // max location maps held in memory
 }
@@ -68,6 +77,12 @@ type ChunkIndex struct {
 const (
 	defaultMaxOpenTSC = 16
 	defaultMaxLocMaps = 8
+	// defaultMaxAbsentCache bounds the negative cache so a download referencing
+	// an enormous number of distinct absent chunks cannot grow it without
+	// limit. At ~50 bytes per map entry this is ~50MB worst case, well beyond
+	// any realistic download; once full, lookups simply stop caching and the
+	// Bloom filter continues to handle the common absent case in O(1).
+	defaultMaxAbsentCache = 1 << 20
 )
 
 // snapIdx is the per-snapshot lazy index. Its .tsc bytes and location map are
@@ -132,9 +147,11 @@ func OpenChunkIndexWith(snapsDir string, maxOpenTSC, maxLocMaps int) (*ChunkInde
 	}
 
 	ci := &ChunkIndex{
-		dir:        snapsDir,
-		maxOpenTSC: maxOpenTSC,
-		maxLocMaps: maxLocMaps,
+		dir:            snapsDir,
+		maxOpenTSC:     maxOpenTSC,
+		maxLocMaps:     maxLocMaps,
+		maxAbsentCache: defaultMaxAbsentCache,
+		absentCache:    make(map[[32]byte]struct{}),
 	}
 
 	entries, err := os.ReadDir(snapsDir)
@@ -155,10 +172,24 @@ func OpenChunkIndexWith(snapsDir string, maxOpenTSC, maxLocMaps int) (*ChunkInde
 			continue
 		}
 		name := e.Name()
-		if !strings.HasSuffix(name, ".tsc") || strings.HasSuffix(name, ".tsc.tmp") {
+		if !strings.HasSuffix(name, ".tsc") {
 			continue
 		}
 		base := strings.TrimSuffix(name, ".tsc")
+		// Skip in-progress background-indexing snaps. The indexer writes
+		// <jobid>.tmp.tsc / <jobid>.tmp.tsm / <jobid>.tmp/ (see snapqueue.go's
+		// captureSubvol / indexAndFinalizeSubvol) and renames them to final
+		// content-addressed names once indexing completes. Indexing one would
+		// record a snap whose .tsc/.tsm/directory the worker renames away
+		// moments later, leaving a stale entry; a FindChunk that resolved a
+		// chunk to that entry just before the rename would then fail
+		// VerifyAndRead on a path that no longer exists and (see downloadFile)
+		// abort the whole download. A download's .tsc.tmp temp file is already
+		// excluded by the .tsc suffix check above (it does not end in .tsc), so
+		// the old explicit .tsc.tmp clause here was dead code.
+		if strings.HasSuffix(base, ".tmp") {
+			continue
+		}
 		tscPath := filepath.Join(snapsDir, name)
 		tsmPath := filepath.Join(snapsDir, base+".tsm")
 		snapDir := filepath.Join(snapsDir, base)
@@ -220,6 +251,16 @@ func (ci *ChunkIndex) FindChunk(sha [32]byte) (*ChunkLocation, bool) {
 		return nil, false
 	}
 
+	// Negative cache: a chunk the Bloom let through but a previous full scan
+	// did not find. This turns repeated lookups of the same absent chunk (e.g.
+	// a chunk referenced by many files of the download but present in no local
+	// snap) into O(1) instead of re-scanning every snap and re-loading evicted
+	// .tsc buffers each time. A nil absentCache (the &ChunkIndex{} fallback)
+	// reads as empty.
+	if _, absent := ci.absentCache[sha]; absent {
+		return nil, false
+	}
+
 	for i := 0; i < len(ci.snaps); i++ {
 		s := ci.snaps[i]
 
@@ -254,6 +295,12 @@ func (ci *ChunkIndex) FindChunk(sha [32]byte) (*ChunkLocation, bool) {
 			Size:     size,
 		}, true
 	}
+
+	// The Bloom said "maybe" but no snap actually has the chunk. Remember it
+	// so the next lookup of the same chunk is O(1) and does not re-scan.
+	if ci.absentCache != nil && len(ci.absentCache) < ci.maxAbsentCache {
+		ci.absentCache[sha] = struct{}{}
+	}
 	return nil, false
 }
 
@@ -268,7 +315,18 @@ func (ci *ChunkIndex) SnapCount() int {
 // buffer if the cap would be exceeded. Must be called with ci.mu held.
 func (ci *ChunkIndex) loadTSCLocked(s *snapIdx) {
 	s.tscLoaded = true
-	content, err := readTSCContentValidated(s.tscPath)
+	// On reload we skip the footer SHA-256 (readTSCContent, not
+	// readTSCContentValidated): OpenChunkIndex already validated every snap's
+	// .tsc footer once, and .tsc files are immutable (content-addressed, never
+	// rewritten after the atomic rename into place), so re-hashing a possibly
+	// large file on every LRU-driven reload is pure waste — and a reload can
+	// happen on every Bloom false positive once the cap forces eviction, which
+	// made a disjoint download re-hash the whole store repeatedly. The cheap
+	// magic + count/length checks still catch truncation/growth, and any
+	// actual content corruption is caught downstream: FindChunk's binary
+	// search may miss or mis-hit, but the chunk data is always hash-verified
+	// before use (downloadFile's VerifyAndRead, with its remote fallback).
+	content, err := readTSCContent(s.tscPath)
 	if err != nil {
 		s.tsc = nil // don't retry (tscLoaded stays true)
 		return
@@ -481,6 +539,33 @@ func readTSCChunkCount(path string) (uint64, error) {
 		return 0, err
 	}
 	return count, nil
+}
+
+// readTSCContent reads a .tsc file and returns its content bytes (header +
+// entries, excluding the 32-byte footer) after only the cheap structural
+// checks: magic, minimum length, and that the declared chunk count fits the
+// entry-data length. It does NOT recompute the footer SHA-256. It is intended
+// for reloading a .tsc that OpenChunkIndex already validated with
+// readTSCContentValidated; .tsc files are immutable after their atomic rename,
+// so the footer check would just re-hash a possibly-large file on every
+// LRU-driven reload. Content corruption is still caught downstream because
+// chunk data is hash-verified before use (see loadTSCLocked).
+func readTSCContent(path string) ([]byte, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	if len(data) < TSCHeaderSize+TSCFooterSize {
+		return nil, fmt.Errorf("tsc file too short")
+	}
+	if string(data[0:4]) != TSCMagic {
+		return nil, fmt.Errorf("invalid TSC magic")
+	}
+	count := binary.BigEndian.Uint64(data[8:16])
+	if err := checkTSCCountConsistent(count, int64(len(data)-TSCFooterSize)); err != nil {
+		return nil, err
+	}
+	return data[:len(data)-TSCFooterSize], nil
 }
 
 // readTSCContentValidated reads a .tsc file, verifies its footer checksum and

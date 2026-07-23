@@ -476,15 +476,24 @@ func downloadFile(opts downloadFileOpts) error {
 		var data []byte
 
 		if ci.localLoc != nil {
-			// Read from local
+			// Read from local. If the local copy is unusable — bit-rot, a
+			// racing snap deletion, or a stale ChunkIndex entry whose source
+			// file the background indexer has renamed away — fall back to
+			// fetching this one chunk from the peer. remoteData never holds
+			// locally-deduped chunks (they were excluded from remoteChunks
+			// above), so the old "fall back to remoteData[i]" branch was dead
+			// code and any local read failure aborted the entire download.
 			data, err = ci.localLoc.VerifyAndRead()
 			if err != nil {
-				// Fall back to remote
-				if rd, ok := remoteData[i]; ok {
-					data = rd
-				} else {
-					return fmt.Errorf("reading local chunk: %w", err)
+				fetched, ferr := fetchRanges(opts.client, opts.baseURL+opts.remotePath,
+					[]rangeSpec{{offset: ci.remoteOffset, size: int64(ci.size)}})
+				if ferr != nil {
+					return fmt.Errorf("local chunk %x unreadable (%v) and remote fetch failed: %w", ci.sha, err, ferr)
 				}
+				if len(fetched) != 1 || BlobSHA256(fetched[0]) != ci.sha {
+					return fmt.Errorf("local chunk %x unreadable (%v) and remote copy hash mismatch", ci.sha, err)
+				}
+				data = fetched[0]
 			}
 		} else {
 			// Get from remote

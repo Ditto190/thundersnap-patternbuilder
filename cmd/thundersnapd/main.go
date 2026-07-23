@@ -2631,6 +2631,14 @@ func handleListSnaps(w http.ResponseWriter, r *http.Request) {
 		}
 
 		snapID := strings.TrimSuffix(entry.Name(), ".tsm")
+		// Skip in-progress background-indexing snaps (<jobid>.tmp.tsm); they
+		// are renamed to final content-addressed names once indexing completes,
+		// and would otherwise appear in `ts snaps` as a bogus <jobid>.tmp entry
+		// that vanishes moments later (or persists after a crash mid-index).
+		// Matches the same filter in tsm.OpenChunkIndex.
+		if strings.HasSuffix(snapID, ".tmp") {
+			continue
+		}
 
 		// Read TSM to get size from header
 		tsmPath := filepath.Join(*flagSnapsDir, entry.Name())

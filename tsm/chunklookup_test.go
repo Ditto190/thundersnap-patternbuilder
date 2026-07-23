@@ -280,3 +280,104 @@ func TestChunkIndexAbsentChunk(t *testing.T) {
 		t.Error("FindChunk reported a hit for an absent chunk")
 	}
 }
+
+// TestOpenChunkIndexSkipsInProgressTmpSnap verifies that OpenChunkIndex does
+// NOT index a background indexer's in-progress snap, which is laid down as
+// <jobid>.tmp/ + <jobid>.tmp.tsm + <jobid>.tmp.tsc and renamed to final
+// content-addressed names once indexing completes (see snapqueue.go). Indexing
+// it would create a stale entry whose paths the worker renames away, which
+// (with downloadFile's local-read path) can abort a concurrent download.
+func TestOpenChunkIndexSkipsInProgressTmpSnap(t *testing.T) {
+	tmpDir := t.TempDir()
+	makeTestSnap(t, tmpDir, "snapA", map[string]string{"a.txt": "content for snap A\n"})
+
+	// Build a second, real snap, then rename its on-disk index artifacts to
+	// the in-progress <name>.tmp naming the background indexer uses.
+	makeTestSnap(t, tmpDir, "snapB", map[string]string{"b.txt": "content for snap B\n"})
+	for _, pair := range [][2]string{
+		{filepath.Join(tmpDir, "snapB"), filepath.Join(tmpDir, "snapB.tmp")},
+		{filepath.Join(tmpDir, "snapB.tsm"), filepath.Join(tmpDir, "snapB.tmp.tsm")},
+		{filepath.Join(tmpDir, "snapB.tsc"), filepath.Join(tmpDir, "snapB.tmp.tsc")},
+	} {
+		if err := os.Rename(pair[0], pair[1]); err != nil {
+			t.Fatalf("rename %s -> %s: %v", pair[0], pair[1], err)
+		}
+	}
+
+	ci, err := OpenChunkIndex(tmpDir)
+	if err != nil {
+		t.Fatalf("OpenChunkIndex: %v", err)
+	}
+	if ci.SnapCount() != 1 {
+		t.Errorf("SnapCount = %d, want 1 (in-progress .tmp snap must be excluded)", ci.SnapCount())
+	}
+	// A chunk that only exists in the .tmp snap must not be found.
+	bTSC, err := ReadTSC(filepath.Join(tmpDir, "snapB.tmp.tsc"))
+	if err != nil || len(bTSC.Entries) == 0 {
+		t.Fatalf("snapB.tmp.tsc unreadable/empty: %v", err)
+	}
+	if _, found := ci.FindChunk(bTSC.Entries[0].SHA256); found {
+		t.Error("FindChunk found a chunk belonging only to the in-progress .tmp snap")
+	}
+}
+
+// TestChunkIndexReloadSkipsFooterRehash verifies that an LRU-driven reload of
+// a .tsc does NOT recompute the footer SHA-256: a .tsc whose footer is
+// corrupted after OpenChunkIndex validated it is still usable on reload,
+// because the footer was checked once at open and .tsc files are immutable.
+// (Chunk data itself is always hash-verified at read time, so index-level
+// trust is safe.) This locks in the efficiency fix that prevents a disjoint
+// download from re-hashing the whole store on every Bloom false positive.
+func TestChunkIndexReloadSkipsFooterRehash(t *testing.T) {
+	tmpDir := t.TempDir()
+	snapABase := makeTestSnap(t, tmpDir, "snapA", map[string]string{
+		"a.txt": "content for snap A, distinct from snap B\n",
+	})
+	snapBBase := makeTestSnap(t, tmpDir, "snapB", map[string]string{
+		"b.txt": "completely different content for snap B\n",
+	})
+
+	// Caps of 1 force eviction: looking up a chunk in one snap evicts the
+	// other's loaded .tsc, so the next lookup of the evicted snap reloads it.
+	ci, err := OpenChunkIndexWith(tmpDir, 1, 1)
+	if err != nil {
+		t.Fatalf("OpenChunkIndexWith: %v", err)
+	}
+
+	chunkA := firstChunkSHA(t, snapABase+".tsc")
+	chunkB := firstChunkSHA(t, snapBBase+".tsc")
+
+	// Load snapA's .tsc, then snapB's (evicting snapA's), so snapA is stale.
+	if _, found := ci.FindChunk(chunkA); !found {
+		t.Fatal("initial FindChunk(chunkA) miss")
+	}
+	if _, found := ci.FindChunk(chunkB); !found {
+		t.Fatal("initial FindChunk(chunkB) miss")
+	}
+
+	// Corrupt snapA's .tsc footer (the last 32 bytes). The header + entries
+	// (which the footer covers) are left intact, so a reload that skips the
+	// footer hash still sees a valid index; a reload that re-hashes would
+	// reject the file.
+	data, err := os.ReadFile(snapABase + ".tsc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := len(data) - TSCFooterSize; i < len(data); i++ {
+		data[i] ^= 0xff
+	}
+	if err := os.WriteFile(snapABase+".tsc", data, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// FindChunk(chunkA) must reload snapA's .tsc (skipping the footer hash)
+	// and still resolve the chunk, whose file data is intact.
+	loc, found := ci.FindChunk(chunkA)
+	if !found {
+		t.Fatal("FindChunk(chunkA) miss after footer corruption + reload; " +
+			"reload should skip the footer SHA-256")
+	}
+	if _, err := loc.VerifyAndRead(); err != nil {
+		t.Fatalf("VerifyAndRead after reload: %v", err)
+	}
+}

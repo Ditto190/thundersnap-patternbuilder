@@ -405,3 +405,87 @@ func TestDownloadDedupFromOtherSnap(t *testing.T) {
 		t.Errorf("downloaded content mismatch (len got=%d want=%d)", len(got), len(content))
 	}
 }
+
+// TestDownloadFallsBackToRemoteOnLocalCorruption verifies that when a locally
+// deduplicated chunk's source file is unreadable (hash mismatch / bit-rot / a
+// stale ChunkIndex entry whose source the background indexer renamed away),
+// downloadFile fetches that one chunk from the peer instead of aborting the
+// whole download. The old code's "fall back to remoteData[i]" branch was dead
+// (locally-deduped chunks were excluded from remoteChunks), so any local read
+// failure aborted the download.
+func TestDownloadFallsBackToRemoteOnLocalCorruption(t *testing.T) {
+	peerDir := t.TempDir()
+	localDir := t.TempDir()
+
+	// Identical content in both snapshots so the chunk hashes match; different
+	// filenames so the snapshot IDs differ.
+	content := []byte("shared file content for local-corruption fallback test\n" +
+		strings.Repeat("the quick brown fox jumps over the lazy dog\n", 64))
+
+	// Local snapA: index it, THEN corrupt its file data on disk so the .tsc
+	// still lists the chunk but VerifyAndRead (which hash-checks the bytes)
+	// fails.
+	if err := os.MkdirAll(filepath.Join(localDir, "snapA"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	snapAFile := filepath.Join(localDir, "snapA", "file.txt")
+	if err := os.WriteFile(snapAFile, content, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := Create(filepath.Join(localDir, "snapA"), filepath.Join(localDir, "snapA"), IndexerOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(snapAFile, append([]byte("X"), content[1:]...), 0644); err != nil {
+		t.Fatal(err) // flip the first byte; same length, different hash
+	}
+
+	// Peer snapB: same bytes, different path.
+	if err := os.MkdirAll(filepath.Join(peerDir, "snapB"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(peerDir, "snapB", "renamed.txt"), content, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := Create(filepath.Join(peerDir, "snapB"), filepath.Join(peerDir, "snapB"), IndexerOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(peerDir, "snapB.stamp"), []byte(""), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Server: serve metadata files AND chunk data (by HTTP range on the file).
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path := strings.TrimPrefix(r.URL.Path, "/bupdate/")
+		fullPath := filepath.Join(peerDir, path)
+		switch {
+		case strings.HasSuffix(path, ".stamp"),
+			strings.HasSuffix(path, ".tsm"),
+			strings.HasSuffix(path, ".tsc"):
+			http.ServeFile(w, r, fullPath)
+		default:
+			// Chunk data: serve the file honoring Range (http.ServeFile does).
+			http.ServeFile(w, r, fullPath)
+		}
+	}))
+	defer server.Close()
+
+	result, err := Download(DownloadOptions{
+		SnapshotID: "snapB",
+		SnapsDir:   localDir,
+		BaseURL:    server.URL,
+	})
+	if err != nil {
+		t.Fatalf("Download: %v (expected local-corruption fallback to remote)", err)
+	}
+	if result.AlreadyExists {
+		t.Error("expected AlreadyExists=false")
+	}
+
+	got, err := os.ReadFile(filepath.Join(localDir, "snapB", "renamed.txt"))
+	if err != nil {
+		t.Fatalf("reading downloaded renamed.txt: %v", err)
+	}
+	if string(got) != string(content) {
+		t.Errorf("downloaded content mismatch (len got=%d want=%d)", len(got), len(content))
+	}
+}
