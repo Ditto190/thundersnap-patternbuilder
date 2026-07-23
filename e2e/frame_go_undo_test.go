@@ -8,7 +8,39 @@ package e2e
 import (
 	"strings"
 	"testing"
+	"time"
 )
+
+// newestLogRootSnap parses `ts log` output and returns the root snap ID of the
+// newest (first) history entry, and whether any entry was present. `ts log`
+// prints "(no snapshots)" when empty, otherwise one line per entry, newest
+// first, as `<timestamp>  <root:home:work>` (optionally followed by a message
+// that may itself contain spaces, so the triplet is always field index 1).
+// Used by tests that need to do what `ts undo` does — create a frame from the
+// most recent snap — without driving ts undo's interactive vsock session.
+func newestLogRootSnap(logOut string) (string, bool) {
+	for _, line := range strings.Split(logOut, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || line == "(no snapshots)" {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		triplet := fields[1] // fields[0] is the timestamp; the snap triplet follows
+		if !strings.Contains(triplet, ":") {
+			continue
+		}
+		parts := strings.SplitN(triplet, ":", 2)
+		root := parts[0]
+		if root == "" || root == "nil" {
+			return "", false
+		}
+		return root, true
+	}
+	return "", false
+}
 
 // TestTsFrame tests the ts frame command with various syntaxes.
 func TestTsFrame(t *testing.T) {
@@ -609,4 +641,129 @@ func TestTsUndoEmptyLog(t *testing.T) {
 	if !strings.Contains(strings.ToLower(output), "no snapshot") && !strings.Contains(strings.ToLower(output), "empty") {
 		t.Logf("ts undo error message: %q", output)
 	}
+}
+
+// TestForkUndoRollsBackToForkPoint verifies that the fork-point snap (the
+// state captured by `ts frame ::` / `ts go ::` at fork time) lands in the
+// forked frame's history, so the first `ts undo` in the new frame rolls back
+// to the fork point rather than past it.
+//
+// ts undo creates a new frame from history[0] (the newest snap). The fork
+// captures the source's live state as a background snap and clones a new frame
+// from it; the new frame's history is cloned from the source's. The fork-point
+// snap MUST be prepended to the new frame's history when it finalizes, so that
+// history[0] is the fork-point state. Without that, history[0] is the source's
+// last pre-fork snap and ts undo silently discards everything done between
+// that snap and the fork — a nondeterministic-history regression.
+//
+// This test reproduces ts undo's frame-creation step (ts undo itself enters an
+// interactive vsock session that can't be driven from a test, matching the
+// approach in TestTsUndo): it reads the forked frame's ts log, takes history[0],
+// builds a frame from it, and checks the on-disk state is the fork point.
+func TestForkUndoRollsBackToForkPoint(t *testing.T) {
+	env := newTestEnv(t)
+	d := startDaemon(t, env)
+
+	createFrameViaDaemon(t, d, "forksrc")
+
+	// v1: take a snap so the source has a pre-fork history entry.
+	if _, exitCode, err := sshExec(t, d, "root@forksrc", "echo v1 > /marker"); err != nil || exitCode != 0 {
+		t.Fatalf("write v1: err=%v exit=%d", err, exitCode)
+	}
+	if _, _, exitCode, err := sshExecSplit(t, d, "root@forksrc", "ts snap --wait"); err != nil || exitCode != 0 {
+		t.Fatalf("ts snap --wait (v1): err=%v exit=%d", err, exitCode)
+	}
+
+	// v2: mutate the source AFTER the snap, so the fork point (v2) differs from
+	// the pre-fork snap (v1). This is what makes the regression observable:
+	// rolling back to v1 instead of v2 means undo jumped past the fork point.
+	if _, exitCode, err := sshExec(t, d, "root@forksrc", "echo v2 > /marker"); err != nil || exitCode != 0 {
+		t.Fatalf("write v2: err=%v exit=%d", err, exitCode)
+	}
+
+	// Fork. The fork captures the source's live state (v2) as a background
+	// snap and clones a new frame from it. ts frame :: returns the new UUID
+	// but no ref, so create one to address it over SSH.
+	forkOut, exitCode, err := sshExec(t, d, "root@forksrc", "ts frame ::")
+	if err != nil || exitCode != 0 {
+		t.Fatalf("ts frame :: : err=%v exit=%d (out %q)", err, exitCode, forkOut)
+	}
+	forkedUUID := strings.TrimSpace(forkOut)
+	if forkedUUID == "" {
+		t.Fatalf("ts frame :: returned no UUID: %q", forkOut)
+	}
+	if _, exitCode, err := sshExec(t, d, "root@forksrc", "ts ref create forked "+forkedUUID); err != nil || exitCode != 0 {
+		t.Fatalf("ts ref create forked: err=%v exit=%d", err, exitCode)
+	}
+
+	// Sanity: the forked frame's live state is the fork point (v2). If this
+	// fails the fork didn't clone the live state and the test setup is wrong.
+	if out, exitCode, err := sshExec(t, d, "root@forked", "read line < /marker && echo $line"); err != nil || exitCode != 0 {
+		t.Fatalf("read marker in forked frame: err=%v exit=%d", err, exitCode)
+	} else if got := strings.TrimSpace(out); got != "v2" {
+		t.Fatalf("forked frame live state = %q, want v2 (fork point); test setup wrong", got)
+	}
+
+	// Wait for the fork-point snap to finalize. It is a background snap of the
+	// SOURCE frame, so observe finalize via the source's ts log growing by one
+	// (from the single v1 snap to two entries).
+	deadline := time.Now().Add(30 * time.Second)
+	finalized := false
+	for time.Now().Before(deadline) {
+		srcLog, _, _, err := sshExecSplit(t, d, "root@forksrc", "ts log")
+		if err != nil {
+			t.Fatalf("ts log (src poll): %v", err)
+		}
+		if n := logEntryCount(srcLog); n >= 2 {
+			finalized = true
+			break
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	if !finalized {
+		t.Fatalf("fork-point snap never finalized in source within 30s")
+	}
+	// Give the worker's forked-frame history update (the fix under test) a
+	// moment to land after the source-side finalize.
+	time.Sleep(500 * time.Millisecond)
+
+	// The forked frame's history[0] must be the fork-point snap (v2), not the
+	// source's pre-fork snap (v1). Reproduce ts undo: build a frame from
+	// history[0] and inspect its /marker.
+	forkedLog, _, _, err := sshExecSplit(t, d, "root@forked", "ts log")
+	if err != nil {
+		t.Fatalf("ts log (forked): %v", err)
+	}
+	rootSnap, ok := newestLogRootSnap(forkedLog)
+	if !ok {
+		t.Fatalf("forked frame ts log has no entries: %q", forkedLog)
+	}
+	t.Logf("forked frame history[0] root snap = %s (ts log: %q)", rootSnap, strings.TrimSpace(forkedLog))
+
+	if _, exitCode, err := sshExec(t, d, "root@forked", "ts frame --ref=forkundo "+rootSnap+":nil:nil"); err != nil || exitCode != 0 {
+		t.Fatalf("ts frame from forked history[0]: err=%v exit=%d", err, exitCode)
+	}
+	out, exitCode, err := sshExec(t, d, "root@forkundo", "read line < /marker && echo $line")
+	if err != nil || exitCode != 0 {
+		t.Fatalf("read marker in forkundo frame: err=%v exit=%d (out %q)", err, exitCode, out)
+	}
+	if got := strings.TrimSpace(out); got != "v2" {
+		t.Errorf("ts undo in a fresh fork rolled back past the fork point: /marker=%q, want %q (the fork-point state). "+
+			"The fork-point snap is missing from the forked frame's history; history[0] is the source's pre-fork snap.",
+			got, "v2")
+	} else {
+		t.Logf("ts undo in fresh fork correctly rolled back to fork point: /marker=%q", got)
+	}
+}
+
+// logEntryCount counts non-empty lines in `ts log` output (one per history
+// entry).
+func logEntryCount(logOut string) int {
+	n := 0
+	for _, line := range strings.Split(logOut, "\n") {
+		if strings.TrimSpace(line) != "" {
+			n++
+		}
+	}
+	return n
 }

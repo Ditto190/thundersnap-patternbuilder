@@ -526,6 +526,27 @@ func (q *snapQueue) processJob(job *snapJob) {
 
 	job.finalized = finalized
 
+	// Build the history entry once; it is prepended to the source frame's
+	// history below and to any forked frame's history after that.
+	var historyEntry frames.HistoryEntry
+	if job.isSubdir() {
+		historyEntry = frames.HistoryEntry{Snap: finalized[compSubdir], Time: time.Now()}
+	} else {
+		rootID := finalized[compRoot]
+		homeID := finalized[compHome]
+		workID := finalized[compWork]
+		homeStr, workStr := homeID, workID
+		if homeStr == "" {
+			homeStr = "nil"
+		}
+		if workStr == "" {
+			workStr = "nil"
+		}
+		triplet := fmt.Sprintf("%s:%s:%s", rootID, homeStr, workStr)
+		job.result = triplet
+		historyEntry = frames.HistoryEntry{Snap: triplet, Time: time.Now()}
+	}
+
 	// Update the frame's stamp/sidecar/history with the finalized IDs. The
 	// sidecar RMW is serialized against /taint and fork via the per-frame
 	// sidecar lock (updateFrameMetaLocked) so a concurrent taint add isn't
@@ -533,7 +554,7 @@ func (q *snapQueue) processJob(job *snapJob) {
 	if job.isSubdir() {
 		sid := finalized[compSubdir]
 		if _, err := q.updateFrameMetaLocked(job.frame, func(m *frames.Frame) {
-			m.History = append([]frames.HistoryEntry{{Snap: sid, Time: time.Now()}}, m.History...)
+			m.History = append([]frames.HistoryEntry{historyEntry}, m.History...)
 		}); err != nil {
 			log.Printf("Warning: failed to update frame sidecar for %s: %v", job.frame, err)
 		}
@@ -546,15 +567,6 @@ func (q *snapQueue) processJob(job *snapJob) {
 		if err := writeStampFile(job.frame, rootID); err != nil {
 			log.Printf("Warning: failed to update stamp file for %s: %v", job.frame, err)
 		}
-		homeStr, workStr := homeID, workID
-		if homeStr == "" {
-			homeStr = "nil"
-		}
-		if workStr == "" {
-			workStr = "nil"
-		}
-		triplet := fmt.Sprintf("%s:%s:%s", rootID, homeStr, workStr)
-		job.result = triplet
 		if _, err := q.updateFrameMetaLocked(job.frame, func(m *frames.Frame) {
 			m.Rootfs = rootID
 			if homeID != "" {
@@ -563,14 +575,62 @@ func (q *snapQueue) processJob(job *snapJob) {
 			if workID != "" {
 				m.Work = workID
 			}
-			m.History = append([]frames.HistoryEntry{{Snap: triplet, Time: time.Now()}}, m.History...)
+			m.History = append([]frames.HistoryEntry{historyEntry}, m.History...)
 		}); err != nil {
 			log.Printf("Warning: failed to update frame sidecar for %s: %v", job.frame, err)
 		}
-		log.Printf("Background snap finalized: %s", triplet)
+		log.Printf("Background snap finalized: %s", job.result)
+
+		// A fork (forkFrame) registers this same job as the pending snap for
+		// both the source frame (job.frame, updated above) and the new forked
+		// frame. The forked frame's sidecar/stamp were cloned from the
+		// source's *pre-fork* metadata, so without the update below its
+		// history would omit the fork-point snap (ts undo in the new frame
+		// would roll back past the fork point) and its stamp/Rootfs/Home/Work
+		// would stay stale — so the forked frame's next incremental snap, once
+		// finishJob clears the pending entry, would chain against the wrong
+		// parent. Bring the forked frame's metadata up to the fork-point snap
+		// now, under the same per-frame sidecar lock discipline. Forks are
+		// always full snaps (forkFrame captures a full snap), so this only
+		// runs in the full-snap branch.
+		for _, ff := range q.forkedFramesForJob(job) {
+			if err := writeStampFile(ff, rootID); err != nil {
+				log.Printf("Warning: failed to update stamp file for forked frame %s: %v", ff, err)
+			}
+			if _, err := q.updateFrameMetaLocked(ff, func(m *frames.Frame) {
+				m.Rootfs = rootID
+				if homeID != "" {
+					m.Home = homeID
+				}
+				if workID != "" {
+					m.Work = workID
+				}
+				m.History = append([]frames.HistoryEntry{historyEntry}, m.History...)
+			}); err != nil {
+				log.Printf("Warning: failed to update sidecar for forked frame %s: %v", ff, err)
+			}
+			log.Printf("Forked frame %s metadata updated to fork-point snap %s", filepath.Base(ff), job.result)
+		}
 	}
 
 	q.finishJob(job, true)
+}
+
+// forkedFramesForJob returns the frames (other than the snap's own source
+// frame) whose pending snap is this job — i.e. the frames forked from the
+// source while this snap was still indexing. Must be called from the worker
+// (processJob), which is the only goroutine that calls finishJob for this job,
+// so the returned set is stable across the finalize that follows.
+func (q *snapQueue) forkedFramesForJob(job *snapJob) []string {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	var out []string
+	for fr, j := range q.framePendingSnap {
+		if j == job && fr != job.frame {
+			out = append(out, fr)
+		}
+	}
+	return out
 }
 
 // finishJob emits the final result event (for streaming --wait), clears any
