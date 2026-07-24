@@ -95,11 +95,11 @@ func TestContainerSharedDevpts(t *testing.T) {
 // re-mounting a fresh "newinstance" devpts on top of the one container-init
 // already mounted. Each stacked instance restarts pts numbering at 0, so every
 // session became pts/0 and /dev/pts showed only the topmost instance's single
-// node. The fix passes --skip-mount-setup so sessions reuse the single shared
+// node. The fix passes join-and-run (no mount setup) so sessions reuse the single shared
 // devpts that container-init mounted.
 //
 // This test runs the exact production command form (nsenter + ts
-// drop-caps-and-run --chroot --skip-mount-setup) for two concurrent sessions,
+// join-and-run --chroot --pty) for two concurrent sessions,
 // each reporting its own tty via `tty`, and asserts:
 //   - the two sessions report DISTINCT pts numbers, and
 //   - the shared /dev/pts contains BOTH slave nodes at once.
@@ -130,15 +130,14 @@ func TestContainerConcurrentSessionDistinctPTS(t *testing.T) {
 		ch := make(chan result, 1)
 		go func() {
 			// Mirror the production per-session command: join the namespace via
-			// nsenter, then ts drop-caps-and-run --chroot --skip-mount-setup,
+			// nsenter, then ts join-and-run --chroot --pty,
 			// running a shell that prints its tty and blocks on the fifo.
 			tsBinary := filepath.Join(absFramePath, "bin", "ts")
 			script := "tty; read x < /tmp/" + gofifo
 			args := []string{
 				"-t", fmt.Sprintf("%d", initPid), "-p", "-m", "-u", "--",
-				tsBinary, "drop-caps-and-run",
+				tsBinary, "join-and-run",
 				"--chroot=" + absFramePath,
-				"--skip-mount-setup",
 				"--pty",
 				"--", "/bin/sh", "-c", script,
 			}

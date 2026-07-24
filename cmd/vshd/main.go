@@ -360,7 +360,7 @@ func (w *logWriter) Write(p []byte) (int, error) {
 // For a container session the command joins the shared PID/mount/UTS namespaces
 // anchored by `ts container-init` (containerNs.GetOrCreate) via the in-binary
 // `ts nsenter`, then chroots and drops caps with `ts drop-caps-and-run
-// --skip-mount-setup`. This is byte-identical to the daemon's host per-session
+// `ts join-and-run --chroot --keep-dev-caps`. This is byte-identical to the daemon's host per-session
 // form, so host and VM sessions sharing a container rootfs see each other's
 // PIDs.
 func buildSessionCmd(rootPrefix, runAsUser string, cmdArgs []string, wantPTY bool) (*exec.Cmd, func(), error) {
@@ -427,9 +427,8 @@ func buildSessionCmd(rootPrefix, runAsUser string, cmdArgs []string, wantPTY boo
 	// processes that later join via setns(CLONE_NEWNS). This approach ensures
 	// identical behavior in all environments (host, nested container, VM).
 	dropCapsArgs := append([]string{
-		"drop-caps-and-run",
+		"join-and-run",
 		"--chroot=" + rootPrefix,
-		"--skip-mount-setup",
 		"--keep-dev-caps",
 		"--",
 		"/bin/ts",

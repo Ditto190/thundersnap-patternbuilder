@@ -129,8 +129,16 @@ func main() {
 	case "undo":
 		cmdUndo(cmdArgs)
 	case "drop-caps-and-run":
-		// Hidden command - not listed in usage
+		// Hidden command - not listed in usage. Creates a fresh namespace
+		// (must be PID 1 via Cloneflags:CLONE_NEWPID|CLONE_NEWNS), sets up
+		// mounts (MS_PRIVATE, pivot_root, setupDev), drops caps, and execs.
 		cmdDropCapsAndRun(cmdArgs)
+	case "join-and-run":
+		// Hidden command - joins an existing container namespace (entered via
+		// ts nsenter) and runs a command inside it. Does zero mount operations;
+		// the container-init has already set up everything. Replaces the old
+		// 'drop-caps-and-run --skip-mount-setup' path.
+		cmdJoinAndRun(cmdArgs)
 	case "container-init":
 		// Hidden command - starts a minimal init process for container namespaces
 		cmdContainerInit(cmdArgs)

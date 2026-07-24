@@ -39,7 +39,6 @@ func cmdDropCapsAndRun(args []string) {
 	// Parse our flags manually since we need to pass remaining args to exec
 	var hostname, domainname, chrootPath string
 	var chrootFd int = -1
-	var skipMountSetup bool
 	var usePty bool
 	var mountVsock bool
 	var keepDevCaps bool
@@ -68,10 +67,6 @@ func cmdDropCapsAndRun(args []string) {
 				os.Exit(1)
 			}
 			chrootFd = fd
-		} else if args[i] == "--skip-mount-setup" {
-			// Used when nsenter has already joined existing namespaces where
-			// container-init has set up mounts. We just need to chroot and drop caps.
-			skipMountSetup = true
 		} else if args[i] == "--pty" {
 			usePty = true
 		} else if args[i] == "--vsock" {
@@ -97,40 +92,31 @@ func cmdDropCapsAndRun(args []string) {
 		os.Exit(1)
 	}
 
-	// Defense-in-depth: the !skipMountSetup path performs destructive mount
-	// operations (MS_PRIVATE on /, bind mounts, pivot_root, setupDev) that must
-	// only run inside a fresh mount namespace created by the caller via
+	// Defense-in-depth: this function performs destructive mount operations
+	// (MS_PRIVATE on /, bind mounts, pivot_root, setupDev) that must only run
+	// inside a fresh mount namespace created by the caller via
 	// Cloneflags:CLONE_NEWPID|CLONE_NEWNS. If invoked without Cloneflags (e.g.
 	// directly from a shell), those operations would land on the host's mount
 	// namespace and destroy it. PID 1 is the reliable signal that the caller
 	// created a new PID namespace (and, by convention, a new mount namespace):
 	// container-init, autorun, and the VM guest init are all PID 1.
-	if !skipMountSetup && os.Getpid() != 1 {
-		fmt.Fprintf(os.Stderr, "error: drop-caps-and-run with mount setup must run as PID 1 (got pid %d); the caller must use Cloneflags:CLONE_NEWPID|CLONE_NEWNS or pass --skip-mount-setup\n", os.Getpid())
+	if os.Getpid() != 1 {
+		fmt.Fprintf(os.Stderr, "error: drop-caps-and-run must run as PID 1 (got pid %d); the caller must use Cloneflags:CLONE_NEWPID|CLONE_NEWNS, or use 'ts join-and-run' to join an existing namespace\n", os.Getpid())
 		os.Exit(1)
 	}
 
-	if !skipMountSetup {
-		// Make all mounts private so mounts inside the container don't propagate
-		// to the host. This must be done BEFORE chroot while "/" is still a real
-		// mount point. After CLONE_NEWNS, we have our own copy of the mount table
-		// but it still has "shared" propagation. Making it private here only
-		// affects our namespace, not the parent.
-		if err := unix.Mount("", "/", "", unix.MS_REC|unix.MS_PRIVATE, ""); err != nil {
-			fmt.Fprintf(os.Stderr, "error: failed to make mounts private: %v\n", err)
-			os.Exit(1)
-		}
+	// Make all mounts private so mounts inside the container don't propagate
+	// to the host. This must be done BEFORE chroot while "/" is still a real
+	// mount point. After CLONE_NEWNS, we have our own copy of the mount table
+	// but it still has "shared" propagation. Making it private here only
+	// affects our namespace, not the parent.
+	if err := unix.Mount("", "/", "", unix.MS_REC|unix.MS_PRIVATE, ""); err != nil {
+		fmt.Fprintf(os.Stderr, "error: failed to make mounts private: %v\n", err)
+		os.Exit(1)
 	}
 
-	// Change the root filesystem to the container's root.
-	//
-	// When joining an existing namespace (--skip-mount-setup), the container-init
-	// has already done pivot_root, so the mount namespace's "/" IS the container
-	// root. We just need to chdir to "/" and then pivot_root will use our current
-	// root as the old root.
-	//
-	// When creating new namespaces (!skipMountSetup), we use pivot_root to
-	// properly change the root without the "chrooted" flag that prevents user
+	// Change the root filesystem to the container's root using pivot_root, which
+	// properly changes the root without the "chrooted" flag that prevents user
 	// namespace creation.
 	//
 	// In nested containers on btrfs, the pivot path may traverse btrfs subvolume
@@ -138,111 +124,69 @@ func cmdDropCapsAndRun(args []string) {
 	// When --chroot-fd is provided (opened before setns), use fchdir to reach
 	// the target through the fd's dentry.
 	if chrootFd >= 0 || chrootPath != "" {
-		if skipMountSetup {
-			// When joining an existing namespace, the container-init has already
-			// done pivot_root. The "/" in this mount namespace IS the container
-			// root. The --chroot-fd points to /proc/<pid>/root, which is that
-			// same root.
-			//
-			// Navigate to the target, then try pivot_root to swap our root.
-			if chrootFd >= 0 {
-				if err := unix.Fchdir(chrootFd); err != nil {
-					fmt.Fprintf(os.Stderr, "error: failed to fchdir to chroot fd: %v\n", err)
-					os.Exit(1)
-				}
-			} else {
-				if err := unix.Chdir(chrootPath); err != nil {
-					fmt.Fprintf(os.Stderr, "error: failed to chdir to %s: %v\n", chrootPath, err)
-					os.Exit(1)
-				}
-			}
+		// Use pivot_root with a bind mount.
+		// The sequence must match container-init:
+		// The sequence must match container-init:
+		// 1. Bind mount the target path to itself FIRST (before chdir)
+		// 2. chdir to the target
+		// 3. Create old_root directory
+		// 4. pivot_root(".", ".old_root")
+		// 5. chdir("/")
+		// 6. Unmount old_root
 
-			oldRoot := ".old_root_join"
-			os.MkdirAll(oldRoot, 0700)
-			if err := unix.PivotRoot(".", oldRoot); err != nil {
-				// pivot_root can fail when joining an existing namespace because
-				// the container-init has already done pivot_root. The "/" in this
-				// namespace is already the container root, so we just need to
-				// chdir("/") to be in the right place. User namespaces still work
-				// because the container-init used pivot_root.
-				if err := unix.Chdir("/"); err != nil {
-					fmt.Fprintf(os.Stderr, "error: failed to chdir to /: %v\n", err)
-					os.Exit(1)
-				}
-			} else {
-				// pivot_root succeeded
-				if err := unix.Chdir("/"); err != nil {
-					fmt.Fprintf(os.Stderr, "error: failed to chdir to / after pivot_root: %v\n", err)
-					os.Exit(1)
-				}
-				// Unmount and remove old root
-				unix.Unmount("/.old_root_join", unix.MNT_DETACH)
-				os.Remove("/.old_root_join")
+		// Get the target path
+		targetPath := chrootPath
+		if chrootFd >= 0 {
+			// For fd case, we need to resolve the path from the fd
+			// by reading /proc/self/fd/<fd>
+			link := fmt.Sprintf("/proc/self/fd/%d", chrootFd)
+			resolved, err := os.Readlink(link)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "error: failed to resolve chroot fd path: %v\n", err)
+				os.Exit(1)
+			}
+			targetPath = resolved
+		}
+
+		// Bind mount the target to itself BEFORE chdir
+		if err := unix.Mount(targetPath, targetPath, "", unix.MS_BIND|unix.MS_REC, ""); err != nil {
+			fmt.Fprintf(os.Stderr, "error: failed to bind-mount %s: %v\n", targetPath, err)
+			os.Exit(1)
+		}
+
+		// Now chdir to the target
+		if chrootFd >= 0 {
+			if err := unix.Fchdir(chrootFd); err != nil {
+				fmt.Fprintf(os.Stderr, "error: failed to fchdir to chroot fd: %v\n", err)
+				os.Exit(1)
 			}
 		} else {
-			// Creating new namespace: use pivot_root with a bind mount.
-			// The sequence must match container-init:
-			// 1. Bind mount the target path to itself FIRST (before chdir)
-			// 2. chdir to the target
-			// 3. Create old_root directory
-			// 4. pivot_root(".", ".old_root")
-			// 5. chdir("/")
-			// 6. Unmount old_root
-
-			// Get the target path
-			targetPath := chrootPath
-			if chrootFd >= 0 {
-				// For fd case, we need to resolve the path from the fd
-				// by reading /proc/self/fd/<fd>
-				link := fmt.Sprintf("/proc/self/fd/%d", chrootFd)
-				resolved, err := os.Readlink(link)
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "error: failed to resolve chroot fd path: %v\n", err)
-					os.Exit(1)
-				}
-				targetPath = resolved
-			}
-
-			// Bind mount the target to itself BEFORE chdir
-			if err := unix.Mount(targetPath, targetPath, "", unix.MS_BIND|unix.MS_REC, ""); err != nil {
-				fmt.Fprintf(os.Stderr, "error: failed to bind-mount %s: %v\n", targetPath, err)
+			if err := unix.Chdir(chrootPath); err != nil {
+				fmt.Fprintf(os.Stderr, "error: failed to chdir to %s: %v\n", chrootPath, err)
 				os.Exit(1)
 			}
-
-			// Now chdir to the target
-			if chrootFd >= 0 {
-				if err := unix.Fchdir(chrootFd); err != nil {
-					fmt.Fprintf(os.Stderr, "error: failed to fchdir to chroot fd: %v\n", err)
-					os.Exit(1)
-				}
-			} else {
-				if err := unix.Chdir(chrootPath); err != nil {
-					fmt.Fprintf(os.Stderr, "error: failed to chdir to %s: %v\n", chrootPath, err)
-					os.Exit(1)
-				}
-			}
-
-			oldRoot := ".old_root"
-			if err := os.MkdirAll(oldRoot, 0700); err != nil {
-				fmt.Fprintf(os.Stderr, "error: failed to create old root dir: %v\n", err)
-				os.Exit(1)
-			}
-
-			if err := unix.PivotRoot(".", oldRoot); err != nil {
-				fmt.Fprintf(os.Stderr, "error: pivot_root failed: %v\n", err)
-				os.Exit(1)
-			}
-
-			if err := unix.Chdir("/"); err != nil {
-				fmt.Fprintf(os.Stderr, "error: failed to chdir to / after pivot_root: %v\n", err)
-				os.Exit(1)
-			}
-
-			if err := unix.Unmount("/.old_root", unix.MNT_DETACH); err != nil {
-				fmt.Fprintf(os.Stderr, "warning: failed to unmount old root: %v\n", err)
-			}
-			os.Remove("/.old_root")
 		}
+
+		oldRoot := ".old_root"
+		if err := os.MkdirAll(oldRoot, 0700); err != nil {
+			fmt.Fprintf(os.Stderr, "error: failed to create old root dir: %v\n", err)
+			os.Exit(1)
+		}
+
+		if err := unix.PivotRoot(".", oldRoot); err != nil {
+			fmt.Fprintf(os.Stderr, "error: pivot_root failed: %v\n", err)
+			os.Exit(1)
+		}
+
+		if err := unix.Chdir("/"); err != nil {
+			fmt.Fprintf(os.Stderr, "error: failed to chdir to / after pivot_root: %v\n", err)
+			os.Exit(1)
+		}
+
+		if err := unix.Unmount("/.old_root", unix.MNT_DETACH); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: failed to unmount old root: %v\n", err)
+		}
+		os.Remove("/.old_root")
 	}
 	// Close the chroot fd if we used it — it was opened by ts nsenter before
 	// setns and passed without O_CLOEXEC so it survived exec.
@@ -250,51 +194,59 @@ func cmdDropCapsAndRun(args []string) {
 		unix.Close(chrootFd)
 	}
 
-	if !skipMountSetup {
-		// Ensure mount points exist (blank containers may not have them)
-		os.MkdirAll("/proc", 0555)
-		os.MkdirAll("/sys", 0555)
+	// Ensure mount points exist (blank containers may not have them)
+	os.MkdirAll("/proc", 0555)
+	os.MkdirAll("/sys", 0555)
 
-		// Mount /proc filesystem
-		if err := unix.Mount("proc", "/proc", "proc", 0, ""); err != nil {
-			// Ignore errors - /proc might already be mounted
-			_ = err
-		}
+	// Mount /proc filesystem
+	if err := unix.Mount("proc", "/proc", "proc", 0, ""); err != nil {
+		// Ignore errors - /proc might already be mounted
+		_ = err
+	}
 
-		// Mount /sys filesystem
-		if err := unix.Mount("sysfs", "/sys", "sysfs", 0, ""); err != nil {
-			// Ignore errors - /sys might already be mounted
-			_ = err
-		}
+	// Mount /sys filesystem
+	if err := unix.Mount("sysfs", "/sys", "sysfs", 0, ""); err != nil {
+		// Ignore errors - /sys might already be mounted
+		_ = err
+	}
 
-		// Set up /dev like Docker/containerd do:
-		// - tmpfs at /dev
-		// - Essential device nodes (null, zero, full, random, urandom, tty)
-		// - Symlinks for stdin/stdout/stderr and /dev/fd
-		// - /dev/pts for pseudoterminals
-		// - /dev/shm for shared memory
-		setupDev(mountVsock)
+	// Set up /dev like Docker/containerd do:
+	// - tmpfs at /dev
+	// - Essential device nodes (null, zero, full, random, urandom, tty)
+	// - Symlinks for stdin/stdout/stderr and /dev/fd
+	// - /dev/pts for pseudoterminals
+	// - /dev/shm for shared memory
+	setupDev(mountVsock)
 
-		// Set hostname if provided (only when creating namespace, not joining)
-		if hostname != "" {
-			if err := unix.Sethostname([]byte(hostname)); err != nil {
-				fmt.Fprintf(os.Stderr, "error: failed to set hostname: %v\n", err)
-				os.Exit(1)
-			}
-		}
-
-		// Set domainname if provided (only when creating namespace, not joining)
-		if domainname != "" {
-			if err := unix.Setdomainname([]byte(domainname)); err != nil {
-				fmt.Fprintf(os.Stderr, "error: failed to set domainname: %v\n", err)
-				os.Exit(1)
-			}
+	// Set hostname if provided (only when creating namespace, not joining)
+	if hostname != "" {
+		if err := unix.Sethostname([]byte(hostname)); err != nil {
+			fmt.Fprintf(os.Stderr, "error: failed to set hostname: %v\n", err)
+			os.Exit(1)
 		}
 	}
 
-	// Capabilities to drop from the bounding set. When keepDevCaps is true,
-	// we retain CAP_MKNOD so nested thundersnap can mount devtmpfs and create
-	// device nodes for its own containers.
+	// Set domainname if provided (only when creating namespace, not joining)
+	if domainname != "" {
+		if err := unix.Setdomainname([]byte(domainname)); err != nil {
+			fmt.Fprintf(os.Stderr, "error: failed to set domainname: %v\n", err)
+			os.Exit(1)
+		}
+	}
+
+	dropCapsAndExec(cmdArgs, keepDevCaps, usePty)
+}
+
+// dropCapsAndExec drops dangerous capabilities from the bounding set and execs
+// the given command (or runs it under a PTY if usePty is true). This is the
+// shared tail of cmdDropCapsAndRun (PID-1 namespace creator) and cmdJoinAndRun
+// (namespace joiner): both paths end by restricting capabilities and exec'ing
+// the target command.
+//
+// keepDevCaps retains CAP_MKNOD so nested thundersnap can mount devtmpfs and
+// create device nodes for its own containers.
+func dropCapsAndExec(cmdArgs []string, keepDevCaps, usePty bool) {
+	// Capabilities to drop from the bounding set.
 	capsToDrop := []uintptr{
 		unix.CAP_NET_ADMIN,
 		unix.CAP_SYS_MODULE,
@@ -307,7 +259,6 @@ func cmdDropCapsAndRun(args []string) {
 		capsToDrop = append(capsToDrop, unix.CAP_MKNOD)
 	}
 
-	// Drop each capability from the bounding set
 	for _, cap := range capsToDrop {
 		if err := unix.Prctl(unix.PR_CAPBSET_DROP, cap, 0, 0, 0); err != nil {
 			fmt.Fprintf(os.Stderr, "error: failed to drop capability %d: %v\n", cap, err)
@@ -321,23 +272,14 @@ func cmdDropCapsAndRun(args []string) {
 		os.Setenv("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
 	}
 
-	// Find the executable in PATH
 	executable, err := findExecutable(cmdArgs[0])
 	if err != nil {
-		// If "su" isn't found, fall back to /bin/sh for root user.
-		// This allows minimal containers without su to still work.
-		// The fallback preserves the same semantics:
-		//   su - root      -> /bin/sh -l
-		//   su root -c CMD -> /bin/sh -c CMD
 		if cmdArgs[0] == "su" {
 			if sh, shErr := findExecutable("/bin/sh"); shErr == nil {
-				// Check if this is "su - root" (login shell) or "su root -c CMD"
 				if len(cmdArgs) >= 3 && cmdArgs[1] == "-" && cmdArgs[2] == "root" {
-					// su - root -> /bin/sh -l
 					executable = sh
 					cmdArgs = []string{"/bin/sh", "-l"}
 				} else if len(cmdArgs) >= 4 && cmdArgs[1] == "root" && cmdArgs[2] == "-c" {
-					// su root -c CMD -> /bin/sh -c CMD
 					executable = sh
 					cmdArgs = append([]string{"/bin/sh", "-c"}, cmdArgs[3:]...)
 				} else {
@@ -355,16 +297,109 @@ func cmdDropCapsAndRun(args []string) {
 	}
 
 	if usePty {
-		// Allocate a PTY inside the container (after devpts is mounted)
-		// and run the command with it, proxying I/O to our stdin/stdout.
 		runWithPty(executable, cmdArgs)
 	} else {
-		// Exec the command, replacing this process
 		if err := syscall.Exec(executable, cmdArgs, os.Environ()); err != nil {
 			fmt.Fprintf(os.Stderr, "error: exec %s: %v\n", cmdArgs[0], err)
 			os.Exit(1)
 		}
 	}
+}
+
+// cmdJoinAndRun joins an existing container namespace (entered via ts nsenter
+// or util-linux nsenter) and runs a command inside it. Unlike drop-caps-and-run
+// which creates a fresh namespace and sets up mounts (MS_PRIVATE, pivot_root,
+// setupDev), this command does ZERO mount operations: the container-init has
+// already done all setup. It just navigates to the container root, drops caps,
+// and execs the command.
+//
+// This is the replacement for 'drop-caps-and-run --skip-mount-setup'. Splitting
+// the join path into its own command eliminates the ambiguous --skip-mount-setup
+// flag and the dangerous soft-ignored pivot_root that accompanied it.
+//
+// Usage: ts join-and-run --chroot=<path> [--chroot-fd=<N>] [--keep-dev-caps]
+//
+//	[--pty] -- <command...>
+func cmdJoinAndRun(args []string) {
+	var chrootPath string
+	var chrootFd int = -1
+	var keepDevCaps bool
+	var usePty bool
+	var cmdArgs []string
+
+	for i := 0; i < len(args); i++ {
+		if args[i] == "--chroot" && i+1 < len(args) {
+			chrootPath = args[i+1]
+			i++
+		} else if strings.HasPrefix(args[i], "--chroot=") {
+			chrootPath = strings.TrimPrefix(args[i], "--chroot=")
+		} else if args[i] == "--chroot-fd" && i+1 < len(args) {
+			fd, err := strconv.Atoi(args[i+1])
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "error: invalid --chroot-fd: %v\n", err)
+				os.Exit(1)
+			}
+			chrootFd = fd
+			i++
+		} else if strings.HasPrefix(args[i], "--chroot-fd=") {
+			fd, err := strconv.Atoi(strings.TrimPrefix(args[i], "--chroot-fd="))
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "error: invalid --chroot-fd: %v\n", err)
+				os.Exit(1)
+			}
+			chrootFd = fd
+		} else if args[i] == "--keep-dev-caps" {
+			keepDevCaps = true
+		} else if args[i] == "--pty" {
+			usePty = true
+		} else if args[i] == "--" {
+			cmdArgs = args[i+1:]
+			break
+		} else {
+			cmdArgs = args[i:]
+			break
+		}
+	}
+
+	if len(cmdArgs) == 0 {
+		fmt.Fprintln(os.Stderr, "error: join-and-run requires a command to execute")
+		os.Exit(1)
+	}
+
+	// Navigate to the container root. After setns(CLONE_NEWNS) (done by ts
+	// nsenter before exec'ing us), the mount table is the container's, but the
+	// process's root dentry may be stale (a kernel VFS behavior on btrfs). The
+	// --chroot-fd (opened by nsenter via /proc/<pid>/root before setns) has the
+	// correct dentry; --chroot is a fallback for when the fd isn't available.
+	if chrootFd >= 0 {
+		if err := unix.Fchdir(chrootFd); err != nil {
+			fmt.Fprintf(os.Stderr, "error: failed to fchdir to chroot fd: %v\n", err)
+			os.Exit(1)
+		}
+	} else if chrootPath != "" {
+		if err := unix.Chdir(chrootPath); err != nil {
+			fmt.Fprintf(os.Stderr, "error: failed to chdir to %s: %v\n", chrootPath, err)
+			os.Exit(1)
+		}
+	}
+
+	// chdir to "/" to be at the root of the container's mount namespace.
+	// The container-init has already pivot_root'd, so "/" IS the container
+	// root. No pivot_root or chroot needed here — and crucially, no mount
+	// operations at all. User namespaces work inside the container because
+	// container-init used pivot_root (not chroot) to set the root.
+	if err := unix.Chdir("/"); err != nil {
+		fmt.Fprintf(os.Stderr, "error: failed to chdir to /: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Close the chroot fd if we used it — it was opened by ts nsenter before
+	// setns and passed without O_CLOEXEC so it survived exec.
+	if chrootFd >= 0 {
+		unix.Close(chrootFd)
+	}
+
+	dropCapsAndExec(cmdArgs, keepDevCaps, usePty)
 }
 
 // runWithPty allocates a PTY inside the container and runs the command with it.
