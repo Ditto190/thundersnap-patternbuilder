@@ -15,6 +15,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"log"
 	"net"
@@ -319,6 +320,29 @@ func (m *vmxSessionManager) releaseVMX(tailscaleUser, isolationName string) {
 	}
 }
 
+// maxUnixSocketPath is the maximum length for a Unix socket path. Linux uses
+// a 108-byte sun_path buffer including the null terminator, so 107 usable bytes.
+const maxUnixSocketPath = 107
+
+// shortSocketDir returns a short path to the given directory, creating a symlink
+// in /tmp if the directory path is too long for Unix socket operations. Returns
+// the short path (which may be the original if it's already short enough) and a
+// cleanup function to remove the symlink when done.
+func shortSocketDir(dir string) (shortDir string, cleanup func(), err error) {
+	// Create a unique symlink name using a hash of the original path.
+	h := fnv.New32a()
+	h.Write([]byte(dir))
+	linkPath := fmt.Sprintf("/tmp/.ts-sock-%x", h.Sum32())
+
+	os.Remove(linkPath) // Remove stale symlink
+	if err := os.Symlink(dir, linkPath); err != nil {
+		return "", nil, err
+	}
+
+	cleanup = func() { os.Remove(linkPath) }
+	return linkPath, cleanup, nil
+}
+
 // hostVshdManager runs a single host-mode vshd process listening on a Unix
 // socket. Host container sessions dial this socket and speak the same vshd wire
 // protocol as VM sessions, so runContainerSession and runVMXSession share one
@@ -330,10 +354,11 @@ func (m *vmxSessionManager) releaseVMX(tailscaleUser, isolationName string) {
 // the VMX request header, and vshd's buildSessionCmd joins/creates that frame's
 // namespace. The process is started lazily on first session and reused.
 type hostVshdManager struct {
-	mu          sync.Mutex
-	cmd         *exec.Cmd
-	sockPath    string
-	lifecycleFd *os.File // write end of lifecycle pipe; kept open to keep vshd alive
+	mu             sync.Mutex
+	cmd            *exec.Cmd
+	sockPath       string
+	lifecycleFd    *os.File // write end of lifecycle pipe; kept open to keep vshd alive
+	symlinkCleanup func()   // cleanup function for socket path symlink, if any
 }
 
 var hostVshd = &hostVshdManager{}
@@ -357,6 +382,10 @@ func (m *hostVshdManager) ensure() (sockPath string, err error) {
 			m.lifecycleFd.Close()
 			m.lifecycleFd = nil
 		}
+		if m.symlinkCleanup != nil {
+			m.symlinkCleanup()
+			m.symlinkCleanup = nil
+		}
 	}
 
 	vshdBin := filepath.Join(fsDirLibexec, "vshd")
@@ -365,7 +394,21 @@ func (m *hostVshdManager) ensure() (sockPath string, err error) {
 	if err := os.MkdirAll(sockDir, 0755); err != nil {
 		return "", fmt.Errorf("create host vshd socket dir: %w", err)
 	}
-	sockPath = filepath.Join(sockDir, "host-vshd.sock")
+
+	// Unix socket paths are limited to 107 bytes (108 minus null terminator).
+	// If the path would be too long (common in e2e tests with long temp dirs),
+	// create a symlink from /tmp to the socket directory and use the short path.
+	sockName := "host-vshd.sock"
+	sockPath = filepath.Join(sockDir, sockName)
+	if len(sockPath) > maxUnixSocketPath {
+		shortDir, cleanup, err := shortSocketDir(sockDir)
+		if err != nil {
+			return "", fmt.Errorf("create short socket path: %w", err)
+		}
+		m.symlinkCleanup = cleanup
+		sockPath = filepath.Join(shortDir, sockName)
+		log.Printf("using short socket path %s (original dir too long)", sockPath)
+	}
 	os.Remove(sockPath)
 
 	// Create a pipe for lifecycle management: vshd monitors the read end and
