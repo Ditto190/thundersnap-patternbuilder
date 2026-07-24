@@ -67,18 +67,6 @@ func (s *VMSession) SetControlHandler(h http.Handler) {
 	s.controlHandler = h
 }
 
-// capSetFCAPInBoundingSet reports whether CAP_SETFCAP is present in this
-// process's capability bounding set. It uses prctl(PR_CAPBSET_READ, CAP_SETFCAP),
-// which returns 1 if the capability is in the bounding set, 0 if not, or an error.
-func capSetFCAPInBoundingSet() bool {
-	res, err := unix.PrctlRetInt(unix.PR_CAPBSET_READ, uintptr(unix.CAP_SETFCAP), 0, 0, 0)
-	if err != nil {
-		// If we can't query, assume it's present (don't change behavior).
-		return true
-	}
-	return res > 0
-}
-
 // waitForSocket polls for the named unix socket to appear, up to attempts
 // times with delay between checks. It returns nil as soon as the socket exists
 // and an error if it never appears. The helper (a process started by us creates
@@ -111,27 +99,26 @@ func StartVM(cfg VMConfig) (*VMSession, error) {
 
 	// Start virtiofsd
 	log.Printf("Starting virtiofsd with shared-dir=%s", cfg.RootFS)
-	virtiofsdArgs := []string{
-		"--socket-path=" + virtiofsSock,
-		"--shared-dir=" + cfg.RootFS,
+	// virtiofsd, when run as root, always calls drop_capabilities() which capset()s
+	// a fixed set of 8 caps including CAP_SETFCAP. Many container runtimes drop
+	// CAP_SETFCAP from the bounding set (e.g. the default Docker/containerd
+	// bounding set 0x1ff5dbeefff omits it), causing that capset() to fail with
+	// EPERM and virtiofsd to exit(1) immediately — leaving a stale vhost-user
+	// socket, so cloud-hypervisor gets ECONNREFUSED and the VM never boots.
+	// --modcaps=-setfcap tells virtiofsd not to require CAP_SETFCAP; virtiofsd
+	// only uses it to set file capabilities on files, which our rootfs does not
+	// need, so dropping it is safe on both hosts and containers.
+	//
+	// TODO: once thundersnap has configurable isolation levels, a nested
+	// thundersnapd could run in a lower-isolation mode that retains CAP_SETFCAP
+	// in its bounding set, making this flag unnecessary in that mode. That mode
+	// doesn't exist today, so we always pass the flag.
+	virtiofsdCmd := exec.Command("/usr/libexec/virtiofsd",
+		"--socket-path="+virtiofsSock,
+		"--shared-dir="+cfg.RootFS,
 		"--cache=always",
-	}
-	// virtiofsd, when run as root, always calls drop_capabilities() which capset()s a
-	// fixed set of 8 caps (including CAP_SETFCAP). If CAP_SETFCAP is not in this
-	// process's capability bounding set — which is the case in containers whose
-	// runtime drops CAP_SETFCAP (e.g. the default Docker/containerd bounding set) —
-	// that capset() fails with EPERM and virtiofsd exits(1) immediately, leaving a
-	// stale vhost-user socket. cloud-hypervisor then fails to connect (ECONNREFUSED)
-	// and the VM never boots. --modcaps=-setfcap tells virtiofsd not to require
-	// CAP_SETFCAP (it only uses it to set file capabilities, which our rootfs does
-	// not need), so capset() succeeds even without CAP_SETFCAP in the bounding set.
-	// We apply it only when CAP_SETFCAP is actually missing, to preserve virtiofsd's
-	// normal capability set on hosts where it is available.
-	if !capSetFCAPInBoundingSet() {
-		log.Printf("CAP_SETFCAP not in bounding set; adding --modcaps=-setfcap to virtiofsd")
-		virtiofsdArgs = append(virtiofsdArgs, "--modcaps=-setfcap")
-	}
-	virtiofsdCmd := exec.Command("/usr/libexec/virtiofsd", virtiofsdArgs...)
+		"--modcaps=-setfcap",
+	)
 	// Pdeathsig ensures virtiofsd exits when its parent (thundersnapd/test harness)
 	// dies, preventing orphaned virtiofsd processes.
 	virtiofsdCmd.SysProcAttr = &syscall.SysProcAttr{

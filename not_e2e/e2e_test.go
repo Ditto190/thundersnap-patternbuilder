@@ -38,8 +38,6 @@ import (
 	"testing"
 	"time"
 	"unsafe"
-
-	"golang.org/x/sys/unix"
 )
 
 // testEnv holds paths and resources for a test environment.
@@ -56,14 +54,11 @@ type testEnv struct {
 
 // startVirtiofsd starts virtiofsd serving sharedDir over the vhost-user socket
 // at virtiofsSock, waits for the socket to appear, and returns the running
-// command (the caller is responsible for Wait/Kill). It applies the same
-// CAP_SETFCAP workaround as thundersnap.StartVM: virtiofsd, when run as root,
-// always capset()s a fixed set of 8 capabilities including CAP_SETFCAP. When
-// CAP_SETFCAP is absent from this process's capability bounding set — as in
-// containers whose runtime drops it (e.g. the default Docker/containerd
-// bounding set 0x1ff5dbeefff omits CAP_SETFCAP) — that capset() fails with
-// EPERM and virtiofsd exits(1) immediately, leaving a stale socket; the VM
-// then never boots. --modcaps=-setfcap tells virtiofsd not to require it.
+// command (the caller is responsible for Wait/Kill). It always passes
+// --modcaps=-setfcap, matching thundersnap.StartVM: see the comment there for
+// why (virtiofsd's drop_capabilities() capset()s CAP_SETFCAP, which is absent
+// from many container runtimes' bounding sets; without the flag virtiofsd
+// exits(1) immediately and the VM never boots).
 func startVirtiofsd(t *testing.T, virtiofsSock, sharedDir string) *exec.Cmd {
 	t.Helper()
 	virtiofsdPath := "/usr/libexec/virtiofsd"
@@ -74,19 +69,13 @@ func startVirtiofsd(t *testing.T, virtiofsSock, sharedDir string) *exec.Cmd {
 		"--socket-path=" + virtiofsSock,
 		"--shared-dir=" + sharedDir,
 		"--cache=always",
-	}
-	if !capSetFCAPInBoundingSet() {
-		t.Logf("CAP_SETFCAP not in bounding set; adding --modcaps=-setfcap to virtiofsd")
-		args = append(args, "--modcaps=-setfcap")
+		"--modcaps=-setfcap",
 	}
 	cmd := exec.Command(virtiofsdPath, args...)
 	cmd.Stderr = os.Stderr
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("start virtiofsd: %v", err)
 	}
-	// Wait for the socket to appear. virtiofsd creates it before (possibly)
-	// exiting on a capability error, so its presence does not guarantee the
-	// daemon is alive; a later connect failure surfaces that.
 	for i := 0; i < 50; i++ {
 		if _, err := os.Stat(virtiofsSock); err == nil {
 			break
@@ -94,18 +83,6 @@ func startVirtiofsd(t *testing.T, virtiofsSock, sharedDir string) *exec.Cmd {
 		time.Sleep(100 * time.Millisecond)
 	}
 	return cmd
-}
-
-// capSetFCAPInBoundingSet reports whether CAP_SETFCAP is present in this
-// process's capability bounding set via prctl(PR_CAPBSET_READ, CAP_SETFCAP),
-// which returns 1 if present, 0 if not. On error it assumes present so as not
-// to change behavior on hosts where the query is unavailable.
-func capSetFCAPInBoundingSet() bool {
-	res, err := unix.PrctlRetInt(unix.PR_CAPBSET_READ, uintptr(unix.CAP_SETFCAP), 0, 0, 0)
-	if err != nil {
-		return true
-	}
-	return res > 0
 }
 
 // requireBtrfsRoot fails the test if the e2e environment is not set up
