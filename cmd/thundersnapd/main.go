@@ -1593,6 +1593,13 @@ func startControlServer(sockPath, rootFS string) (*controlServer, error) {
 	// By chdir'ing to the socket's parent directory first, we use a short relative name.
 	sockName := filepath.Base(sockPath) // e.g., "thunder.sock"
 	sockDir := filepath.Dir(sockPath)   // e.g., rootFS/id
+
+	// Ensure the socket directory exists. The /id directory may not have been
+	// created yet if no ref has been associated with this frame.
+	if err := os.MkdirAll(sockDir, 0755); err != nil {
+		return nil, fmt.Errorf("create socket dir %s: %w", sockDir, err)
+	}
+
 	cwd, err := os.Getwd()
 	if err != nil {
 		return nil, fmt.Errorf("get cwd: %w", err)

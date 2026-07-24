@@ -418,8 +418,9 @@ func TestSSHContainerBasic(t *testing.T) {
 	}
 	t.Logf("echo output (testframe): %s", output)
 
-	// Test ts snap: create a snapshot of the current frame
-	output, exitCode, err = sshExec(t, d, "testframe", "ts snap")
+	// Test ts snap: create a snapshot of the current frame.
+	// Use --wait to ensure indexing completes before checking ts snaps.
+	output, exitCode, err = sshExec(t, d, "testframe", "ts snap --wait")
 	if err != nil {
 		t.Fatalf("ts snap failed: %v", err)
 	}
