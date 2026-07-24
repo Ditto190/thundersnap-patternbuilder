@@ -248,7 +248,14 @@ func StartVM(cfg VMConfig) (*VMSession, error) {
 	// it builds: the vshd that runs as this VM's init listens on AF_VSOCK. (The
 	// kernel does not auto-mount devtmpfs in the guest, so /dev/vsock would
 	// otherwise be absent.) Containers never get this flag.
-	cmdline := fmt.Sprintf(`console=ttyS0 panic=1 rootfstype=virtiofs root=rootfs rw ip=10.0.2.15::10.0.2.2:255.255.255.0:%s:eth0:off init=%s -- -c "exec %s drop-caps-and-run --vsock %s -c 'echo nameserver 8.8.8.8 > /etc/resolv.conf; exec %s'"`, hostname, shBin, tsBin, shBin, vshdBin)
+	// Run ts directly as the kernel's init (PID 1). Previously this used
+	// `init=<sh> -c "exec <ts> drop-caps-and-run ..."` but /bin/sh is a symlink
+	// to ts (mvdan/sh shell mode), whose `exec` builtin forks instead of
+	// replacing the process — so ts drop-caps-and-run was never PID 1, which
+	// trips the pid-1 safety gate in cmdDropCapsAndRun. By setting init=<ts>
+	// directly, the kernel starts ts as PID 1, and ts dispatches to the
+	// drop-caps-and-run subcommand with the remaining init args.
+	cmdline := fmt.Sprintf(`console=ttyS0 panic=1 rootfstype=virtiofs root=rootfs rw ip=10.0.2.15::10.0.2.2:255.255.255.0:%s:eth0:off init=%s -- drop-caps-and-run --vsock %s -c "echo nameserver 8.8.8.8 > /etc/resolv.conf; exec %s"`, hostname, tsBin, shBin, vshdBin)
 
 	// Create pipe for event monitor - cloud-hypervisor writes events, we read them
 	eventReadPipe, eventWritePipe, err := os.Pipe()

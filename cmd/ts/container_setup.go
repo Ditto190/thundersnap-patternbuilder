@@ -97,19 +97,28 @@ func cmdDropCapsAndRun(args []string) {
 		os.Exit(1)
 	}
 
+	// Defense-in-depth: the !skipMountSetup path performs destructive mount
+	// operations (MS_PRIVATE on /, bind mounts, pivot_root, setupDev) that must
+	// only run inside a fresh mount namespace created by the caller via
+	// Cloneflags:CLONE_NEWPID|CLONE_NEWNS. If invoked without Cloneflags (e.g.
+	// directly from a shell), those operations would land on the host's mount
+	// namespace and destroy it. PID 1 is the reliable signal that the caller
+	// created a new PID namespace (and, by convention, a new mount namespace):
+	// container-init, autorun, and the VM guest init are all PID 1.
+	if !skipMountSetup && os.Getpid() != 1 {
+		fmt.Fprintf(os.Stderr, "error: drop-caps-and-run with mount setup must run as PID 1 (got pid %d); the caller must use Cloneflags:CLONE_NEWPID|CLONE_NEWNS or pass --skip-mount-setup\n", os.Getpid())
+		os.Exit(1)
+	}
+
 	if !skipMountSetup {
 		// Make all mounts private so mounts inside the container don't propagate
 		// to the host. This must be done BEFORE chroot while "/" is still a real
 		// mount point. After CLONE_NEWNS, we have our own copy of the mount table
 		// but it still has "shared" propagation. Making it private here only
 		// affects our namespace, not the parent.
-		//
-		// In VM mode (running as init), this may fail because the root filesystem
-		// (virtiofs) doesn't support propagation changes. That's fine - VMs don't
-		// have mount propagation concerns anyway.
 		if err := unix.Mount("", "/", "", unix.MS_REC|unix.MS_PRIVATE, ""); err != nil {
-			// Only log, don't exit - this is expected to fail in VM mode
-			fmt.Fprintf(os.Stderr, "warning: failed to make mounts private: %v (ok in VM mode)\n", err)
+			fmt.Fprintf(os.Stderr, "error: failed to make mounts private: %v\n", err)
+			os.Exit(1)
 		}
 	}
 
@@ -731,12 +740,24 @@ func cmdContainerInit(args []string) {
 		os.Exit(1)
 	}
 
+	// Defense-in-depth: container-init performs destructive mount operations
+	// (MS_PRIVATE on /, bind mounts, pivot_root, setupDev) that must only run
+	// inside a fresh mount namespace created by the caller via
+	// Cloneflags:CLONE_NEWPID|CLONE_NEWNS. If invoked without Cloneflags (e.g.
+	// directly from a shell), those operations would land on the host's mount
+	// namespace and destroy it. PID 1 is the reliable signal that the caller
+	// created a new PID namespace.
+	if os.Getpid() != 1 {
+		fmt.Fprintf(os.Stderr, "error: container-init must run as PID 1 (got pid %d); the caller must use Cloneflags:CLONE_NEWPID|CLONE_NEWNS\n", os.Getpid())
+		os.Exit(1)
+	}
+
 	// Make all mounts private so mounts inside the container don't propagate
 	// to the host. This must be done BEFORE chroot while "/" is still a real
 	// mount point.
 	if err := unix.Mount("", "/", "", unix.MS_REC|unix.MS_PRIVATE, ""); err != nil {
-		// Only log, don't exit - this is expected to fail in VM mode
-		fmt.Fprintf(os.Stderr, "warning: failed to make mounts private: %v (ok in VM mode)\n", err)
+		fmt.Fprintf(os.Stderr, "error: failed to make mounts private: %v\n", err)
+		os.Exit(1)
 	}
 
 	// Bind-mount btrfs subvolume boundaries in the path from / to chrootPath.
