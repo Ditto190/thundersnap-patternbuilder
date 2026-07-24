@@ -29,8 +29,9 @@ all: build
 
 # Run all tests (requires CGO_ENABLED=0 for cmd/ts tests).
 # If the tests pass, also verify all Go files are gofmt-formatted; fail if not.
+# Hard timeout of 60s to prevent hangs.
 test:
-	CGO_ENABLED=0 go test ./...
+	CGO_ENABLED=0 timeout 60s go test ./...
 	@echo "checking gofmt..."
 	@unformatted=$$(gofmt -l $$(find . -name '*.go' -not -path './.tmp-e2e/*' -not -path './vendor/*' 2>/dev/null)); \
 	if [ -n "$$unformatted" ]; then \
@@ -48,6 +49,7 @@ test:
 # -test.timeout is intentionally aggressive (well under Go's 10m default): these
 # tests are all fast, so a hang almost always means a real bug, not a slow test.
 # E2E_ARGS can be used to pass extra args (e.g., E2E_ARGS="-run TestFoo").
+# Hard timeout of 120s enforced at Makefile level to prevent long hangs.
 E2E_TMPDIR ?= $(CURDIR)/.tmp-e2e
 E2E_TEST_TIMEOUT ?= 2m
 E2E_ARGS ?=
@@ -55,7 +57,7 @@ NOT_E2E_TEST_TIMEOUT ?= 2m
 e2e: ts vshd thundersnapd
 	@mkdir -p $(E2E_TMPDIR)
 	CGO_ENABLED=0 go test -tags e2e -c -o $(BIN)/e2e.test ./e2e
-	sudo -E env \
+	sudo -E timeout 120s env \
 		TMPDIR="$(E2E_TMPDIR)" \
 		TS_BINARY="$(CURDIR)/$(BIN)/ts" \
 		VSHD_BINARY="$(CURDIR)/$(BIN)/vshd" \
@@ -64,10 +66,11 @@ e2e: ts vshd thundersnapd
 
 # Run legacy "e2e" tests (not actually e2e - see not-e2e-enough.md)
 # These tests exercise individual components but don't go through the SSH front door.
+# Hard timeout of 240s enforced at Makefile level to prevent long hangs.
 not_e2e: ts vshd thundersnapd
 	@mkdir -p $(E2E_TMPDIR)
 	CGO_ENABLED=0 go test -tags e2e -c -o $(BIN)/not_e2e.test ./not_e2e
-	sudo -E env \
+	sudo -E timeout 240s env \
 		TMPDIR="$(E2E_TMPDIR)" \
 		TS_BINARY="$(CURDIR)/$(BIN)/ts" \
 		VSHD_BINARY="$(CURDIR)/$(BIN)/vshd" \
