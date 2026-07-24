@@ -93,21 +93,6 @@ func copyBinaryWithDeps(t *testing.T, src, rootfs string) {
 	}
 }
 
-// buildStaticDaemon builds thundersnapd with CGO_ENABLED=0 (static binary)
-// so it can run inside a minimal container rootfs without shared libraries.
-// The regular `make binaries` thundersnapd is dynamically linked.
-func buildStaticDaemon(t *testing.T, env *testEnv) string {
-	t.Helper()
-	staticPath := filepath.Join(env.root, "thundersnapd-static")
-	cmd := exec.Command("go", "build", "-o", staticPath, "./cmd/thundersnapd")
-	cmd.Env = append(os.Environ(), "CGO_ENABLED=0")
-	cmd.Dir = env.repoRoot
-	if output, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("build static thundersnapd: %v\n%s", err, output)
-	}
-	return staticPath
-}
-
 // innerDaemon is a handle to an inner thundersnapd running inside a frame on
 // the outer daemon. The inner daemon's SSH port is accessible from the test
 // because thundersnap containers share the network namespace (no CLONE_NEWNET).
@@ -145,11 +130,8 @@ func setupInnerDaemon(t *testing.T, d *daemonInstance, env *testEnv, outerRef, o
 
 	// --- 1. Copy binaries into the frame rootfs ---
 
-	// Build a static thundersnapd (the regular one is dynamically linked).
-	staticDaemon := buildStaticDaemon(t, env)
-
-	// thundersnapd (static) → /bin/thundersnapd
-	if err := copyFile(staticDaemon, filepath.Join(framePath, "bin", "thundersnapd")); err != nil {
+	// thundersnapd (static, built with CGO_ENABLED=0 by Makefile) → /bin/thundersnapd
+	if err := copyFile(env.daemonBinary, filepath.Join(framePath, "bin", "thundersnapd")); err != nil {
 		t.Fatalf("copy thundersnapd: %v", err)
 	}
 	os.Chmod(filepath.Join(framePath, "bin", "thundersnapd"), 0755)

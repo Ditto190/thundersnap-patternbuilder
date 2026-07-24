@@ -91,9 +91,11 @@ vsh:
 	@mkdir -p $(BIN)
 	go build -o $(BIN)/$@ ./cmd/$@
 
+# thundersnapd: CGO_ENABLED=0 so the nested test (nested_test.go) can run it
+# inside a minimal container rootfs that lacks shared libraries.
 thundersnapd:
 	@mkdir -p $(BIN)
-	go build -o $(BIN)/$@ ./cmd/$@
+	CGO_ENABLED=0 go build -o $(BIN)/$@ ./cmd/$@
 
 tsm:
 	@mkdir -p $(BIN)
