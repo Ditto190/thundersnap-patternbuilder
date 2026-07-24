@@ -675,13 +675,16 @@ func TestSSHContainerBasic(t *testing.T) {
 	}
 	defer sess1.Close()
 
-	// Start a long-running command (cat waits for input)
+	// Start a long-running command. We use "read x" (shell builtin) to wait
+	// for stdin. When the test closes the SSH session, the read will get EOF
+	// and exit. External commands like cat/sleep are not available in minimal
+	// containers where /bin/sh is the ts binary's minimal shell mode.
 	stdin1, err := sess1.StdinPipe()
 	if err != nil {
 		t.Fatalf("stdin pipe 1: %v", err)
 	}
-	if err := sess1.Start("cat"); err != nil {
-		t.Fatalf("start cat: %v", err)
+	if err := sess1.Start("read x"); err != nil {
+		t.Fatalf("start read: %v", err)
 	}
 
 	// Give the session time to register
@@ -695,7 +698,7 @@ func TestSSHContainerBasic(t *testing.T) {
 	if exitCode != 0 {
 		t.Errorf("ts frames: expected exit code 0, got %d", exitCode)
 	}
-	t.Logf("ts frames (with 1 cat session): %s", output)
+	t.Logf("ts frames (with 1 sleep session): %s", output)
 	// The output should show a non-zero session count for testframe.
 	// Format is typically: "testframe  N" where N is the session count.
 	// We check that the line with testframe doesn't say "0" or "stopped".
@@ -722,8 +725,8 @@ func TestSSHContainerBasic(t *testing.T) {
 	if err != nil {
 		t.Fatalf("stdin pipe 2: %v", err)
 	}
-	if err := sess2.Start("cat"); err != nil {
-		t.Fatalf("start cat 2: %v", err)
+	if err := sess2.Start("read x"); err != nil {
+		t.Fatalf("start read 2: %v", err)
 	}
 
 	time.Sleep(500 * time.Millisecond)
@@ -736,7 +739,7 @@ func TestSSHContainerBasic(t *testing.T) {
 	if exitCode != 0 {
 		t.Errorf("ts frames: expected exit code 0, got %d", exitCode)
 	}
-	t.Logf("ts frames (with 2 cat sessions): %s", output)
+	t.Logf("ts frames (with 2 sleep sessions): %s", output)
 
 	// Close the long-running sessions
 	stdin1.Close()
@@ -754,7 +757,7 @@ func TestSSHContainerBasic(t *testing.T) {
 	if exitCode != 0 {
 		t.Errorf("ts frames: expected exit code 0, got %d", exitCode)
 	}
-	t.Logf("ts frames (after closing cat sessions): %s", output)
+	t.Logf("ts frames (after closing sleep sessions): %s", output)
 }
 
 // TestSSHContainerUserRoot tests SSH as root user to a container frame.

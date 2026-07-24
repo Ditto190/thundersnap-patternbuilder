@@ -475,6 +475,8 @@ func proxyVshdSessionGeneric(
 
 	// Host -> guest: frame client stdin as FrameStdin; relay winsize changes.
 	// This goroutine exits when stdin EOFs; it does not signal session end.
+	// When stdin closes (EOF), send an empty FrameStdin as an EOF marker so
+	// the guest knows to close the child's stdin.
 	go func() {
 		if isPty && winCh != nil {
 			go func() {
@@ -492,6 +494,8 @@ func proxyVshdSessionGeneric(
 				}
 			}
 			if rerr != nil {
+				// Send empty FrameStdin as EOF marker to signal stdin closed
+				writeFrame(vshdproto.FrameStdin, nil)
 				break
 			}
 		}

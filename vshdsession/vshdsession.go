@@ -152,7 +152,8 @@ func servePipe(conn io.Writer, reader io.Reader, cmd *exec.Cmd, postStart func(p
 	logf.logf("command started with PID %d", cmd.Process.Pid)
 
 	// Client -> child stdin: decode FrameStdin frames. Other frame types (e.g.
-	// stray winsize) are ignored in pipe mode. Close stdin on EOF.
+	// stray winsize) are ignored in pipe mode. Close stdin on EOF or when
+	// we receive an empty FrameStdin (the daemon's EOF marker).
 	go func() {
 		defer stdin.Close()
 		for {
@@ -161,6 +162,10 @@ func servePipe(conn io.Writer, reader io.Reader, cmd *exec.Cmd, postStart func(p
 				return
 			}
 			if typ == vshdproto.FrameStdin {
+				// Empty FrameStdin is the EOF marker from the daemon
+				if len(payload) == 0 {
+					return
+				}
 				if _, werr := stdin.Write(payload); werr != nil {
 					return
 				}
