@@ -1103,6 +1103,25 @@ func TestContainerNamespaceSetup(t *testing.T) {
 	}
 	shellPid := strings.TrimSpace(output)
 	t.Logf("Session shell PID: %s (small PID suggests we're in container PID namespace)", shellPid)
+
+	// 6. Verify that user namespaces work inside the container.
+	// This requires pivot_root instead of chroot: with chroot, unshare -U fails
+	// with EPERM because the kernel denies user namespace creation when the
+	// process root is set via chroot() rather than pivot_root(). This is a
+	// security measure to prevent container escapes via user namespaces.
+	installBusyboxAppletInFrame(t, d, "nstest", "unshare")
+	output, exitCode, err = sshExec(t, d, "root@nstest", "/bin/unshare -U echo OK")
+	if err != nil {
+		t.Fatalf("sshExec failed: %v", err)
+	}
+	if exitCode != 0 {
+		t.Errorf("unshare -U: expected exit code 0, got %d (output: %q) - pivot_root may not be working", exitCode, output)
+	}
+	if !strings.Contains(output, "OK") {
+		t.Errorf("unshare -U: expected output to contain 'OK', got: %q", output)
+	} else {
+		t.Logf("User namespace inside container OK: unshare -U succeeded")
+	}
 }
 
 // TestVMNamespaceSetup validates that VM mode containers have correct namespace setup.

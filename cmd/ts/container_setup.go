@@ -113,34 +113,126 @@ func cmdDropCapsAndRun(args []string) {
 		}
 	}
 
-	// Chroot into the container rootfs if specified.
-	// This is needed both when creating new namespaces and when joining existing ones,
-	// because even after setns(CLONE_NEWNS), our root is still the host's "/".
+	// Change the root filesystem to the container's root.
 	//
-	// In nested containers on btrfs, the chroot path may traverse btrfs subvolume
-	// boundaries (e.g. /work/...) that are inaccessible after setns due to a stale
-	// root dentry. When --chroot-fd is provided (opened by ts nsenter before
-	// setns), use fchdir + chroot(".") to resolve through the fd's dentry
-	// instead of the stale root.
-	if chrootFd >= 0 {
-		if err := unix.Fchdir(chrootFd); err != nil {
-			fmt.Fprintf(os.Stderr, "error: failed to fchdir to chroot fd: %v\n", err)
-			os.Exit(1)
-		}
-		if err := unix.Chroot("."); err != nil {
-			fmt.Fprintf(os.Stderr, "error: failed to chroot to . (via fd): %v\n", err)
-			os.Exit(1)
-		}
-	} else if chrootPath != "" {
-		if err := unix.Chroot(chrootPath); err != nil {
-			fmt.Fprintf(os.Stderr, "error: failed to chroot to %s: %v\n", chrootPath, err)
-			os.Exit(1)
-		}
-	}
+	// When joining an existing namespace (--skip-mount-setup), the container-init
+	// has already done pivot_root, so the mount namespace's "/" IS the container
+	// root. We just need to chdir to "/" and then pivot_root will use our current
+	// root as the old root.
+	//
+	// When creating new namespaces (!skipMountSetup), we use pivot_root to
+	// properly change the root without the "chrooted" flag that prevents user
+	// namespace creation.
+	//
+	// In nested containers on btrfs, the pivot path may traverse btrfs subvolume
+	// boundaries that are inaccessible after setns due to a stale root dentry.
+	// When --chroot-fd is provided (opened before setns), use fchdir to reach
+	// the target through the fd's dentry.
 	if chrootFd >= 0 || chrootPath != "" {
-		if err := unix.Chdir("/"); err != nil {
-			fmt.Fprintf(os.Stderr, "error: failed to chdir to /: %v\n", err)
-			os.Exit(1)
+		if skipMountSetup {
+			// When joining an existing namespace, the container-init has already
+			// done pivot_root. The "/" in this mount namespace IS the container
+			// root. The --chroot-fd points to /proc/<pid>/root, which is that
+			// same root.
+			//
+			// Navigate to the target, then try pivot_root to swap our root.
+			if chrootFd >= 0 {
+				if err := unix.Fchdir(chrootFd); err != nil {
+					fmt.Fprintf(os.Stderr, "error: failed to fchdir to chroot fd: %v\n", err)
+					os.Exit(1)
+				}
+			} else {
+				if err := unix.Chdir(chrootPath); err != nil {
+					fmt.Fprintf(os.Stderr, "error: failed to chdir to %s: %v\n", chrootPath, err)
+					os.Exit(1)
+				}
+			}
+
+			oldRoot := ".old_root_join"
+			os.MkdirAll(oldRoot, 0700)
+			if err := unix.PivotRoot(".", oldRoot); err != nil {
+				// pivot_root can fail when joining an existing namespace because
+				// the container-init has already done pivot_root. The "/" in this
+				// namespace is already the container root, so we just need to
+				// chdir("/") to be in the right place. User namespaces still work
+				// because the container-init used pivot_root.
+				if err := unix.Chdir("/"); err != nil {
+					fmt.Fprintf(os.Stderr, "error: failed to chdir to /: %v\n", err)
+					os.Exit(1)
+				}
+			} else {
+				// pivot_root succeeded
+				if err := unix.Chdir("/"); err != nil {
+					fmt.Fprintf(os.Stderr, "error: failed to chdir to / after pivot_root: %v\n", err)
+					os.Exit(1)
+				}
+				// Unmount and remove old root
+				unix.Unmount("/.old_root_join", unix.MNT_DETACH)
+				os.Remove("/.old_root_join")
+			}
+		} else {
+			// Creating new namespace: use pivot_root with a bind mount.
+			// The sequence must match container-init:
+			// 1. Bind mount the target path to itself FIRST (before chdir)
+			// 2. chdir to the target
+			// 3. Create old_root directory
+			// 4. pivot_root(".", ".old_root")
+			// 5. chdir("/")
+			// 6. Unmount old_root
+
+			// Get the target path
+			targetPath := chrootPath
+			if chrootFd >= 0 {
+				// For fd case, we need to resolve the path from the fd
+				// by reading /proc/self/fd/<fd>
+				link := fmt.Sprintf("/proc/self/fd/%d", chrootFd)
+				resolved, err := os.Readlink(link)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "error: failed to resolve chroot fd path: %v\n", err)
+					os.Exit(1)
+				}
+				targetPath = resolved
+			}
+
+			// Bind mount the target to itself BEFORE chdir
+			if err := unix.Mount(targetPath, targetPath, "", unix.MS_BIND|unix.MS_REC, ""); err != nil {
+				fmt.Fprintf(os.Stderr, "error: failed to bind-mount %s: %v\n", targetPath, err)
+				os.Exit(1)
+			}
+
+			// Now chdir to the target
+			if chrootFd >= 0 {
+				if err := unix.Fchdir(chrootFd); err != nil {
+					fmt.Fprintf(os.Stderr, "error: failed to fchdir to chroot fd: %v\n", err)
+					os.Exit(1)
+				}
+			} else {
+				if err := unix.Chdir(chrootPath); err != nil {
+					fmt.Fprintf(os.Stderr, "error: failed to chdir to %s: %v\n", chrootPath, err)
+					os.Exit(1)
+				}
+			}
+
+			oldRoot := ".old_root"
+			if err := os.MkdirAll(oldRoot, 0700); err != nil {
+				fmt.Fprintf(os.Stderr, "error: failed to create old root dir: %v\n", err)
+				os.Exit(1)
+			}
+
+			if err := unix.PivotRoot(".", oldRoot); err != nil {
+				fmt.Fprintf(os.Stderr, "error: pivot_root failed: %v\n", err)
+				os.Exit(1)
+			}
+
+			if err := unix.Chdir("/"); err != nil {
+				fmt.Fprintf(os.Stderr, "error: failed to chdir to / after pivot_root: %v\n", err)
+				os.Exit(1)
+			}
+
+			if err := unix.Unmount("/.old_root", unix.MNT_DETACH); err != nil {
+				fmt.Fprintf(os.Stderr, "warning: failed to unmount old root: %v\n", err)
+			}
+			os.Remove("/.old_root")
 		}
 	}
 	// Close the chroot fd if we used it — it was opened by ts nsenter before
@@ -683,8 +775,8 @@ func cmdContainerInit(args []string) {
 		os.Exit(1)
 	}
 
-	// Stat /dev/kvm BEFORE chrooting (while the host's /dev is still visible).
-	// We store the device number so setupDev can mknod it after chrooting (when
+	// Stat /dev/kvm BEFORE pivot_root (while the host's /dev is still visible).
+	// We store the device number so setupDev can mknod it after pivot_root (when
 	// /dev is a fresh tmpfs with no device nodes). This propagates KVM into
 	// containers so nested VMs work.
 	if st, err := os.Stat("/dev/kvm"); err == nil {
@@ -693,14 +785,56 @@ func cmdContainerInit(args []string) {
 		}
 	}
 
-	// Chroot into the container rootfs
-	if err := unix.Chroot(chrootPath); err != nil {
-		fmt.Fprintf(os.Stderr, "error: failed to chroot to %s: %v\n", chrootPath, err)
+	// Use pivot_root instead of chroot. pivot_root properly changes the root
+	// filesystem in a way that allows user namespaces to be created inside the
+	// container. With chroot, unshare(CLONE_NEWUSER) fails with EPERM because
+	// the kernel considers the process to be in a "chroot jail" and denies
+	// user namespace creation as a security measure.
+	//
+	// The pivot_root dance:
+	// 1. chdir to the new root (already bind-mounted above)
+	// 2. Create a directory to mount the old root
+	// 3. pivot_root(".", "old_root") - atomically swaps / with the current dir
+	// 4. chdir("/") to be in the new root
+	// 5. Unmount and remove the old root
+
+	// chdir to the new root before pivot_root
+	if err := unix.Chdir(chrootPath); err != nil {
+		fmt.Fprintf(os.Stderr, "error: failed to chdir to %s: %v\n", chrootPath, err)
 		os.Exit(1)
 	}
-	if err := unix.Chdir("/"); err != nil {
-		fmt.Fprintf(os.Stderr, "error: failed to chdir to /: %v\n", err)
+
+	// Create a directory for the old root. We'll unmount and remove it after pivot.
+	oldRoot := ".old_root"
+	if err := os.MkdirAll(oldRoot, 0700); err != nil {
+		fmt.Fprintf(os.Stderr, "error: failed to create old root dir: %v\n", err)
 		os.Exit(1)
+	}
+
+	// pivot_root(".", ".old_root") - the new root is "." (current dir), and the
+	// old root will be mounted at ".old_root" (relative to new root, so /.old_root)
+	if err := unix.PivotRoot(".", oldRoot); err != nil {
+		fmt.Fprintf(os.Stderr, "error: pivot_root failed: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Now we're in the new root. chdir to "/" to be at the new root.
+	if err := unix.Chdir("/"); err != nil {
+		fmt.Fprintf(os.Stderr, "error: failed to chdir to / after pivot_root: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Unmount the old root. MNT_DETACH allows lazy unmount even if something
+	// is still using it (shouldn't be, but be safe).
+	if err := unix.Unmount("/.old_root", unix.MNT_DETACH); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: failed to unmount old root: %v\n", err)
+		// Non-fatal: we can continue, the old root is just still visible
+	}
+
+	// Remove the old root directory
+	if err := os.Remove("/.old_root"); err != nil {
+		// Non-fatal: directory might not be empty if unmount failed
+		fmt.Fprintf(os.Stderr, "warning: failed to remove old root dir: %v\n", err)
 	}
 
 	// Ensure mount points exist (blank containers may not have them)
