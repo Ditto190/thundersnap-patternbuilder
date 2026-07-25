@@ -156,51 +156,110 @@ func TestSnapBackgroundCapturesAtCallTime(t *testing.T) {
 }
 
 // TestSnapRapidDoubleBackgroundIndexing verifies that two rapid fire-and-forget
-// snaps both eventually land in ts snaps. This exercises the serialized
-// indexing queue and the per-frame pending-snap chaining: the second snap is
-// captured before the first finishes indexing, so it chains to the first job
-// and is indexed incrementally once the first finalizes.
+// snaps BOTH eventually finalize. This exercises the serialized indexing queue
+// and the per-frame pending-snap chaining: the second snap is captured before
+// the first finishes indexing, so it chains to the first job and is indexed
+// incrementally once the first finalizes.
+//
+// The two snaps capture DISTINCT content (a v1 then a v2 marker file), so they
+// must produce two distinct snap IDs and two new ts log history entries. The
+// previous version only asserted `ts snaps` grew by >=1, which passed even if
+// the queue dropped the second job or finalized only one of the two — exactly
+// the concurrency regression the test purports to guard. Asserting both land
+// catches a dropped/overwritten second pending entry.
 func TestSnapRapidDoubleBackgroundIndexing(t *testing.T) {
 	env := newTestEnv(t)
 	d := startDaemon(t, env)
 
 	createFrameViaDaemon(t, d, "bgdouble")
 
-	// Count snaps before any background snap lands.
-	before, _, _, err := sshExecSplit(t, d, "root@bgdouble", "ts snaps")
+	// Count ts log history entries before any background snap lands. Each
+	// finalized snap prepends one history entry, so +2 entries means both jobs
+	// finalized.
+	beforeLog, _, _, err := sshExecSplit(t, d, "root@bgdouble", "ts log")
 	if err != nil {
-		t.Fatalf("ts snaps (before): %v", err)
+		t.Fatalf("ts log (before): %v", err)
 	}
-	beforeCount := strings.Count(before, "\n")
+	beforeCount := len(nonEmptyLogLines(beforeLog))
 
-	// Two rapid fire-and-forget snaps. The captures serialize under the queue
-	// lock (instant btrfs snapshots); indexing happens in the background.
-	for i := 0; i < 2; i++ {
-		stdout, _, exitCode, err := sshExecSplit(t, d, "root@bgdouble", "ts snap")
-		if err != nil || exitCode != 0 {
-			t.Fatalf("ts snap #%d: err=%v exit=%d (stdout: %q)", i+1, err, exitCode, stdout)
-		}
-		if strings.TrimSpace(stdout) != "" {
-			t.Errorf("ts snap #%d (no --wait): expected empty stdout, got %q", i+1, stdout)
-		}
+	// Snap v1: write a marker, fire-and-forget snap (no --wait).
+	if _, exit, err := sshExec(t, d, "root@bgdouble", "echo v1 > /marker"); err != nil || exit != 0 {
+		t.Fatalf("write v1 marker: err=%v exit=%d", err, exit)
+	}
+	if stdout, _, exit, err := sshExecSplit(t, d, "root@bgdouble", "ts snap"); err != nil || exit != 0 {
+		t.Fatalf("ts snap #1: err=%v exit=%d (stdout: %q)", err, exit, stdout)
+	} else if strings.TrimSpace(stdout) != "" {
+		t.Errorf("ts snap #1 (no --wait): expected empty stdout, got %q", stdout)
 	}
 
-	// Both background snaps should eventually finalize and appear in ts snaps.
-	// (They may or may not dedup to the same content ID: a freshly created
-	// frame's files can still be inside the racy-ctime window, so the two
-	// snaps can legitimately produce distinct IDs. We only require that at
-	// least one new snap lands.)
+	// Snap v2: change the marker to distinct content, fire-and-forget snap.
+	// The capture happens immediately (before the first job finishes
+	// indexing), so v2's snap must reflect the v2 marker.
+	if _, exit, err := sshExec(t, d, "root@bgdouble", "echo v2 > /marker"); err != nil || exit != 0 {
+		t.Fatalf("write v2 marker: err=%v exit=%d", err, exit)
+	}
+	if stdout, _, exit, err := sshExecSplit(t, d, "root@bgdouble", "ts snap"); err != nil || exit != 0 {
+		t.Fatalf("ts snap #2: err=%v exit=%d (stdout: %q)", err, exit, stdout)
+	} else if strings.TrimSpace(stdout) != "" {
+		t.Errorf("ts snap #2 (no --wait): expected empty stdout, got %q", stdout)
+	}
+
+	// Poll ts log until BOTH snaps have finalized (>=2 new history entries).
+	// Each finalized job prepends a history entry, so this directly proves both
+	// pending jobs were indexed rather than one being dropped/overwritten.
 	deadline := time.Now().Add(30 * time.Second)
+	var logOut string
 	for time.Now().Before(deadline) {
-		out, _, _, err := sshExecSplit(t, d, "root@bgdouble", "ts snaps")
+		out, _, _, err := sshExecSplit(t, d, "root@bgdouble", "ts log")
 		if err != nil {
-			t.Fatalf("ts snaps (poll): %v", err)
+			t.Fatalf("ts log (poll): %v", err)
 		}
-		if strings.Count(out, "\n") > beforeCount {
-			t.Logf("both rapid background snaps finalized (ts snaps grew by >=1)")
-			return
+		logOut = out
+		if len(nonEmptyLogLines(out))-beforeCount >= 2 {
+			break
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
-	t.Fatalf("rapid double ts snap: background snaps never appeared in ts snaps within 30s (before=%q)", before)
+	lines := nonEmptyLogLines(logOut)
+	if got := len(lines) - beforeCount; got < 2 {
+		t.Fatalf("rapid double ts snap: only %d of 2 background snaps finalized in ts log within 30s (before=%d after=%d log=%q)",
+			got, beforeCount, len(lines), logOut)
+	}
+
+	// The two newest history entries (ts log prints newest first) must have
+	// distinct root snap IDs: v1 and v2 captured different /marker content, so
+	// they content-address to different IDs. Identical IDs would mean the
+	// second capture was lost or merged into the first.
+	rootSnaps := make([]string, 0, 2)
+	for _, line := range lines[:2] {
+		// ts log line: "<timestamp>  <root:home:work> [message]". fields[1] is
+		// the snap triplet; the root ID is the part before the first colon.
+		fields := strings.Fields(line)
+		if len(fields) < 2 || !strings.Contains(fields[1], ":") {
+			t.Fatalf("could not parse root snap from ts log line %q", line)
+		}
+		root := strings.SplitN(fields[1], ":", 2)[0]
+		if root == "" || root == "nil" {
+			t.Fatalf("parsed nil/empty root snap from ts log line %q", line)
+		}
+		rootSnaps = append(rootSnaps, root)
+	}
+	if rootSnaps[0] == rootSnaps[1] {
+		t.Fatalf("expected two distinct root snap IDs for v1/v2, both are %q (log=%q)", rootSnaps[0], logOut)
+	}
+	t.Logf("both rapid background snaps finalized with distinct IDs: %s, %s", rootSnaps[0], rootSnaps[1])
+}
+
+// nonEmptyLogLines returns the non-empty, non-"(no snapshots)" lines of ts log
+// output, preserving order (newest first).
+func nonEmptyLogLines(logOut string) []string {
+	var out []string
+	for _, line := range strings.Split(logOut, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || line == "(no snapshots)" {
+			continue
+		}
+		out = append(out, line)
+	}
+	return out
 }
