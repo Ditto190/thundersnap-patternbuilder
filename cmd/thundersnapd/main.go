@@ -1527,6 +1527,40 @@ func selectTargetUser(rootFS, targetUser string) string {
 	return "root"
 }
 
+// resolveSFTPStartDir picks the container-relative directory an SFTP (scp)
+// session starts in. Relative filenames from `scp host:relpath` resolve
+// against this directory (via sftp.WithStartDirectory), so it MUST be a
+// directory that actually exists in the frame.
+//
+// thundersnap's shared home is /home: ensureFrameFS always creates it as a
+// subvolume (empty or cloned) chowned to the thundersnap user, and an SSH
+// login as the default "user" account starts there. That makes /home the
+// natural default for scp uploads. A looked-up per-user home (e.g. ubuntu's
+// /home/ubuntu) is preferred when it actually exists in the rootfs. root's
+// /root is deliberately skipped: users expect `scp host:file` to land in the
+// shared /home (where `ssh host` puts them as the default user), not in
+// root's dotfile directory, and a bare `scp host:relpath` should not require
+// the user to know whether the frame has an /etc/passwd root entry.
+//
+// The old code hardcoded "/home/user" as the default, which never exists in
+// a thundersnap frame (the home subvolume is /home, not /home/user): for a
+// passwd-less nil:nil:nil frame connected to as root@, LookupUser returned
+// nil and homeDir stayed "/home/user", so every relative scp failed with
+// ENOENT. On a real image LookupUser("root") returned /root, so scp landed
+// in /root instead of /home.
+//
+// userInfo is the already-resolved user info for runAsUser (the caller does
+// the LookupUser so it can reuse it for uid/gid); it may be nil.
+func resolveSFTPStartDir(rootFS, targetUser string, userInfo *tsm.UserInfo) string {
+	const defaultHome = "/home"
+	if userInfo != nil && userInfo.Home != "" && userInfo.Home != "/root" {
+		if info, err := os.Stat(filepath.Join(rootFS, userInfo.Home)); err == nil && info.IsDir() {
+			return userInfo.Home
+		}
+	}
+	return defaultHome
+}
+
 // readStampFile reads the snapshot ID from a .stamp file.
 // Returns empty string if file doesn't exist.
 func readStampFile(path string) string {

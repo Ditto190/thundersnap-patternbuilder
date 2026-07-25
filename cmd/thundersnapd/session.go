@@ -107,21 +107,22 @@ func runSFTPSession(s ssh.Session, rootFS, targetUser string) error {
 		return fmt.Errorf("get absolute path for rootFS: %w", err)
 	}
 
-	// Determine which Unix user to run as and get their home directory
+	// Determine which Unix user to run as and get their home directory, plus
+	// the container-relative start directory for the SFTP session. The start
+	// directory is what `scp host:relpath` relative filenames resolve against,
+	// so it MUST be a directory that exists in the frame — see resolveSFTPStartDir
+	// for why /home (always-present shared subvolume) is the default and why
+	// root's /root is deliberately skipped.
 	runAsUser := selectTargetUser(rootFS, targetUser)
 	userInfo := tsm.LookupUser(rootFS, runAsUser)
+	homeDir := resolveSFTPStartDir(rootFS, targetUser, userInfo)
 
-	// Default to /home/user if we can't look up the user
-	homeDir := "/home/user"
 	// Files created over SFTP are created by the thundersnapd process (root),
 	// so without an explicit chown they would all be owned by root. Chown new
 	// files/dirs to the target user so that scp/sftp uploads land with the
 	// correct ownership rather than as root.
 	uid, gid := -1, -1
 	if userInfo != nil {
-		if userInfo.Home != "" {
-			homeDir = userInfo.Home
-		}
 		uid = int(userInfo.UID)
 		gid = int(userInfo.GID)
 	}
