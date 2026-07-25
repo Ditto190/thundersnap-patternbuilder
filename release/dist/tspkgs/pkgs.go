@@ -18,10 +18,13 @@ import (
 	"github.com/goreleaser/nfpm/v2/files"
 )
 
-// symlinkLatest creates a thundersnap_latest_<arch>.<ext> symlink pointing to filename.
+// symlinkLatest creates a <pkgName>_latest_<arch>.<ext> symlink pointing to filename.
 // filename is e.g. "thundersnap_1.2.3_amd64.deb"; the symlink replaces the version with "latest".
-func symlinkLatest(outDir, filename, arch, ext string) {
-	link := fmt.Sprintf("thundersnap_latest_%s.%s", arch, ext)
+// pkgName is the package name prefix (e.g. "thundersnap" or "thundersnap-dev") so that
+// coinstallable variants get distinct latest symlinks that don't clobber each other when
+// targets build concurrently.
+func symlinkLatest(outDir, pkgName, filename, arch, ext string) {
+	link := fmt.Sprintf("%s_latest_%s.%s", pkgName, arch, ext)
 	linkPath := filepath.Join(outDir, link)
 	os.Remove(linkPath)
 	if err := os.Symlink(filename, linkPath); err != nil {
@@ -158,7 +161,7 @@ func (t *tgzTarget) Build(b *Build) ([]string, error) {
 	if err := f.Close(); err != nil {
 		return nil, err
 	}
-	symlinkLatest(b.Out, filename, t.arch(), "tgz")
+	symlinkLatest(b.Out, "thundersnap", filename, t.arch(), "tgz")
 	return []string{filename}, nil
 }
 
@@ -279,7 +282,7 @@ func (t *debTarget) Build(b *Build) ([]string, error) {
 	if err := f.Close(); err != nil {
 		return nil, err
 	}
-	symlinkLatest(b.Out, filename, arch, "deb")
+	symlinkLatest(b.Out, "thundersnap", filename, arch, "deb")
 	return []string{filename}, nil
 }
 
@@ -406,7 +409,7 @@ func (t *rpmTarget) Build(b *Build) ([]string, error) {
 	if err := f.Close(); err != nil {
 		return nil, err
 	}
-	symlinkLatest(b.Out, filename, arch, "rpm")
+	symlinkLatest(b.Out, "thundersnap", filename, arch, "rpm")
 	return []string{filename}, nil
 }
 
@@ -536,7 +539,7 @@ func (t *debDevTarget) Build(b *Build) ([]string, error) {
 	if err := f.Close(); err != nil {
 		return nil, err
 	}
-	symlinkLatest(b.Out, filename, arch, "deb")
+	symlinkLatest(b.Out, "thundersnap-dev", filename, arch, "deb")
 	return []string{filename}, nil
 }
 
