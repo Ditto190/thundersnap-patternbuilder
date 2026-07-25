@@ -58,7 +58,37 @@ func Serve(conn io.Writer, reader io.Reader, cmd *exec.Cmd, wantPTY bool, postSt
 // servePTY starts cmd on a pty and bridges it to the TLV stream:
 // FrameStdin -> pty, FrameWinsize -> pty.Setsize, pty output -> FrameStdout.
 func servePTY(conn io.Writer, reader io.Reader, cmd *exec.Cmd, postStart func(pid int), logf Logf) {
-	ptmx, err := pty.Start(cmd)
+	// The client (the daemon's proxyVshdSessionGeneric) sends the initial
+	// FrameWinsize as the FIRST frame of a PTY session, before any stdin. Read
+	// it here and create the pty at that size with pty.StartWithSize, so the
+	// child sees the correct terminal size from its very first ioctl. Without
+	// this, pty.Start creates a 0x0 pty and a command that queries the size
+	// immediately (e.g. `stty size`) races the later pty.Setsize -- on a 0x0
+	// pty busybox stty errors ("stty: standard input: No such file or
+	// directory") rather than reporting 0x0, which intermittently broke the
+	// e2e winsize tests under load. If the first frame is stdin instead (a
+	// caller that did not send a winsize first) we buffer it and replay it
+	// after start; if the stream is already at EOF we just proceed.
+	var initSize *pty.Winsize
+	var leftoverStdin []byte
+	if t, p, err := vshdproto.ReadFrame(reader); err == nil {
+		switch t {
+		case vshdproto.FrameWinsize:
+			if ws, derr := vshdproto.DecodeWinsize(p); derr == nil {
+				initSize = &pty.Winsize{Rows: ws.Rows, Cols: ws.Cols, X: ws.X, Y: ws.Y}
+			}
+		case vshdproto.FrameStdin:
+			leftoverStdin = p
+		}
+	}
+	if initSize == nil {
+		// Fall back to the traditional 24x80 default so the pty is never 0x0
+		// (which makes some stty/tty operations error). A later FrameWinsize
+		// from the client resizes via the loop below.
+		initSize = &pty.Winsize{Rows: 24, Cols: 80}
+	}
+
+	ptmx, err := pty.StartWithSize(cmd, initSize)
 	if err != nil {
 		logf.logf("failed to start pty: %v", err)
 		vshdproto.WriteFrame(conn, vshdproto.FrameStderr, []byte("vshd: failed to start shell: "+err.Error()+"\n"))
@@ -69,7 +99,13 @@ func servePTY(conn io.Writer, reader io.Reader, cmd *exec.Cmd, postStart func(pi
 	if postStart != nil {
 		postStart(cmd.Process.Pid)
 	}
-	logf.logf("pty session started with PID %d", cmd.Process.Pid)
+	logf.logf("pty session started with PID %d (size %dx%d)", cmd.Process.Pid, initSize.Rows, initSize.Cols)
+
+	// Replay any stdin that arrived as the first frame (when the caller did
+	// not send a winsize first) before the goroutine drains the rest.
+	if len(leftoverStdin) > 0 {
+		ptmx.Write(leftoverStdin)
+	}
 
 	// Client -> child: decode TLV frames, route stdin to the pty and winsize to
 	// the pty size. Runs until the client closes (EOF) or sends a malformed frame.

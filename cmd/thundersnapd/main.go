@@ -2560,9 +2560,13 @@ func relinkSnapChildren(snapsDir, oldParent, newParent string) error {
 	return nil
 }
 
-// DeleteFrameRequest is the request body for /delete-frame
+// DeleteFrameRequest is the request body for /delete-frame. The CLI's
+// `ts frame --delete <uuid>` sends UUID; older/ref-based callers send
+// FrameName (a ref). Either is accepted: UUID addresses the frame directly,
+// FrameName is resolved through the user's ref store.
 type DeleteFrameRequest struct {
 	FrameName string `json:"frame_name"`
+	UUID      string `json:"uuid"`
 }
 
 // DeleteFrameResponse is the response from /delete-frame
@@ -2583,10 +2587,10 @@ func (c *controlServer) handleDeleteFrame(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	if req.FrameName == "" {
+	if req.UUID == "" && req.FrameName == "" {
 		writeJSON(w, http.StatusBadRequest, DeleteFrameResponse{
 			Status:  "error",
-			Message: "frame_name is required",
+			Message: "frame_name or uuid is required",
 		})
 		return
 	}
@@ -2604,25 +2608,52 @@ func (c *controlServer) handleDeleteFrame(w http.ResponseWriter, r *http.Request
 	refStore := userRefStore(user)
 	frameStore := userFrameStore(user)
 
-	// Resolve the frame name (a ref) to its UUID. Frames are addressed by ref
-	// in this API; there is no name-based fallback path on disk.
-	ref, err := refStore.Get(req.FrameName)
-	if err != nil {
-		if err == refs.ErrRefNotFound {
-			writeJSON(w, http.StatusNotFound, DeleteFrameResponse{
+	// Resolve the target frame to a UUID. `ts frame --delete <uuid>` addresses
+	// the frame directly; a FrameName is a ref resolved through the user's ref
+	// store. refName tracks which ref (if any) to drop after the frame is gone.
+	var frameID frameid.ID
+	var refName string
+	if req.UUID != "" {
+		id, err := frameid.Parse(req.UUID)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, DeleteFrameResponse{
 				Status:  "error",
-				Message: fmt.Sprintf("no such frame %q", req.FrameName),
+				Message: fmt.Sprintf("invalid uuid %q: %v", req.UUID, err),
 			})
 			return
 		}
-		writeJSON(w, http.StatusInternalServerError, DeleteFrameResponse{
-			Status:  "error",
-			Message: err.Error(),
-		})
-		return
+		frameID = id
+		// Best-effort: find a ref pointing at this UUID so its config can be
+		// cleaned up alongside the frame.
+		names, err := refStore.List()
+		if err == nil {
+			for _, n := range names {
+				if r, gerr := refStore.Get(n); gerr == nil && r.UUID == frameID {
+					refName = n
+					break
+				}
+			}
+		}
+	} else {
+		ref, err := refStore.Get(req.FrameName)
+		if err != nil {
+			if err == refs.ErrRefNotFound {
+				writeJSON(w, http.StatusNotFound, DeleteFrameResponse{
+					Status:  "error",
+					Message: fmt.Sprintf("no such frame %q", req.FrameName),
+				})
+				return
+			}
+			writeJSON(w, http.StatusInternalServerError, DeleteFrameResponse{
+				Status:  "error",
+				Message: err.Error(),
+			})
+			return
+		}
+		frameID = ref.UUID
+		refName = req.FrameName
 	}
-	uuid := ref.UUID
-	framePath := framePathForUserUUID(user, uuid)
+	framePath := framePathForUserUUID(user, frameID)
 
 	// Prevent deleting the current frame
 	if framePath == c.rootFS {
@@ -2665,15 +2696,18 @@ func (c *controlServer) handleDeleteFrame(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	// Delete the frame metadata sidecar via the store, then drop the ref.
-	if err := frameStore.Delete(uuid); err != nil && err != frames.ErrFrameNotFound {
-		log.Printf("Warning: delete frame metadata for %s: %v", uuid, err)
+	// Delete the frame metadata sidecar via the store, then drop any ref that
+	// pointed at it (best-effort: a UUID-based delete may have no ref).
+	if err := frameStore.Delete(frameID); err != nil && err != frames.ErrFrameNotFound {
+		log.Printf("Warning: delete frame metadata for %s: %v", frameID, err)
 	}
-	if err := refStore.Delete(req.FrameName); err != nil && err != refs.ErrRefNotFound {
-		log.Printf("Warning: delete ref %s: %v", req.FrameName, err)
+	if refName != "" {
+		if err := refStore.Delete(refName); err != nil && err != refs.ErrRefNotFound {
+			log.Printf("Warning: delete ref %s: %v", refName, err)
+		}
 	}
 
-	log.Printf("Deleted frame %s (ref %q, user %s)", framePath, req.FrameName, user)
+	log.Printf("Deleted frame %s (ref %q, user %s)", framePath, refName, user)
 
 	writeJSON(w, http.StatusOK, DeleteFrameResponse{
 		Status: "ok",

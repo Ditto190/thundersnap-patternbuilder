@@ -1,5 +1,24 @@
 # not-e2e-enough.md — Why the e2e suite catches so few bugs
 
+> **Progress (2026-07-25):** The migration this doc prescribes is largely
+> done. The C/D/E-bucket not_e2e tests for frames, snapshots, taints, docker,
+> integration, refid, uid/hardlink fidelity, errors, the container session
+> matrix, metrics, and the duplicate SSH tests have been ported onto a real
+> `startDaemon` + `sshExec`/`sshInteractive` harness in `e2e/`
+> (lifecycle_test.go, taint_test.go, fidelity_test.go, container_test.go,
+> errors_test.go, vm_test.go) or deleted as redundant with package tests. The
+> fake control server (`startTestControlServer` family) and the inline
+> mesh/streaming httptest fakes are deleted. The e2e suite caught one real
+> bug in the process (`ts frame --delete` sent `uuid` but the daemon read
+> `frame_name` — now fixed).
+>
+> **Remaining:** the deep VM tests (vm_test.go, vmx_test.go,
+> minimal_shell_test.go, vshd_devpts_test.go + helpers) still hand-spawn
+> cloud-hypervisor; they need a working /dev/kvm environment to port onto the
+> daemon-driven `vm/` SSH harness (W5). Mesh `ts who-has`/`ts download-snap`
+> between two real daemons (W6) needs a mesh peer-config seam in
+> `--test-listen` mode. See TODO.md for the tracked items.
+
 ## TL;DR
 
 The e2e suite is **not end-to-end at all.** Of ~43 test functions across 33 files:

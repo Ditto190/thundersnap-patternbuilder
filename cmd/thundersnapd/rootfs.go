@@ -216,9 +216,19 @@ func ensureFrameFS(rootFS string, meta *frames.Frame) error {
 		if err := btrfsCreateSubvol(idPath); err != nil {
 			return err
 		}
-		// Set permissions: 0700 (only root can access)
+		// Set permissions: 0700, owned by the thundersnap user. /id holds the
+		// frame's control socket (thunder.sock, chmod 0666 by startControlServer)
+		// and any frame-local secrets; the frame's default user (uid 7575) must
+		// be able to traverse /id to reach the socket so non-root `ts` subcommands
+		// (ts frame/snap/ref, ts go -c, autorun, ...) work. Root retains access
+		// (bypasses perms); other users are excluded. This matches /home and
+		// /work, which are also chowned to the thundersnap user when created
+		// fresh. Keep 0700 (not 0755) so only the owner can list /id contents.
 		if err := os.Chmod(idPath, 0700); err != nil {
 			log.Printf("Warning: failed to chmod /id subvolume: %v", err)
+		}
+		if err := os.Chown(idPath, tsm.ThundersnapUID, tsm.ThundersnapGID); err != nil {
+			log.Printf("Warning: failed to chown /id subvolume: %v", err)
 		}
 	}
 
@@ -349,9 +359,13 @@ func setupMinimalRootfs(rootFS string) error {
 		}
 	}
 
-	// Create minimal /etc/passwd
+	// Create minimal /etc/passwd. The "user" account's home is /home (the
+	// shared home subvolume ensureFrameFS always creates), NOT /home/user —
+	// /home/user is never created in a nil:nil:nil frame, so a passwd entry
+	// naming it makes `su - user` fail to chdir and breaks login-shell tests.
+	// This matches tsm.EnsureUserInPasswd, which also writes home=/home.
 	passwdContent := "root:x:0:0:root:/root:/bin/sh\n" +
-		fmt.Sprintf("user:x:%d:%d:user:/home/user:/bin/sh\n", tsm.ThundersnapUID, tsm.ThundersnapGID) +
+		fmt.Sprintf("user:x:%d:%d:user:/home:/bin/sh\n", tsm.ThundersnapUID, tsm.ThundersnapGID) +
 		"nobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin\n"
 	if err := os.WriteFile(filepath.Join(rootFS, "etc/passwd"), []byte(passwdContent), 0644); err != nil {
 		return fmt.Errorf("write /etc/passwd: %w", err)
@@ -394,7 +408,9 @@ func setupMinimalRootfs(rootFS string) error {
 // copyTsBinary copies the ts binary into the container's /bin using btrfs reflink (COW copy).
 // If the container has no /bin/sh, it also creates a symlink /bin/sh -> ts so that
 // SSH commands work (ssh invokes /bin/sh -c "command"). The ts binary has a minimal
-// shell mode that handles this case.
+// shell mode that handles this case. Likewise, if the container has no /bin/su, it
+// symlinks /bin/su -> ts so vshd can switch to a non-root user (`su - user`) without
+// needing a real su installed in the frame; ts has a minimal su mode for this.
 func copyTsBinary(rootFS string) error {
 	// Remove legacy /sbin/ts if present (we moved to /bin/ts for PATH sanity).
 	os.Remove(filepath.Join(rootFS, "sbin", "ts"))
@@ -411,6 +427,17 @@ func copyTsBinary(rootFS string) error {
 		if err := os.Symlink("ts", shPath); err != nil {
 			// Non-fatal: log but don't fail
 			log.Printf("Warning: failed to create /bin/sh symlink: %v", err)
+		}
+	}
+
+	// If there's no su, symlink /bin/su -> ts so vshd can drop to a non-root
+	// user in a minimal frame. ts has a minimal su mode that activates when
+	// invoked as "su". A frame that ships a real su (e.g. an Ubuntu rootfs
+	// snap) keeps it; the symlink is only created when /bin/su is absent.
+	suPath := filepath.Join(rootFS, "bin", "su")
+	if _, err := os.Lstat(suPath); os.IsNotExist(err) {
+		if err := os.Symlink("ts", suPath); err != nil {
+			log.Printf("Warning: failed to create /bin/su symlink: %v", err)
 		}
 	}
 

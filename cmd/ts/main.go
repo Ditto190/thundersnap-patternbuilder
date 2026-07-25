@@ -71,10 +71,27 @@ func isShellInvocation(base string) bool {
 	return base == "sh" || base == "-sh"
 }
 
+// isSuInvocation reports whether argv0's basename indicates ts is being run as
+// the container 'su' (user-switcher). thundersnapd symlinks /bin/su -> /bin/ts
+// for containers that lack a real su, so vshd's `su - user` works in a
+// nil:nil:nil frame with no userspace tools installed. A login su is exec'd
+// with a leading dash ("-su"), which we also recognize.
+func isSuInvocation(base string) bool {
+	return base == "su" || base == "-su"
+}
+
 func main() {
+	base := filepath.Base(os.Args[0])
 	// Check if we're being invoked as a shell (argv[0] is "sh" or "-sh").
-	if isShellInvocation(filepath.Base(os.Args[0])) {
+	if isShellInvocation(base) {
 		runAsShell()
+		return
+	}
+	// Check if we're being invoked as su (argv[0] is "su" or "-su"). This lets
+	// vshd switch to a non-root user in a minimal container that has no real su
+	// binary, mirroring the /bin/sh -> ts symlink trick.
+	if isSuInvocation(base) {
+		runAsSu(os.Args[1:])
 		return
 	}
 
@@ -142,6 +159,11 @@ func main() {
 	case "container-init":
 		// Hidden command - starts a minimal init process for container namespaces
 		cmdContainerInit(cmdArgs)
+	case "su":
+		// Switch user (drop privileges and exec a login shell or -c command).
+		// Also reachable via the /bin/su -> ts symlink; this subcommand form is
+		// for direct invocation/testing.
+		runAsSu(cmdArgs)
 	case "session-serve":
 		// Hidden command - in-container vshd session endpoint. Runs after chroot
 		// so the pty it opens lands in the container's devpts; speaks vshdproto

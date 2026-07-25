@@ -1,9 +1,7 @@
 // Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
-//go:build e2e
-
-package e2e
+package metrics
 
 import (
 	"fmt"
@@ -11,75 +9,74 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strconv"
 	"testing"
 
 	"github.com/tailscale/thundersnap/frameid"
-	"github.com/tailscale/thundersnap/metrics"
 	"github.com/tailscale/thundersnap/refs"
 	"github.com/tailscale/thundersnap/tsm"
 )
 
 // TestMetricsExport is the regression test for "export prometheus metrics on
-// :7575". It exercises the real production metrics package (metrics.NewHandler,
-// the same handler the daemon serves at /metrics) against a real on-disk fs/snaps
-// layout and a real refs.Store, then scrapes the handler over HTTP and asserts:
+// :7575". It exercises the real production metrics handler (NewHandler, the
+// same handler the daemon serves at /metrics) against a real on-disk fs/snaps
+// layout and a real refs.Store, scrapes the handler over HTTP, and asserts:
+//   - the standard OS-level collectors are present (go_goroutines, process_*
+//     metrics), and
+//   - the thundersnap gauges reflect the real counts of frames, snaps, refs,
+//     and the supplied running-session / running-VM closures.
 //
-//   - the standard OS-level collectors are present (go_goroutines, a process_*
-//     metric), matching aperture's Go+process collector export, and
-//   - the thundersnap gauges reflect the real counts of frames, snaps, refs, and
-//     the supplied running-session / running-VM closures.
+// This is a port of the former not_e2e/metrics_test.go TestMetricsExport,
+// adapted to use t.TempDir + the tsm indexer instead of btrfs subvolumes so
+// it runs as a plain package test (no root/btrfs required).
 func TestMetricsExport(t *testing.T) {
-	env := newTestEnv(t)
+	fsDir := t.TempDir()
+	snapsDir := t.TempDir()
 
-	baseSnap := env.createBaseSnapshot()
-	t.Logf("base snapshot: %s", baseSnap)
-
-	// Two snaps: index two read-only subvolumes into <snapsDir>/<id>.tsm. The
-	// metrics collector counts snaps by their .tsm manifest files.
+	// Two snaps: index two source trees into <snapsDir>/<id>. The metrics
+	// collector counts snaps by their .tsm manifest files.
 	for _, id := range []string{"aaa111", "bbb222"} {
-		src := filepath.Join(env.snapshotsDir, "src-"+id)
-		if out, err := exec.Command("btrfs", "subvolume", "snapshot", "-r",
-			filepath.Join(env.snapshotsDir, baseSnap), src).CombinedOutput(); err != nil {
-			t.Fatalf("btrfs snapshot %s: %v\n%s", id, err, out)
+		src := t.TempDir()
+		if err := os.WriteFile(filepath.Join(src, "f.txt"), []byte("x"), 0644); err != nil {
+			t.Fatalf("write source file: %v", err)
 		}
-		defer exec.Command("btrfs", "subvolume", "delete", src).Run()
 		idx := tsm.NewIndexer(tsm.IndexerOptions{})
-		if err := idx.Index(src, filepath.Join(env.snapshotsDir, id)); err != nil {
+		if err := idx.Index(src, filepath.Join(snapsDir, id)); err != nil {
 			t.Fatalf("index snap %s: %v", id, err)
 		}
 	}
 	wantSnaps := 2
 
 	// Three frames under fs/<user>/<uuid>/ each marked by a <uuid>.jsonc file,
-	// the canonical layout the daemon's frame listing (and the metrics
-	// collector) counts. The sidecar stem must be a valid frame UUID.
+	// the canonical layout the metrics collector counts. The sidecar stem must
+	// be a valid frame UUID.
 	wantFrames := 3
 	for i := 0; i < wantFrames; i++ {
-		user := "testuser"
 		name := frameid.MustNew().String()
-		framePath := filepath.Join(env.fsDir, user, name)
+		framePath := filepath.Join(fsDir, "testuser", name)
 		if err := os.MkdirAll(framePath, 0755); err != nil {
 			t.Fatalf("mkdir frame: %v", err)
 		}
-		mustWriteFile(t, framePath+".jsonc", "{}\n")
+		if err := os.WriteFile(framePath+".jsonc", []byte("{}\n"), 0644); err != nil {
+			t.Fatalf("write sidecar: %v", err)
+		}
 	}
 	// A legacy-layout sidecar whose stem is NOT a UUID must NOT be counted.
-	if err := os.MkdirAll(filepath.Join(env.fsDir, "testuser", "legacy"), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Join(fsDir, "testuser", "legacy"), 0755); err != nil {
 		t.Fatalf("mkdir legacy: %v", err)
 	}
-	mustWriteFile(t, filepath.Join(env.fsDir, "testuser", "legacy.jsonc"), "{}\n")
+	if err := os.WriteFile(filepath.Join(fsDir, "testuser", "legacy.jsonc"), []byte("{}\n"), 0644); err != nil {
+		t.Fatalf("write legacy sidecar: %v", err)
+	}
 	// A bare directory with no .jsonc must NOT be counted as a frame.
-	if err := os.MkdirAll(filepath.Join(env.fsDir, "testuser", "notaframe"), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Join(fsDir, "testuser", "notaframe"), 0755); err != nil {
 		t.Fatalf("mkdir notaframe: %v", err)
 	}
 
-	// Two refs in a real per-user ref store, counted via the Refs closure the
-	// daemon supplies (summing each user's List()).
-	dataDir := filepath.Join(env.root, "state")
+	// Two refs in a real per-user ref store, counted via the Refs closure.
+	dataDir := t.TempDir()
 	store := refs.NewUserStore(dataDir, "testuser")
 	wantRefs := 2
 	for i := 0; i < wantRefs; i++ {
@@ -88,20 +85,18 @@ func TestMetricsExport(t *testing.T) {
 		}
 	}
 
-	// Supply running session / VM counts via closures, as the daemon does from
-	// its in-memory state.
 	wantSessions := 4
 	wantVMs := 1
 
-	handler, err := metrics.NewHandler(metrics.Sources{
-		FsDir:           env.fsDir,
-		SnapsDir:        env.snapshotsDir,
+	handler, err := NewHandler(Sources{
+		FsDir:           fsDir,
+		SnapsDir:        snapsDir,
 		Refs:            func() int { names, _ := store.List(); return len(names) },
 		RunningSessions: func() int { return wantSessions },
 		RunningVMs:      func() int { return wantVMs },
 	})
 	if err != nil {
-		t.Fatalf("metrics.NewHandler: %v", err)
+		t.Fatalf("NewHandler: %v", err)
 	}
 
 	srv := httptest.NewServer(handler)
@@ -122,14 +117,12 @@ func TestMetricsExport(t *testing.T) {
 	out := string(body)
 	t.Logf("/metrics output:\n%s", out)
 
-	// OS-level metrics from the standard Go + process collectors.
 	for _, name := range []string{"go_goroutines", "process_open_fds", "process_start_time_seconds"} {
 		if !regexp.MustCompile(`(?m)^` + regexp.QuoteMeta(name) + `\b`).MatchString(out) {
 			t.Errorf("missing OS-level metric %q in /metrics output", name)
 		}
 	}
 
-	// thundersnap-specific gauges with their expected values.
 	checks := []struct {
 		metric string
 		want   int

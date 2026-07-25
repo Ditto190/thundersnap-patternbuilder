@@ -23,28 +23,51 @@ deliberately deferred. Cross them off as they land.
 - [ ] **Mesh `download-snap` between two daemons has no real-e2e test.** The
       deleted `TestE2EDownloadSnap` was the only two-daemon download test; the
       current suite covers it only at the unit level (`tsm/download_test.go`
-      with httptest peers) and via `not_e2e/mesh_test.go` fakes. `tsm/download.go`
-      + the new ChunkIndex dedup changed substantially. Add the W6 workflow from
+      with httptest peers). The `not_e2e/mesh_test.go` and `streaming_test.go`
+      fakes were deleted (they reimplemented the protocol and tested the test's
+      own copy, not the real handlers — false green). `tsm/download.go` + the
+      ChunkIndex dedup changed substantially. Add the W6 workflow from
       `not_e2e/not-e2e-enough.md`: start daemons A+B, snap on A via SSH,
       download-snap on B through the production handler/CLI, fork a frame from
-      the downloaded snap, verify content over SSH. (Both reviews, HIGH/MEDIUM.)
-- [ ] **`/home` and `/work` ownership not asserted by any real-e2e test.** The
-      deleted `TestE2EFrameHomeWorkOwnership` checked uid/gid 1000 and
-      subvolume-ness; the uid since moved to `tsm.ThundersnapUID` (7575), also
-      unverified. Add an ownership check over SSH: `stat -c %u:%g /home` and
-      `/work` after `ts frame`, assert `ThundersnapUID:ThundersnapGID`.
-      (Both reviews, MEDIUM.)
-- [ ] **Session PTY visibility in container not asserted.** The deleted
-      `TestE2EPtyVisibleInContainer` verified the session's PTY slave appears in
-      the container's `/dev/pts`; current tests only check `/dev/pts` exists.
-      Add an `sshInteractive` test that runs `tty` and asserts the path exists
-      (`test -c $(tty)`). (deepseek-v4-pro review, MEDIUM.)
+      the downloaded snap, verify content over SSH. This needs a mesh
+      peer-config seam in `--test-listen` mode (the test-mode daemon has no
+      tsnet peers) — a small product change. (Both reviews, HIGH/MEDIUM.)
+- [ ] **`/home` and `/work` ownership not asserted by any real-e2e test.**
+      `e2e/fidelity_test.go` now asserts a chown'd file's uid/gid survive a
+      snap+fork, but does not assert the daemon-created `/home` and `/work`
+      subvolumes are owned by `tsm.ThundersnapUID` (7575). Add a `stat -c
+      %u:%g /home` and `/work` check after `ts frame`. (Both reviews, MEDIUM.)
+- [x] **Session PTY visibility in container not asserted.** Covered by
+      `e2e/container_test.go` `TestContainerConcurrentDistinctPTS`, which opens
+      two concurrent PTY SSH sessions, runs `tty` in each, and asserts they get
+      distinct `/dev/pts<N>` devices. (deepseek-v4-pro review, MEDIUM.)
 - [ ] **`TestForkUndoRollsBackToForkPoint` reproduces `ts undo`'s effect by
       parsing `ts log` instead of driving `ts undo -c`.** `TestTsUndo` shows the
       `-c` infrastructure works; this test could run
       `ts undo -c 'read line < /marker && echo $line'` on the forked frame and
       assert the marker is `v2` — a stronger test of the actual fork-point fix.
       (deepseek-v4-pro review, LOW.)
+
+## not_e2e teardown (remaining)
+
+The not_e2e suite has been largely emptied into the real e2e harness (see
+`not_e2e/not-e2e-enough.md` for the plan). The remaining not_e2e files are all
+VM tests that hand-spawn cloud-hypervisor and need a working KVM environment
+to port onto the daemon-driven `vm/` SSH harness:
+
+- [ ] **Port the deep VM tests to e2e.** `vm_test.go` (launch, networking,
+      virtiofs, vshd comm, concurrent sessions, graceful shutdown, panic
+      recovery, insufficient memory, user switching, process isolation),
+      `vmx_test.go` (basic/concurrent/container-isolation/outer-shell/shared-
+      VM), `minimal_shell_test.go` (shell features), `vshd_devpts_test.go`
+      (devpts), and the VM helpers in `e2e_test.go`/`vshd_proto_test.go`. The
+      daemon-driven VM SSH path is already covered by `e2e/vm_test.go`
+      (TestVMSSHSessionMatrix, TestVMXPtyWinsize) and `TestVMNamespaceSetup`;
+      the deep tests should go through `vm/` sessions against a real
+      `thundersnapd` instead of hand-spawning cloud-hypervisor. Per
+      not-e2e-enough.md W5, keep panic-recovery / insufficient-memory as
+      targeted negatives that still go through the daemon. Requires a host
+      with /dev/kvm passthrough to write and verify.
 
 ## SFTP / scp
 

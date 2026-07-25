@@ -371,60 +371,6 @@ func (c *httpClient) post(path string, body interface{}) (map[string]interface{}
 	return result, nil
 }
 
-// TestE2EBasicSnapshot tests creating a base snapshot and snapping it.
-func TestE2EBasicSnapshot(t *testing.T) {
-	env := newTestEnv(t)
-
-	// Create a base snapshot
-	baseSnap := env.createBaseSnapshot()
-	t.Logf("Created base snapshot: %s", baseSnap)
-
-	// Verify the snapshot exists
-	snapPath := filepath.Join(env.snapshotsDir, baseSnap)
-	if _, err := os.Stat(snapPath); err != nil {
-		t.Fatalf("snapshot not found: %v", err)
-	}
-
-	// Verify it has expected structure
-	for _, path := range []string{"etc/passwd", "etc/group", "bin/ts"} {
-		full := filepath.Join(snapPath, path)
-		if _, err := os.Stat(full); err != nil {
-			t.Errorf("expected file %s not found: %v", path, err)
-		}
-	}
-}
-
-// TestE2EOwnership verifies file ownership is preserved correctly.
-func TestE2EOwnership(t *testing.T) {
-	env := newTestEnv(t)
-
-	baseSnap := env.createBaseSnapshot()
-	snapPath := filepath.Join(env.snapshotsDir, baseSnap)
-
-	// Check ownership of home/user
-	homePath := filepath.Join(snapPath, "home/user")
-	info, err := os.Stat(homePath)
-	if err != nil {
-		t.Fatalf("stat home/user: %v", err)
-	}
-	stat := info.Sys().(*syscall.Stat_t)
-	if stat.Uid != 1000 || stat.Gid != 1000 {
-		t.Errorf("home/user ownership: got %d:%d, want 1000:1000", stat.Uid, stat.Gid)
-	}
-
-	// Check ownership of .profile
-	profilePath := filepath.Join(snapPath, "home/user/.profile")
-	info, err = os.Stat(profilePath)
-	if err != nil {
-		t.Fatalf("stat .profile: %v", err)
-	}
-	stat = info.Sys().(*syscall.Stat_t)
-	if stat.Uid != 1000 || stat.Gid != 1000 {
-		t.Errorf(".profile ownership: got %d:%d, want 1000:1000", stat.Uid, stat.Gid)
-	}
-}
-
-// devCheckResult holds parsed output from "ts check-dev".
 type devCheckResult struct {
 	devicePerms map[string]string // device name -> octal perms
 	linkTargets map[string]string // symlink name -> target
@@ -1172,4 +1118,85 @@ func tryVsockConnect(vsockSock string, port int) error {
 	}
 
 	return nil
+}
+
+// isolationCheckResult holds parsed output from "ts check-isolation". Kept as
+// a shared helper for the remaining not_e2e nested_test.go until it is ported
+// to the real e2e harness.
+type isolationCheckResult struct {
+	hostname         string
+	domainname       string
+	isPID1           bool
+	pid              string
+	procMounted      bool
+	sysMounted       bool
+	capabilities     map[string]string // cap name -> "has" or "dropped"
+	namespaces       map[string]string // ns name -> inode
+	mountPropagation string            // "private", "shared", "slave", "unbindable"
+}
+
+// parseIsolationOutput parses the output of "ts check-isolation".
+func parseIsolationOutput(output string) isolationCheckResult {
+	result := isolationCheckResult{
+		capabilities: make(map[string]string),
+		namespaces:   make(map[string]string),
+	}
+
+	for _, line := range strings.Split(output, "\n") {
+		parts := strings.SplitN(line, ":", 3)
+		if len(parts) < 2 {
+			continue
+		}
+		switch parts[0] {
+		case "HOSTNAME":
+			result.hostname = parts[1]
+		case "DOMAINNAME":
+			result.domainname = parts[1]
+		case "PID1":
+			if parts[1] == "yes" {
+				result.isPID1 = true
+				result.pid = "1"
+			} else if len(parts) >= 3 {
+				result.pid = parts[2]
+			}
+		case "PROC":
+			result.procMounted = parts[1] == "mounted"
+		case "SYS":
+			result.sysMounted = parts[1] == "mounted"
+		case "CAP":
+			if len(parts) >= 3 {
+				result.capabilities[parts[1]] = parts[2]
+			}
+		case "NS":
+			if len(parts) >= 3 {
+				result.namespaces[parts[1]] = parts[2]
+			}
+		case "MOUNT_PROPAGATION":
+			result.mountPropagation = parts[1]
+		}
+	}
+
+	return result
+}
+
+// installBusyboxShell installs a real busybox /bin/sh into a frame rootfs
+// (used by the remaining not_e2e VM tests). The e2e harness installs applets
+// over SFTP instead; this direct-rootfs variant is kept only until the VM
+// tests are ported.
+func installBusyboxShell(t *testing.T, absFramePath string) {
+	t.Helper()
+	busybox, err := exec.LookPath("busybox")
+	if err != nil {
+		t.Fatalf("busybox required: %v", err)
+	}
+	shDst := filepath.Join(absFramePath, "bin/sh")
+	if err := os.Remove(shDst); err != nil && !os.IsNotExist(err) {
+		t.Fatalf("remove sh: %v", err)
+	}
+	if err := copyFile(busybox, shDst); err != nil {
+		t.Fatalf("copy busybox sh: %v", err)
+	}
+	if err := os.Chmod(shDst, 0755); err != nil {
+		t.Fatalf("chmod sh: %v", err)
+	}
 }

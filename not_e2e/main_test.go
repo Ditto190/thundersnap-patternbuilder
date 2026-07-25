@@ -45,33 +45,25 @@ func TestMain(m *testing.M) {
 		run  string
 	}{
 		// Tier 0: pure in-process package checks (no btrfs, no daemon).
-		// NOTE: tiers should be mutually exclusive so no test runs twice. A few
-		// trivial in-process tests (e.g. TestFramePath) are matched by both the
-		// unit tier and a later broad tier; they are idempotent and sub-
-		// millisecond, so the harmless double-run is accepted rather than
-		// complicating the patterns with RE2-unfriendly exclusions.
-		{"unit", `^Test(RefsPackage|FramesPackage|SnaphashEncoding|FrameidGeneration|RefNameValidation|FramePath|FixtureCreatesAllFileTypes|DefaultTestContainerSpecCompleteness)$`},
+		// The bulk of the unit-level refs/frames/snaphash/frameid coverage now
+		// lives in those packages' own _test.go files (run by `make test`); the
+		// only remaining in-process checks here exercise the not_e2e test
+		// fixture generator itself.
+		{"unit", `^Test(FixtureCreatesAllFileTypes|DefaultTestContainerSpecCompleteness)$`},
 
-		// Tier 1: TSM/TSC on-disk format fundamentals.
-		{"format", `^Test(TSM|TSC).*$`},
+		// Tier 1: snapshot file-type handling (uid/hardlink/setuid/setgid fidelity
+		// now covered by the real e2e fidelity_test.go; the in-process tsm/
+		// snap-incremental/subdir/progress checks are covered by the tsm
+		// package's own _test.go and the e2e snap tests).
+		{"snapshot", `^Test(E2EBasicSnapshot|E2EOwnership|E2EDevSetup|ConcurrentModificationDuringSnapshot|Symlink).*$`},
 
-		// Tier 2: basic snapshot create/list/dedup/delete + file-type handling.
-		{"snapshot", `^Test(E2EBasicSnapshot|E2EOwnership|E2EDevSetup|Snapshot|NestedSnapshotTree|LargeDirectoryTree|ConcurrentModificationDuringSnapshot|DeleteSnapshotWithReference|Hardlink|Symlink|Setuid|Setgid).*$`},
-
-		// Tier 3: error handling and refs.
-		{"refs-errors", `^Test(Error|Ref|CorruptedSnapshotMetadata).*$`},
-
-		// Tier 4: container isolation primitives.
-		{"container", `^Test(BlankContainer|Container|NestedThundersnap|Cgroup|TsNsenter|Vshd).*$`},
-
-		// Tier 5: frames, taints, integration, mesh, streaming, uid, docker.
-		{"frames", `^Test(Frame|MultipleTaintsOnFrame|Taint|Integration|Workflow|CrossFrame|Mesh|Metrics|Streaming|NDJSON|HTTPRange|Vsock|UID|Id|Docker|MultipleConcurrentSessions|LongRunningProgressUpdates|QueryFrameTaints|DeleteRunningFrame).*$`},
-
-		// Tier 6: SSH/shell scenarios.
-		{"shell", `^Test(SSH|MinimalShell).*$`},
-
-		// Tier 7: VM/VMX tests (slowest: boot cloud-hypervisor).
-		{"vm", `^Test(VM|E2EVMPanicRecovery).*$`},
+		// Tier 2: VM/VMX tests (slowest: boot cloud-hypervisor). The container
+		// SSH tests now live in the real e2e/ssh_test.go and the VM SSH session
+		// matrix in e2e/vm_test.go; the remaining tests here hand-spawn VMs.
+		// (mesh/streaming fake-control-server tests were deleted as false-green
+		// C-bucket fakes; the real /who-has and /download-snap handlers still
+		// need a mesh peer-config seam for real e2e coverage.)
+		{"vm", `^Test(VM|E2EVMPanicRecovery|Vshd|MinimalShell).*$`},
 	}
 
 	for _, tier := range tiers {

@@ -296,6 +296,54 @@ func sshInteractive(t *testing.T, d *daemonInstance, user string) (*ssh.Client, 
 	return client, session, nil
 }
 
+// sshPtyRun connects to the daemon, requests a 40x80 PTY, and runs cmd
+// non-interactively (session.Run, not session.Shell), returning the combined
+// stdout+stderr output and exit status. Unlike sshInteractive (which starts an
+// interactive login shell that prints prompts and echoes typed input), this
+// runs the command as argv with no shell loop, so the captured stream is
+// exactly the command's own pty output -- no prompt, no echo, no greeting.
+// That makes exact-match assertions deterministic and lets a test detect any
+// relay reordering, corruption, or extra/missing bytes.
+//
+// In PTY mode the daemon/vshd wire the child's stdout AND stderr both to the
+// pty slave (creack/pty), so the whole stream arrives as FrameStdout on the
+// client; capturing stdout+stderr together is therefore the union of both,
+// in kernel write order. See TestContainerPtyWriteOrder for why that matters.
+func sshPtyRun(t *testing.T, d *daemonInstance, user, cmd string) (string, int, error) {
+	t.Helper()
+	config := sshConfig(user)
+	client, err := ssh.Dial("tcp", d.addr, config)
+	if err != nil {
+		return "", -1, fmt.Errorf("dial: %w", err)
+	}
+	defer client.Close()
+	session, err := client.NewSession()
+	if err != nil {
+		return "", -1, fmt.Errorf("new session: %w", err)
+	}
+	defer session.Close()
+	modes := ssh.TerminalModes{
+		ssh.ECHO:          1,
+		ssh.TTY_OP_ISPEED: 14400,
+		ssh.TTY_OP_OSPEED: 14400,
+	}
+	if err := session.RequestPty("xterm", 40, 80, modes); err != nil {
+		return "", -1, fmt.Errorf("request pty: %w", err)
+	}
+	var outBuf safeBuffer
+	session.Stdout = &outBuf
+	session.Stderr = &outBuf
+	exitCode := 0
+	if err := session.Run(cmd); err != nil {
+		if exitErr, ok := err.(*ssh.ExitError); ok {
+			exitCode = exitErr.ExitStatus()
+		} else {
+			return outBuf.String(), -1, fmt.Errorf("run command: %w", err)
+		}
+	}
+	return outBuf.String(), exitCode, nil
+}
+
 // createFrameViaDaemon creates a frame by running `ts frame` over SSH to the daemon.
 // This is the proper e2e way to create frames - through the daemon, not by manipulating
 // data structures directly. Returns the frame UUID.
@@ -788,20 +836,16 @@ func TestSSHContainerUserRoot(t *testing.T) {
 // TestSSHContainerUserNonRoot tests SSH as a non-root user to a container frame.
 // Identity is probed by side effect: a non-root user cannot create a file
 // directly under / (which is owned by root, mode 0755), so the write must fail.
-//
-// NOTE: This test requires busybox for su (vshd needs su to switch users).
-// Until su is added to libexec and auto-copied to frames by the daemon,
-// this test must install it directly.
+// vshd switches to the "user" account via `su - user`; a nil:nil:nil frame
+// has no real su, so the daemon symlinks /bin/su -> ts, whose built-in su
+// mode (runAsSu) does the setuid. This test therefore also exercises the
+// native ts su path end to end.
 func TestSSHContainerUserNonRoot(t *testing.T) {
 	env := newTestEnv(t)
 	d := startDaemon(t, env)
 
 	// Create frame via daemon (true e2e - no manual data structure manipulation)
 	createFrameViaDaemon(t, d, "userframe")
-
-	// Install busybox as su (required for vshd to switch to non-root users).
-	// TODO: Once su is in libexec and auto-copied to frames, remove this.
-	installBusyboxAppletInFrame(t, d, "userframe", "su")
 
 	// SSH as user@frame (runs as the unprivileged "user" account) and try to
 	// create a file in /. This must FAIL: a non-root user cannot write to /.
@@ -818,35 +862,31 @@ func TestSSHContainerUserNonRoot(t *testing.T) {
 	t.Logf("Output: %s (exit %d)", output, exitCode)
 }
 
-// TestSSHContainerWorkingDir tests that SSH sessions start in the correct working directory.
-//
-// NOTE: This test requires busybox for su (vshd needs su to switch users).
-// Until su is added to libexec and auto-copied to frames by the daemon,
-// this test must install it directly.
+// TestSSHContainerWorkingDir tests that a non-root SSH session starts in the
+// user's home directory. The "user" account's home is /home (the shared home
+// subvolume), so pwd must be exactly /home. vshd reaches it via `su - user`,
+// which the daemon's /bin/su -> ts symlink serves with ts's built-in su mode.
 func TestSSHContainerWorkingDir(t *testing.T) {
 	env := newTestEnv(t)
 	d := startDaemon(t, env)
 
-	// Create frame via daemon (true e2e - no manual data structure manipulation)
 	createFrameViaDaemon(t, d, "cwdframe")
 
-	// Install busybox as su (required for vshd to switch to non-root users).
-	// TODO: Once su is in libexec and auto-copied to frames, remove this.
-	installBusyboxAppletInFrame(t, d, "cwdframe", "su")
-
-	// SSH as user@frame and check pwd
 	output, exitCode, err := sshExec(t, d, "user@cwdframe", "pwd")
 	if err != nil {
 		t.Fatalf("sshExec failed: %v", err)
 	}
 	if exitCode != 0 {
-		t.Errorf("Expected exit code 0, got %d", exitCode)
+		t.Fatalf("pwd exited %d (expected 0); output: %q", exitCode, output)
 	}
-	// Should start in user's home directory
-	if !strings.Contains(output, "/home/user") {
-		t.Errorf("Expected pwd to be /home/user, got: %q", output)
+	// Trim the CR that the PTY line discipline appends and any trailing
+	// whitespace; pwd prints a single line. The login shell must start in /home.
+	pwd := strings.TrimSpace(strings.ReplaceAll(output, "\r", ""))
+	if pwd != "/home" {
+		t.Errorf("Expected pwd to be /home, got: %q (raw output: %q)", pwd, output)
+	} else {
+		t.Logf("pwd OK: %q", pwd)
 	}
-	t.Logf("Output: %s", output)
 }
 
 // TestSSHContainerStdoutStderrSeparate verifies that the daemon keeps a
@@ -857,19 +897,13 @@ func TestSSHContainerWorkingDir(t *testing.T) {
 // (incorrectly) folds stderr into stdout, the stderr marker leaks into the
 // stdout buffer and this test fails.
 //
-// NOTE: This test requires busybox for su (vshd needs su to switch users).
-// Until su is added to libexec and auto-copied to frames by the daemon,
-// this test must install it directly.
+// Runs as user@ (non-root), exercising the native ts su path.
 func TestSSHContainerStdoutStderrSeparate(t *testing.T) {
 	env := newTestEnv(t)
 	d := startDaemon(t, env)
 
 	// Create frame via daemon (true e2e - no manual data structure manipulation)
 	createFrameViaDaemon(t, d, "streamframe")
-
-	// Install busybox as su (required for vshd to switch to non-root users).
-	// TODO: Once su is in libexec and auto-copied to frames, remove this.
-	installBusyboxAppletInFrame(t, d, "streamframe", "su")
 
 	// Emit OUTMARK on stdout and ERRMARK on stderr (fd 2).
 	stdout, stderr, exitCode, err := sshExecSplit(t, d, "user@streamframe",

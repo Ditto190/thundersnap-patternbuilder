@@ -274,26 +274,8 @@ func dropCapsAndExec(cmdArgs []string, keepDevCaps, usePty bool) {
 
 	executable, err := findExecutable(cmdArgs[0])
 	if err != nil {
-		if cmdArgs[0] == "su" {
-			if sh, shErr := findExecutable("/bin/sh"); shErr == nil {
-				if len(cmdArgs) >= 3 && cmdArgs[1] == "-" && cmdArgs[2] == "root" {
-					executable = sh
-					cmdArgs = []string{"/bin/sh", "-l"}
-				} else if len(cmdArgs) >= 4 && cmdArgs[1] == "root" && cmdArgs[2] == "-c" {
-					executable = sh
-					cmdArgs = append([]string{"/bin/sh", "-c"}, cmdArgs[3:]...)
-				} else {
-					fmt.Fprintf(os.Stderr, "error: %v\n", err)
-					os.Exit(1)
-				}
-			} else {
-				fmt.Fprintf(os.Stderr, "error: %v\n", err)
-				os.Exit(1)
-			}
-		} else {
-			fmt.Fprintf(os.Stderr, "error: %v\n", err)
-			os.Exit(1)
-		}
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
 	}
 
 	if usePty {
