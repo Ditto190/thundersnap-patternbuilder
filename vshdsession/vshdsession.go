@@ -26,6 +26,7 @@ import (
 	"os/exec"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/creack/pty"
 	"github.com/tailscale/thundersnap/vshdproto"
@@ -154,11 +155,21 @@ func servePipe(conn io.Writer, reader io.Reader, cmd *exec.Cmd, postStart func(p
 	// Client -> child stdin: decode FrameStdin frames. Other frame types (e.g.
 	// stray winsize) are ignored in pipe mode. Close stdin on EOF or when
 	// we receive an empty FrameStdin (the daemon's EOF marker).
+	//
+	// If the reader returns an error (the client disconnected / the conn
+	// closed) we also signal the child to exit: a non-stdin-reading command
+	// (e.g. `while true; do :; done`, as used by autorun) would otherwise
+	// keep running forever, orphaned after its peer is gone. This mirrors the
+	// SIGHUP servePTY sends when the pty output stream ends, and is the
+	// standard "remote command dies on SSH disconnect" behaviour. An empty
+	// FrameStdin is a normal stdin EOF (the daemon sends it as soon as its
+	// own stdin ends for an exec session) and must NOT kill the child.
 	go func() {
 		defer stdin.Close()
 		for {
 			typ, payload, err := vshdproto.ReadFrame(reader)
 			if err != nil {
+				killChildOnDisconnect(cmd, logf)
 				return
 			}
 			if typ == vshdproto.FrameStdin {
@@ -176,6 +187,35 @@ func servePipe(conn io.Writer, reader io.Reader, cmd *exec.Cmd, postStart func(p
 	code := waitExitCode(cmd)
 	vshdproto.WriteFrame(conn, vshdproto.FrameExit, vshdproto.EncodeExit(code))
 	logf.logf("command exited (code %d)", code)
+}
+
+// killChildOnDisconnect signals cmd to exit because the client disconnected.
+// It sends SIGHUP (the signal a terminal sends on hangup, matching servePTY),
+// then escalates to SIGKILL after a 2s grace in case the child ignores or traps
+// SIGHUP. Signalling an already-exited child is harmless (the kernel returns
+// ESRCH, which we ignore). It runs the escalation in its own goroutine so the
+// caller (the stdin reader loop) can return immediately; the main servePipe
+// goroutine unblocks on cmd.Wait() once the child exits.
+func killChildOnDisconnect(cmd *exec.Cmd, logf Logf) {
+	if cmd.Process == nil {
+		return
+	}
+	go func() {
+		if err := cmd.Process.Signal(syscall.SIGHUP); err != nil {
+			return // child already exited
+		}
+		logf.logf("client disconnected; sent SIGHUP to child PID %d", cmd.Process.Pid)
+		timer := time.NewTimer(2 * time.Second)
+		defer timer.Stop()
+		<-timer.C
+		// Still running? Force kill. ProcessState is set once Wait reaps the
+		// child; checking it races favorably enough here (worst case we SIGKILL
+		// a just-exited process, which is a harmless no-op).
+		if cmd.ProcessState == nil {
+			_ = cmd.Process.Signal(syscall.SIGKILL)
+			logf.logf("child PID %d did not exit on SIGHUP; sent SIGKILL", cmd.Process.Pid)
+		}
+	}()
 }
 
 // waitExitCode waits for cmd and returns its exit code (0 on success, 128+signal

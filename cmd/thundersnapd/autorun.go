@@ -8,15 +8,16 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net"
 	"os"
-	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/tailscale/thundersnap/frameid"
 	"github.com/tailscale/thundersnap/refs"
+	"github.com/tailscale/thundersnap/vshdproto"
 )
 
 // autorunManager manages autorun processes for refs. It ensures that refs with
@@ -38,12 +39,18 @@ type autorunKey struct {
 }
 
 // autorunProcess tracks a running autorun process.
+//
+// The process runs inside a vshd container session (the same path SSH container
+// sessions take), so it is tracked by the vshd session connection rather than a
+// host exec.Cmd. Closing conn tears the session down and SIGHUPs the child (see
+// vshdsession.servePipe), so stop() closes conn rather than signalling a PID.
 type autorunProcess struct {
 	key       autorunKey
 	frameUUID frameid.ID
 	argv      []string
-	cmd       *exec.Cmd
 	cancel    context.CancelFunc
+	mu        sync.Mutex    // guards conn
+	conn      net.Conn      // current vshd session conn; nil between runs / when stopped
 	done      chan struct{} // closed when the supervisor goroutine exits
 }
 
@@ -223,19 +230,16 @@ func (m *autorunManager) supervise(ctx context.Context, proc *autorunProcess) {
 	for {
 		select {
 		case <-ctx.Done():
-			// Kill the current process if running
-			m.mu.Lock()
-			if proc.cmd != nil && proc.cmd.Process != nil {
-				proc.cmd.Process.Signal(syscall.SIGTERM)
-				// Give it a moment to exit gracefully, then force kill
-				go func(cmd *exec.Cmd) {
-					time.Sleep(2 * time.Second)
-					if cmd.Process != nil {
-						cmd.Process.Kill()
-					}
-				}(proc.cmd)
+			// stop() (or shutdownAutorunManager) already cancelled ctx and
+			// closed proc.conn, which tears down the in-container session and
+			// SIGHUPs the child. Close conn defensively in case ctx was
+			// cancelled by another path; a nil/double close is harmless.
+			proc.mu.Lock()
+			if proc.conn != nil {
+				_ = proc.conn.Close()
+				proc.conn = nil
 			}
-			m.mu.Unlock()
+			proc.mu.Unlock()
 			return
 
 		default:
@@ -270,53 +274,97 @@ func (m *autorunManager) supervise(ctx context.Context, proc *autorunProcess) {
 	}
 }
 
-// runOnce runs the autorun command once and waits for it to exit.
+// runOnce runs the autorun command once by entering a container session via
+// the host vshd shim — the same path SSH container sessions take
+// (runContainerSession) — and blocks until the command exits or the session is
+// torn down. The command runs as root with proc.argv directly, equivalent to
+// `ssh root@<ref> -- <argv>`.
+//
+// Going through vshd (rather than spawning `ts drop-caps-and-run` with a bespoke
+// CLONE_NEWPID) shares vshd's namespace anchoring and, critically, the
+// disconnect cleanup in vshdsession.servePipe: when stop() closes conn (or the
+// daemon exits and the kernel closes the conn's fd), the in-container
+// session-serve SIGHUPs the child, so a non-stdin-reading autorun command (e.g.
+// `while true; do :; done`) dies instead of being orphaned and spinning forever.
+// The old bespoke CLONE_NEWPID spawn reparented to init on daemon exit and left
+// the child running in its own PID namespace with nothing to kill it.
 func (m *autorunManager) runOnce(ctx context.Context, proc *autorunProcess) error {
-	// Build the frame path: fs/<user>/<uuid>
-	framePath := filepath.Join(m.dataDir, "fs", proc.key.user, proc.frameUUID.String())
-
-	// Build the command to run via ts drop-caps-and-run
-	// This runs the command in the container environment with proper namespaces.
-	tsBinary := filepath.Join(framePath, "bin", "ts")
-	if _, err := os.Stat(tsBinary); err != nil {
-		return fmt.Errorf("ts binary not found in frame: %v", err)
+	// Resolve the ref to its current frame rootfs so ref moves are reflected.
+	rootFS, _, err := resolveFrameRootFS(proc.key.user, proc.key.refName)
+	if err != nil {
+		return fmt.Errorf("resolve frame %s/%s: %w", proc.key.user, proc.key.refName, err)
 	}
-
-	// The command is: ts drop-caps-and-run --chroot=<framePath> -- <argv...>
-	// TODO: --keep-dev-caps is currently always passed to allow running
-	// thundersnap recursively (for development). See vshd's buildSessionCmd
-	// for the full rationale; this should be made configurable.
-	args := []string{"drop-caps-and-run", "--chroot=" + framePath, "--keep-dev-caps", "--"}
-	args = append(args, proc.argv...)
-
-	cmd := exec.CommandContext(ctx, tsBinary, args...)
-	cmd.Dir = "/"
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Cloneflags: syscall.CLONE_NEWPID | syscall.CLONE_NEWNS | syscall.CLONE_NEWUTS,
+	if err := prepareContainerRootFS(rootFS, ""); err != nil {
+		return fmt.Errorf("prepare rootfs: %w", err)
 	}
+	if _, err := controlServers.getOrCreateControlServer(rootFS); err != nil {
+		return fmt.Errorf("start control socket: %w", err)
+	}
+	defer controlServers.releaseControlServer(rootFS)
 
-	// Redirect stdout/stderr to logs
-	cmd.Stdout = &autorunLogWriter{user: proc.key.user, refName: proc.key.refName, stream: "stdout"}
-	cmd.Stderr = &autorunLogWriter{user: proc.key.user, refName: proc.key.refName, stream: "stderr"}
+	absRootFS, err := filepath.Abs(rootFS)
+	if err != nil {
+		return fmt.Errorf("abs rootfs: %w", err)
+	}
+	framePathHdr := strings.TrimPrefix(absRootFS, "/")
 
-	m.mu.Lock()
-	proc.cmd = cmd
-	m.mu.Unlock()
+	sockPath, err := hostVshd.ensure()
+	if err != nil {
+		return fmt.Errorf("start host vshd: %w", err)
+	}
+	conn, err := net.Dial("unix", sockPath)
+	if err != nil {
+		return fmt.Errorf("dial host vshd: %w", err)
+	}
+	defer conn.Close()
 
-	err := cmd.Run()
+	// Record the conn so stop() can close it to tear the session down. Cleared
+	// (under proc.mu) when runOnce returns.
+	proc.mu.Lock()
+	proc.conn = conn
+	proc.mu.Unlock()
+	defer func() {
+		proc.mu.Lock()
+		proc.conn = nil
+		proc.mu.Unlock()
+	}()
 
-	m.mu.Lock()
-	proc.cmd = nil
-	m.mu.Unlock()
+	// Non-PTY session running proc.argv directly as root — the same request
+	// `ssh root@<ref> -- <argv>` sends. No stdin: an immediate EOF is sent,
+	// matching an exec session with no input (and NOT a disconnect, so
+	// servePipe does not SIGHUP the child).
+	writeVshdRequest(conn, framePathHdr, "root", false, proc.argv)
 
-	return err
+	exitCode := proxyVshdSessionGeneric(
+		strings.NewReader(""), // stdin: immediate EOF (no input)
+		&autorunLogWriter{user: proc.key.user, refName: proc.key.refName, stream: "stdout"},
+		&autorunLogWriter{user: proc.key.user, refName: proc.key.refName, stream: "stderr"},
+		conn,
+		false,               // isPty
+		vshdproto.Winsize{}, // initialWinsize (n/a for non-PTY)
+		nil,                 // winCh
+		nil, nil, nil,       // clientClosed, done, panicked (n/a)
+	)
+	if exitCode != 0 {
+		return fmt.Errorf("exit code %d", exitCode)
+	}
+	return nil
 }
 
-// stop stops the autorun process.
+// stop stops the autorun process by cancelling its context and closing the
+// vshd session conn. Closing conn tears down the in-container session and
+// SIGHUPs the child (see runOnce / vshdsession.servePipe), so a non-stdin-
+// reading command (e.g. `while true; do :; done`) exits promptly.
 func (p *autorunProcess) stop() {
 	if p.cancel != nil {
 		p.cancel()
 	}
+	p.mu.Lock()
+	if p.conn != nil {
+		_ = p.conn.Close()
+		p.conn = nil
+	}
+	p.mu.Unlock()
 }
 
 // autorunLogWriter logs output from autorun processes.
