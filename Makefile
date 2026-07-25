@@ -75,7 +75,7 @@ not_e2e: ts vshd thundersnapd
 		TS_BINARY="$(CURDIR)/$(BIN)/ts" \
 		VSHD_BINARY="$(CURDIR)/$(BIN)/vshd" \
 		THUNDERSNAPD_BINARY="$(CURDIR)/$(BIN)/thundersnapd" \
-		$(BIN)/not_e2e.test -test.v -test.failfast -test.timeout=$(NOT_E2E_TEST_TIMEOUT)
+		$(BIN)/not_e2e.test -test.v -test.failfast -test.timeout=$(NOT_E2E_TEST_TIMEOUT) $(E2E_ARGS)
 
 # Build all binaries for local development
 binaries: ts vsh vshd thundersnapd tsm

@@ -139,11 +139,15 @@ func createVMXRootFS(t *testing.T, env *testEnv, vmxRootFS string) {
 // The init binaries are at /<initPrefix>/bin/ts and /<initPrefix>/sbin/vshd.
 // vshd runs without chroot so it can access /dev/vsock at the virtiofs root.
 // vshd then spawns containers with chroot into individual frame paths.
+//
+// ts is run directly as the kernel's init (PID 1) so it can perform mount
+// setup — matches thundersnap/vm.go. The old init=<sh> -c 'exec <ts> ...'
+// form tripped the pid-1 safety gate in drop-caps-and-run.
 func vmxCmdlineWithPrefix(initPrefix, hostname string) string {
 	shBin := "/" + initPrefix + "/bin/sh"
 	tsBin := "/" + initPrefix + "/bin/ts"
 	vshdBin := "/" + initPrefix + "/sbin/vshd"
-	return fmt.Sprintf(`console=ttyS0 panic=1 rootfstype=virtiofs root=rootfs rw ip=10.0.2.15::10.0.2.2:255.255.255.0:%s:eth0:off init=%s -- -c "exec %s drop-caps-and-run --vsock %s -c 'echo nameserver 8.8.8.8 > /etc/resolv.conf; exec %s'"`, hostname, shBin, tsBin, shBin, vshdBin)
+	return fmt.Sprintf(`console=ttyS0 panic=1 rootfstype=virtiofs root=rootfs rw ip=10.0.2.15::10.0.2.2:255.255.255.0:%s:eth0:off init=%s -- drop-caps-and-run --vsock %s -c "echo nameserver 8.8.8.8 > /etc/resolv.conf; exec %s"`, hostname, tsBin, shBin, vshdBin)
 }
 
 // dialVsock connects to a VM's vsock port with the cloud-hypervisor handshake.

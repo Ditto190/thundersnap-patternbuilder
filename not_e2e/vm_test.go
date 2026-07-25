@@ -61,26 +61,17 @@ func startVM(t *testing.T, env *testEnv, framePath, vmDir string, memoryMB int, 
 		vmExited:     make(chan error, 1),
 	}
 
-	// Start virtiofsd
-	virtiofsdPath := "/usr/libexec/virtiofsd"
-	if _, err := os.Stat(virtiofsdPath); err != nil {
-		virtiofsdPath, _ = exec.LookPath("virtiofsd")
-	}
-	session.virtiofsdCmd = exec.Command(virtiofsdPath,
-		"--socket-path="+virtiofsSock,
-		"--shared-dir="+absFramePath,
-		"--cache=always",
-	)
-	session.virtiofsdCmd.Stderr = os.Stderr
-	if err := session.virtiofsdCmd.Start(); err != nil {
-		return nil, fmt.Errorf("start virtiofsd: %w", err)
-	}
-
-	// Wait for virtiofsd socket
-	if !waitForSocket(virtiofsSock, 5*time.Second) {
+	// Start virtiofsd via the shared helper, which always passes
+	// --modcaps=-setfcap (matching thundersnap.StartVM). Without that flag,
+	// virtiofsd's drop_capabilities() capset()s CAP_SETFCAP, which is absent
+	// from many container runtimes' bounding sets; virtiofsd then exits(1)
+	// immediately and the VM never boots.
+	cmd, err := startVirtiofsd(virtiofsSock, absFramePath)
+	if err != nil {
 		session.cleanup()
-		return nil, fmt.Errorf("virtiofsd socket not created")
+		return nil, err
 	}
+	session.virtiofsdCmd = cmd
 
 	// Start passt
 	session.passtCmd = exec.Command("passt",
@@ -278,8 +269,12 @@ func standardVMCmdline() string {
 // vmCmdlineWithHostname returns a kernel command line with the specified hostname.
 // The hostname is passed via the kernel IP autoconfig ip= parameter:
 // ip=<client-ip>::<gw-ip>:<netmask>:<hostname>:<device>:<autoconf>
+//
+// ts is run directly as the kernel's init (PID 1) so it can perform mount
+// setup — matches thundersnap/vm.go. The old init=/bin/sh -c 'exec /bin/ts ...'
+// form tripped the pid-1 safety gate in drop-caps-and-run.
 func vmCmdlineWithHostname(hostname string) string {
-	return fmt.Sprintf(`console=ttyS0 panic=1 rootfstype=virtiofs root=rootfs rw ip=10.0.2.15::10.0.2.2:255.255.255.0:%s:eth0:off init=/bin/sh -- -c "exec /bin/ts drop-caps-and-run --vsock /bin/sh -c 'echo nameserver 8.8.8.8 > /etc/resolv.conf; exec /sbin/vshd'"`, hostname)
+	return fmt.Sprintf(`console=ttyS0 panic=1 rootfstype=virtiofs root=rootfs rw ip=10.0.2.15::10.0.2.2:255.255.255.0:%s:eth0:off init=/bin/ts -- drop-caps-and-run --vsock /bin/sh -c "echo nameserver 8.8.8.8 > /etc/resolv.conf; exec /sbin/vshd"`, hostname)
 }
 
 // TestVMLaunchSuccess tests that a VM launches successfully with sufficient memory.

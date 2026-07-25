@@ -338,8 +338,8 @@ func parseIsolationOutput(output string) isolationCheckResult {
 //
 // It drives the REAL production per-session form the daemon uses
 // (cmd/thundersnapd buildSessionCommand): join the shared namespace anchored by
-// container-init with nsenter, then run ts drop-caps-and-run --chroot
-// join-and-run. The earlier version of this test instead called the
+// container-init with ts nsenter, then run ts join-and-run --chroot.
+// The earlier version of this test instead called the
 // thundersnap.{Start,Run}InContainerNs spawn fork, which built the command
 // WITHOUT join-and-run and was never used by the daemon, so a green
 // result proved nothing about the live path.
@@ -359,16 +359,17 @@ func TestContainerSharedPIDNamespace(t *testing.T) {
 	tsBinary := filepath.Join(absFramePath, "bin", "ts")
 
 	// runSession runs the exact production per-session command form against the
-	// shared namespace: nsenter joins initPid's PID/mount/UTS namespaces, then
-	// ts join-and-run --chroot execs the script.
+	// shared namespace: ts nsenter joins initPid's PID/mount/UTS namespaces,
+	// then ts join-and-run --chroot execs the script.
 	runSession := func(script string) *exec.Cmd {
 		args := []string{
+			"nsenter",
 			"-t", fmt.Sprintf("%d", initPid), "-p", "-m", "-u", "--",
 			tsBinary, "join-and-run",
 			"--chroot=" + absFramePath,
 			"--", "/bin/sh", "-c", script,
 		}
-		cmd := exec.Command("nsenter", args...)
+		cmd := exec.Command(tsBinary, args...)
 		cmd.Dir = "/"
 		return cmd
 	}

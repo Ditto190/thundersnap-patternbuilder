@@ -58,9 +58,9 @@ type testEnv struct {
 // --modcaps=-setfcap, matching thundersnap.StartVM: see the comment there for
 // why (virtiofsd's drop_capabilities() capset()s CAP_SETFCAP, which is absent
 // from many container runtimes' bounding sets; without the flag virtiofsd
-// exits(1) immediately and the VM never boots).
-func startVirtiofsd(t *testing.T, virtiofsSock, sharedDir string) *exec.Cmd {
-	t.Helper()
+// exits(1) immediately and the VM never boots). It returns an error if
+// virtiofsd fails to start or its socket never appears.
+func startVirtiofsd(virtiofsSock, sharedDir string) (*exec.Cmd, error) {
 	virtiofsdPath := "/usr/libexec/virtiofsd"
 	if _, err := os.Stat(virtiofsdPath); err != nil {
 		virtiofsdPath, _ = exec.LookPath("virtiofsd")
@@ -74,15 +74,17 @@ func startVirtiofsd(t *testing.T, virtiofsSock, sharedDir string) *exec.Cmd {
 	cmd := exec.Command(virtiofsdPath, args...)
 	cmd.Stderr = os.Stderr
 	if err := cmd.Start(); err != nil {
-		t.Fatalf("start virtiofsd: %v", err)
+		return nil, fmt.Errorf("start virtiofsd: %w", err)
 	}
 	for i := 0; i < 50; i++ {
 		if _, err := os.Stat(virtiofsSock); err == nil {
-			break
+			return cmd, nil
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	return cmd
+	cmd.Process.Kill()
+	cmd.Wait()
+	return nil, fmt.Errorf("virtiofsd socket %s not created", virtiofsSock)
 }
 
 // requireBtrfsRoot fails the test if the e2e environment is not set up
@@ -760,7 +762,10 @@ func testDevSetupVM(t *testing.T) {
 	defer os.Remove(vsockSock)
 	defer os.Remove(passtSock)
 
-	virtiofsdCmd := startVirtiofsd(t, virtiofsSock, absFramePath)
+	virtiofsdCmd, err := startVirtiofsd(virtiofsSock, absFramePath)
+	if err != nil {
+		t.Fatalf("%v", err)
+	}
 	defer virtiofsdCmd.Wait()
 	defer virtiofsdCmd.Process.Kill()
 
@@ -793,12 +798,16 @@ func testDevSetupVM(t *testing.T) {
 	chvPath := filepath.Join(vmDir, "cloud-hypervisor")
 	kernelPath := filepath.Join(vmDir, "vmlinux")
 
-	// Build kernel command line - use sh as init, then call ts drop-caps-and-run
-	// for consistent /dev setup between container and VM modes.
+	// Build kernel command line - run ts directly as the kernel's init (PID 1)
+	// so it can perform mount setup (the pid-1 safety gate in drop-caps-and-run
+	// rejects non-PID-1 callers). This matches thundersnap/vm.go. Previously this
+	// used init=/bin/sh -c 'exec /bin/ts ...' but /bin/sh is a symlink to ts
+	// (mvdan/sh shell mode) whose exec builtin forks rather than replacing the
+	// process, so ts was never PID 1.
 	// panic=1 ensures the VM reboots (and thus terminates) on kernel panic.
 	// Use kernel IP autoconfiguration (ip=) instead of manual ip commands because
 	// the test container doesn't have the ip binary.
-	cmdline := `console=ttyS0 panic=1 rootfstype=virtiofs root=rootfs rw ip=10.0.2.15::10.0.2.2:255.255.255.0::eth0:off init=/bin/sh -- -c "exec /bin/ts drop-caps-and-run --vsock /bin/sh -c 'echo nameserver 8.8.8.8 > /etc/resolv.conf; exec /sbin/vshd'"`
+	cmdline := `console=ttyS0 panic=1 rootfstype=virtiofs root=rootfs rw ip=10.0.2.15::10.0.2.2:255.255.255.0::eth0:off init=/bin/ts -- drop-caps-and-run --vsock /bin/sh -c "echo nameserver 8.8.8.8 > /etc/resolv.conf; exec /sbin/vshd"`
 
 	// Create pipe for event monitor to detect panics
 	eventReadPipe, eventWritePipe, err := os.Pipe()
@@ -931,7 +940,10 @@ func testVMPanicRecovery(t *testing.T) {
 	defer os.Remove(vsockSock)
 	defer os.Remove(passtSock)
 
-	virtiofsdCmd := startVirtiofsd(t, virtiofsSock, absFramePath)
+	virtiofsdCmd, err := startVirtiofsd(virtiofsSock, absFramePath)
+	if err != nil {
+		t.Fatalf("%v", err)
+	}
 	defer virtiofsdCmd.Wait()
 	defer virtiofsdCmd.Process.Kill()
 

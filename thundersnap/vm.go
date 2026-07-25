@@ -207,9 +207,10 @@ func StartVM(cfg VMConfig) (*VMSession, error) {
 	// than running ip commands in userspace. Format: ip=<client-ip>::<gw-ip>:<netmask>:<hostname>:<device>:<autoconf>
 	// This requires CONFIG_IP_PNP=y in the kernel config.
 	//
-	// We use sh as init because kernel cmdline argument parsing is limited -
-	// it doesn't handle complex quoting well when passing args directly to init.
-	// The shell script approach is more reliable.
+	// We run ts directly as the kernel's init (PID 1) so it can perform the
+	// destructive mount setup that drop-caps-and-run requires (the pid-1 safety
+	// gate rejects non-PID-1 callers). The kernel passes everything after "--"
+	// as init args, which ts dispatches to the drop-caps-and-run subcommand.
 	//
 	// panic=1 tells the kernel to reboot 1 second after a panic. Since there's
 	// no bootable device, cloud-hypervisor will exit when the VM reboots.

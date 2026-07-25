@@ -98,29 +98,16 @@ func TestSSHCommandWorkingDirectory(t *testing.T) {
 	defer os.Remove(vsockSock)
 	defer os.Remove(passtSock)
 
-	// Start virtiofsd
-	virtiofsdPath := "/usr/libexec/virtiofsd"
-	if _, err := os.Stat(virtiofsdPath); err != nil {
-		virtiofsdPath, _ = exec.LookPath("virtiofsd")
-	}
-	virtiofsdCmd := exec.Command(virtiofsdPath,
-		"--socket-path="+virtiofsSock,
-		"--shared-dir="+absFramePath,
-		"--cache=always",
-	)
-	virtiofsdCmd.Stderr = os.Stderr
-	if err := virtiofsdCmd.Start(); err != nil {
-		t.Fatalf("start virtiofsd: %v", err)
+	// Start virtiofsd via the shared helper, which always passes
+	// --modcaps=-setfcap (matching thundersnap.StartVM). Without that flag,
+	// virtiofsd exits(1) immediately in containers whose bounding set omits
+	// CAP_SETFCAP and the VM never boots.
+	virtiofsdCmd, err := startVirtiofsd(virtiofsSock, absFramePath)
+	if err != nil {
+		t.Fatalf("%v", err)
 	}
 	defer virtiofsdCmd.Wait()
 	defer virtiofsdCmd.Process.Kill()
-
-	for i := 0; i < 50; i++ {
-		if _, err := os.Stat(virtiofsSock); err == nil {
-			break
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
 
 	// Start passt
 	passtCmd := exec.Command("passt",
@@ -150,7 +137,9 @@ func TestSSHCommandWorkingDirectory(t *testing.T) {
 	chvPath := filepath.Join(vmDir, "cloud-hypervisor")
 	kernelPath := filepath.Join(vmDir, "vmlinux")
 
-	cmdline := `console=ttyS0 panic=1 rootfstype=virtiofs root=rootfs rw ip=10.0.2.15::10.0.2.2:255.255.255.0::eth0:off init=/bin/sh -- -c "exec /bin/ts drop-caps-and-run --vsock /bin/sh -c 'echo nameserver 8.8.8.8 > /etc/resolv.conf; exec /sbin/vshd'"`
+	// Run ts directly as init (PID 1) — matches thundersnap/vm.go. The old
+	// init=/bin/sh -c 'exec /bin/ts ...' form tripped the pid-1 safety gate.
+	cmdline := `console=ttyS0 panic=1 rootfstype=virtiofs root=rootfs rw ip=10.0.2.15::10.0.2.2:255.255.255.0::eth0:off init=/bin/ts -- drop-caps-and-run --vsock /bin/sh -c "echo nameserver 8.8.8.8 > /etc/resolv.conf; exec /sbin/vshd"`
 
 	chvCmd := exec.Command(chvPath,
 		"--kernel", kernelPath,

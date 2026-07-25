@@ -6,6 +6,7 @@
 package e2e
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"os/exec"
@@ -98,7 +99,7 @@ func TestContainerSharedDevpts(t *testing.T) {
 // node. The fix passes join-and-run (no mount setup) so sessions reuse the single shared
 // devpts that container-init mounted.
 //
-// This test runs the exact production command form (nsenter + ts
+// This test runs the exact production command form (ts nsenter + ts
 // join-and-run --chroot --pty) for two concurrent sessions,
 // each reporting its own tty via `tty`, and asserts:
 //   - the two sessions report DISTINCT pts numbers, and
@@ -123,28 +124,33 @@ func TestContainerConcurrentSessionDistinctPTS(t *testing.T) {
 	}
 
 	type result struct {
-		tty string
-		err error
+		tty    string
+		stderr string
+		err    error
 	}
 	run := func(gofifo string) <-chan result {
 		ch := make(chan result, 1)
 		go func() {
 			// Mirror the production per-session command: join the namespace via
-			// nsenter, then ts join-and-run --chroot --pty,
+			// ts nsenter (the in-binary CGO-free nsenter vshd uses on the host
+			// and inside VMs), then ts join-and-run --chroot --pty,
 			// running a shell that prints its tty and blocks on the fifo.
 			tsBinary := filepath.Join(absFramePath, "bin", "ts")
 			script := "tty; read x < /tmp/" + gofifo
 			args := []string{
+				"nsenter",
 				"-t", fmt.Sprintf("%d", initPid), "-p", "-m", "-u", "--",
 				tsBinary, "join-and-run",
 				"--chroot=" + absFramePath,
 				"--pty",
 				"--", "/bin/sh", "-c", script,
 			}
-			cmd := exec.Command("nsenter", args...)
+			cmd := exec.Command(tsBinary, args...)
 			cmd.Dir = "/"
+			var stderr bytes.Buffer
+			cmd.Stderr = &stderr
 			out, err := cmd.Output()
-			ch <- result{tty: strings.TrimSpace(string(out)), err: err}
+			ch <- result{tty: strings.TrimSpace(string(out)), stderr: stderr.String(), err: err}
 		}()
 		return ch
 	}
@@ -154,7 +160,46 @@ func TestContainerConcurrentSessionDistinctPTS(t *testing.T) {
 
 	// Wait until both sessions are alive (both have created their pts and are
 	// blocked on the fifo) by polling the shared /dev/pts for two slave nodes.
-	waitForDevptsSlaves(t, initPid, 2)
+	// Also surface any session that has already errored out, so a failure in
+	// join-and-run is reported immediately instead of just a devpts timeout.
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(devptsSlaves(t, initPid)) >= 2 {
+			break
+		}
+		select {
+		case r := <-ch1:
+			t.Fatalf("session 1 exited before both pts were live: %v\ntty=%q\nstderr:\n%s", r.err, r.tty, r.stderr)
+		case r := <-ch2:
+			t.Fatalf("session 2 exited before both pts were live: %v\ntty=%q\nstderr:\n%s", r.err, r.tty, r.stderr)
+		default:
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if len(devptsSlaves(t, initPid)) < 2 {
+		// Drain whatever the sessions have produced (release fifos first so a
+		// blocked session can finish) and report the real error.
+		for _, name := range []string{"go1", "go2"} {
+			if f, err := os.OpenFile(filepath.Join(absFramePath, "tmp", name), os.O_WRONLY, 0); err == nil {
+				fmt.Fprintln(f, "go")
+				f.Close()
+			}
+		}
+		drain := func(ch <-chan result, which string) result {
+			select {
+			case r := <-ch:
+				return r
+			case <-time.After(3 * time.Second):
+				return result{err: fmt.Errorf("session %s did not exit within 3s", which)}
+			}
+		}
+		r1 := drain(ch1, "1")
+		r2 := drain(ch2, "2")
+		t.Fatalf("timed out waiting for 2 pts slaves; have %v\n"+
+			"session 1: err=%v tty=%q\nstderr:\n%s\n"+
+			"session 2: err=%v tty=%q\nstderr:\n%s",
+			devptsSlaves(t, initPid), r1.err, r1.tty, r1.stderr, r2.err, r2.tty, r2.stderr)
+	}
 
 	// While both are alive, the shared devpts must contain two distinct slaves.
 	slaves := devptsSlaves(t, initPid)
