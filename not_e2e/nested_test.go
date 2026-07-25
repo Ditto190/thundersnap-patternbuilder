@@ -338,19 +338,24 @@ func TestCgroupMultiLevelSubtreeControl(t *testing.T) {
 	}
 
 	// Check if cgroup v2 is available. Inside a container /sys/fs/cgroup is
-	// often a read-only sysfs mount with no cgroup.controllers (the project
-	// treats cgroup setup as best-effort in containers — see CLAUDE.md). Since
-	// this test runs as root, try to mount a fresh cgroup2 there so the
-	// multi-level subtree_control logic is actually exercised. If cgroup2
-	// still isn't available, treat it as an environmental limitation (matching
-	// TestNestedThundersnapCgroup's stance) rather than a failure: the bug fix
-	// this test guards is only verifiable on a real cgroup2 host.
+	// often a read-only sysfs mount with no cgroup.controllers. Since this test
+	// runs as root, try to mount a fresh cgroup2 there so the multi-level
+	// subtree_control logic is actually exercised.
+	//
+	// If cgroup2 still isn't available, hard-fail rather than silently pass:
+	// this test is matched by a not_e2e tier, so a bare return would let `make
+	// not_e2e` report green without ever running the multi-level write — a
+	// false-green in exactly the container environment where the guarded fix
+	// is most likely to regress. Per the project's e2e-never-skip rule, a
+	// missing precondition is a misconfigured environment and must fail, not
+	// skip. Run these tests on a real cgroup2 host (or a container with a
+	// writable /sys/fs/cgroup) to exercise them.
 	if _, err := os.Stat("/sys/fs/cgroup/cgroup.controllers"); err != nil {
 		if merr := unix.Mount("none", "/sys/fs/cgroup", "cgroup2", 0, ""); merr != nil {
-			t.Logf("INFO: cgroup v2 not available and could not be mounted: %v", merr)
-			t.Logf("This is expected in containers with a read-only /sys/fs/cgroup; " +
-				"the multi-level subtree_control fix is verified on real cgroup2 hosts.")
-			return
+			t.Fatalf("cgroup v2 not available and could not be mounted at /sys/fs/cgroup: %v. "+
+				"This test guards the multi-level cgroup.subtree_control fix and must "+
+				"run on a real cgroup2 host (or a container with a writable /sys/fs/cgroup); "+
+				"it must not silently pass.", merr)
 		}
 		t.Logf("Mounted cgroup2 at /sys/fs/cgroup for this test")
 	}
