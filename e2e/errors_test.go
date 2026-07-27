@@ -126,3 +126,39 @@ func TestErrorInvalidFrameSpec(t *testing.T) {
 		t.Logf("path-traversal frame spec correctly rejected (exit=%d): %q", exit, strings.TrimSpace(out))
 	}
 }
+
+// TestErrorInvalidFrameName verifies that a name used to address a frame that
+// is neither a valid UUID nor a valid ref name is rejected — at the CLI (ts
+// frame <bad>) and over SSH (root@<bad>) — rather than being turned into a
+// filesystem path. Ref names must start with a letter and contain only
+// letters/digits/dash/underscore (no dots, no slashes); a dot or slash in a
+// frame name is a path-traversal hazard, so it is refused.
+func TestErrorInvalidFrameName(t *testing.T) {
+	env := newTestEnv(t)
+	d := startDaemon(t, env)
+	createFrameViaDaemon(t, d, "namehost")
+
+	// `ts frame <bad>` is rejected client-side for a non-UUID, non-ref name.
+	for _, bad := range []string{"foo.bar", "foo/bar", ".."} {
+		out, exit, err := sshExec(t, d, "root@namehost", "ts frame "+bad)
+		if err != nil {
+			t.Fatalf("sshExec ts frame %s: %v", bad, err)
+		}
+		if exit == 0 {
+			t.Errorf("ts frame %q: expected non-zero exit, got 0 (out=%q)", bad, out)
+		} else {
+			t.Logf("ts frame %q correctly rejected (exit=%d): %q", bad, exit, strings.TrimSpace(out))
+		}
+	}
+
+	// SSH to `root@<bad>` is rejected by the daemon's frame resolution (a
+	// bogus name must not resolve to a path or create a phantom frame).
+	for _, bad := range []string{"foo.bar", "foo/bar"} {
+		out, exit, err := sshExec(t, d, "root@"+bad, "echo hi")
+		if err == nil && exit == 0 {
+			t.Errorf("ssh root@%q: expected failure, got exit 0 (out=%q)", bad, out)
+		} else {
+			t.Logf("ssh root@%q correctly failed (exit=%d): %q", bad, exit, strings.TrimSpace(out))
+		}
+	}
+}

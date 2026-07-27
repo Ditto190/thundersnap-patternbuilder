@@ -2610,9 +2610,11 @@ func (c *controlServer) handleDeleteFrame(w http.ResponseWriter, r *http.Request
 
 	// Resolve the target frame to a UUID. `ts frame --delete <uuid>` addresses
 	// the frame directly; a FrameName is a ref resolved through the user's ref
-	// store. refNames tracks every ref pointing at the frame so they can all be
-	// dropped after the frame is gone — a frame may have several refs (aliases)
-	// and leaving any behind would dangle.
+	// store. refNames tracks every ref pointing at the frame so the handler can
+	// REFUSE the delete while any remain (a frame with refs is in use; the
+	// caller must delete the refs first). A frame may have several refs
+	// (aliases); collecting all of them is what lets the gate catch the
+	// "deleted by one ref but used by another" disaster.
 	var frameID frameid.ID
 	var refNames []string
 	if req.UUID != "" {
@@ -2625,8 +2627,8 @@ func (c *controlServer) handleDeleteFrame(w http.ResponseWriter, r *http.Request
 			return
 		}
 		frameID = id
-		// Best-effort: find every ref pointing at this UUID so their config
-		// can be cleaned up alongside the frame.
+		// Find every ref pointing at this UUID so the gate below can refuse if
+		// any remain.
 		if names, err := refStore.List(); err == nil {
 			for _, n := range names {
 				if r, gerr := refStore.Get(n); gerr == nil && r.UUID == frameID {
@@ -2657,11 +2659,29 @@ func (c *controlServer) handleDeleteFrame(w http.ResponseWriter, r *http.Request
 	}
 	framePath := framePathForUserUUID(user, frameID)
 
-	// Prevent deleting the current frame
+	// Prevent deleting the current frame.
 	if framePath == c.rootFS {
 		writeJSON(w, http.StatusBadRequest, DeleteFrameResponse{
 			Status:  "error",
 			Message: "cannot delete the currently active frame",
+		})
+		return
+	}
+
+	// Refuse to delete a frame that still has refs pointing at it. A frame may
+	// have several refs (aliases); deleting the frame while any remain would
+	// leave those refs dangling — and worse, a user who deletes by one ref
+	// would silently kill a frame that other critical refs depend on. Require
+	// the caller to delete every ref first (ts ref delete <name>); only when
+	// zero refs remain is the frame safe to remove. This also makes
+	// `ts frame --delete <refname>` always refuse (the ref it is addressed by
+	// still exists), steering users to delete the ref explicitly.
+	if len(refNames) > 0 {
+		writeJSON(w, http.StatusConflict, DeleteFrameResponse{
+			Status: "error",
+			Message: fmt.Sprintf(
+				"frame %s still has %d ref(s): %s; delete them first with 'ts ref delete <name>' before deleting the frame",
+				frameID, len(refNames), strings.Join(refNames, ", ")),
 		})
 		return
 	}
@@ -2698,8 +2718,11 @@ func (c *controlServer) handleDeleteFrame(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	// Delete the frame metadata sidecar via the store, then drop every ref that
-	// pointed at it (best-effort: a UUID-based delete may have no ref, or several).
+	// Delete the frame metadata sidecar. No ref cleanup is needed here: the
+	// ref-attached check above guarantees zero refs point at this frame, so
+	// there is nothing to dangle. (refNames is empty by construction here; the
+	// loop is kept only as a defensive no-op in case a future caller bypasses
+	// the gate.)
 	if err := frameStore.Delete(frameID); err != nil && err != frames.ErrFrameNotFound {
 		log.Printf("Warning: delete frame metadata for %s: %v", frameID, err)
 	}

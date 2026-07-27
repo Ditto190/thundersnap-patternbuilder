@@ -17,7 +17,6 @@ func TestValidateName(t *testing.T) {
 		"foo",
 		"foo-bar",
 		"foo_bar",
-		"foo.bar",
 		"Foo123",
 		"a",
 		"a1",
@@ -33,11 +32,13 @@ func TestValidateName(t *testing.T) {
 		"-foo",
 		"_foo",
 		".foo",
+		"1foo",    // must start with a letter (reserve leading digits)
+		"foo.bar", // dots reserved for future syntax / path-traversal hazard
 		"foo..bar",
 		"foo/bar",
 		"foo\nbar",
 		"foo bar",
-		"foo.", // trailing dot: documented as not allowed
+		"foo.", // trailing dot
 	}
 	for _, name := range invalid {
 		if err := ValidateName(name); err == nil {
@@ -45,10 +46,29 @@ func TestValidateName(t *testing.T) {
 		}
 	}
 
-	// Trailing dash/underscore remain valid (only trailing dots are barred).
+	// Trailing dash/underscore remain valid.
 	for _, name := range []string{"foo-", "foo_"} {
 		if err := ValidateName(name); err != nil {
 			t.Errorf("ValidateName(%q) = %v, want nil", name, err)
+		}
+	}
+}
+
+func TestValidateFrameName(t *testing.T) {
+	// A valid UUID is a valid frame name even though it is not a valid ref name
+	// (UUIDs start with a hex digit; refs must start with a letter).
+	uuid := frameid.MustNew().String()
+	if err := ValidateFrameName(uuid); err != nil {
+		t.Errorf("ValidateFrameName(uuid %q) = %v, want nil", uuid, err)
+	}
+	// A valid ref name is a valid frame name.
+	if err := ValidateFrameName("my-frame"); err != nil {
+		t.Errorf("ValidateFrameName(%q) = %v, want nil", "my-frame", err)
+	}
+	// Neither a valid UUID nor a valid ref name: rejected.
+	for _, name := range []string{"", "foo.bar", "foo/bar", "..", "1foo", "foo bar"} {
+		if err := ValidateFrameName(name); err == nil {
+			t.Errorf("ValidateFrameName(%q) = nil, want error", name)
 		}
 	}
 }

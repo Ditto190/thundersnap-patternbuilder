@@ -30,6 +30,8 @@ import (
 
 	"github.com/mdlayher/vsock"
 	"github.com/pborman/getopt/v2"
+	"github.com/tailscale/thundersnap/frameid"
+	"github.com/tailscale/thundersnap/refs"
 	"github.com/tailscale/thundersnap/thunderclient"
 	"github.com/tailscale/thundersnap/thunderproto"
 	"github.com/tailscale/thundersnap/tsm"
@@ -593,6 +595,16 @@ func cmdFrame(args []string) {
 			os.Exit(1)
 		}
 		uuid := opts.Arg(0)
+		// `ts frame --delete` addresses a frame by UUID; reject anything that is
+		// not a valid UUID so a bogus string is never sent to the daemon. (To
+		// delete a frame you reached via a ref, delete the ref first, then delete
+		// the now-unreferenced frame by UUID — the daemon refuses to delete a
+		// frame that still has refs.)
+		if _, err := frameid.Parse(uuid); err != nil {
+			fmt.Fprintf(os.Stderr, "error: %q is not a valid frame UUID: %v\n", uuid, err)
+			fmt.Fprintln(os.Stderr, "usage: ts frame --delete <uuid>")
+			os.Exit(1)
+		}
 		if err := doDeleteFrame(*sockPath, uuid); err != nil {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 			os.Exit(1)
@@ -632,8 +644,15 @@ func cmdFrame(args []string) {
 		os.Exit(1)
 	}
 
-	// No colons: this is a UUID or ref resolution (not creation)
+	// No colons: this is a UUID or ref resolution (not creation). Validate it
+	// is a valid frame name (UUID or ref) client-side so a bogus string gives
+	// a clean error here rather than reaching the daemon.
 	if colonCount == 0 {
+		if err := refs.ValidateFrameName(spec); err != nil {
+			fmt.Fprintf(os.Stderr, "error: invalid frame name %q: %v\n", spec, err)
+			fmt.Fprintln(os.Stderr, "       frame names must be a valid UUID or a ref (start with a letter; letters/digits/dash/underscore only)")
+			os.Exit(1)
+		}
 		uuid, err := doResolveFrame(*sockPath, spec)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
@@ -643,7 +662,15 @@ func cmdFrame(args []string) {
 		return
 	}
 
-	// Two colons: snap triplet
+	// Two colons: snap triplet. If a ref name is requested, validate it
+	// client-side (the daemon validates too, but a clean local error is better
+	// than a round-trip rejection).
+	if *refName != "" {
+		if err := refs.ValidateName(*refName); err != nil {
+			fmt.Fprintf(os.Stderr, "error: invalid ref name %q: %v\n", *refName, err)
+			os.Exit(1)
+		}
+	}
 	// Special case: :: snaps the current frame and creates a new frame from it.
 	// Fork does this without blocking on indexing: it captures the current
 	// frame as a background snap and clones a new frame from the live

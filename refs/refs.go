@@ -47,15 +47,16 @@ var (
 	ErrInvalidRefName = errors.New("invalid ref name")
 )
 
-// validRefName matches valid ref names: alphanumeric, dash, underscore, dot.
-// Must start with alphanumeric. Consecutive dots and trailing dots are
-// rejected separately in ValidateName (a regexp alone can't express "no `..`
-// anywhere" cleanly alongside the character-class rule).
-var validRefName = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]*$`)
-
-// consecutiveDots matches a "../"-style path-traversal sequence within a ref
-// name. Compiled once at package load rather than on every ValidateName call.
-var consecutiveDots = regexp.MustCompile(`\.\.`)
+// validRefName matches valid ref names. The charset is deliberately
+// restrictive so syntax is reserved for the future: only ASCII letters,
+// digits, dash, and underscore are allowed, and the name must start with a
+// letter. In particular dots ('.') and slashes ('/') are NOT allowed — dots
+// are reserved for future namespace/version separators and would also be a
+// path-traversal hazard (ref names become filenames via refPath), and slashes
+// would create nested paths. A UUID is never a valid ref name under this rule
+// (UUIDs start with a hex digit), which keeps the UUID and ref namespaces
+// disjoint (see ValidateFrameName).
+var validRefName = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_-]*$`)
 
 // ReflogEntry records when a ref pointed to a particular UUID.
 type ReflogEntry struct {
@@ -132,7 +133,9 @@ func notFoundOr(name, what string, err error) error {
 	return fmt.Errorf("%s ref %s: %w", what, name, err)
 }
 
-// ValidateName checks if a ref name is valid.
+// ValidateName checks if a ref name is valid: non-empty, at most 128 bytes,
+// starting with an ASCII letter, and containing only ASCII letters, digits,
+// dash, and underscore (no dots, no slashes — see validRefName).
 func ValidateName(name string) error {
 	if name == "" {
 		return fmt.Errorf("%w: empty name", ErrInvalidRefName)
@@ -141,20 +144,24 @@ func ValidateName(name string) error {
 		return fmt.Errorf("%w: name too long (max 128)", ErrInvalidRefName)
 	}
 	if !validRefName.MatchString(name) {
-		return fmt.Errorf("%w: must start with alphanumeric, contain only alphanumeric/dash/underscore/dot", ErrInvalidRefName)
-	}
-	// The character-class regex permits a single ".", so "foo.." would pass it;
-	// reject any "../"-style sequence explicitly to block path-traversal tricks.
-	if consecutiveDots.MatchString(name) {
-		return fmt.Errorf("%w: consecutive dots not allowed", ErrInvalidRefName)
-	}
-	// The regex also permits a trailing dot ("foo."), but the package promises
-	// no trailing dots (a trailing "." is confusing as a filename stem and on
-	// some filesystems is stripped). Reject it to match the documented rule.
-	if name[len(name)-1] == '.' {
-		return fmt.Errorf("%w: trailing dot not allowed", ErrInvalidRefName)
+		return fmt.Errorf("%w: must start with a letter and contain only letters/digits/dash/underscore", ErrInvalidRefName)
 	}
 	return nil
+}
+
+// ValidateFrameName reports whether name is a valid frame address: either a
+// valid frame UUID (parsed by frameid.Parse) or a valid ref name (ValidateName).
+// A frame is addressed by UUID (e.g. `ts frame --delete <uuid>`,
+// `ssh user@<uuid>`) or by ref name (e.g. `ts frame <ref>`, `ssh user@<ref>`);
+// any other string is rejected so a bogus name never becomes a filesystem path.
+// The two branches are disjoint: a UUID starts with a hex digit and so is not a
+// valid ref name (refs must start with a letter), which means a name never
+// matches both and the UUID/ref namespaces stay unambiguous.
+func ValidateFrameName(name string) error {
+	if _, err := frameid.Parse(name); err == nil {
+		return nil
+	}
+	return ValidateName(name)
 }
 
 // Create creates a new ref pointing at the given UUID.

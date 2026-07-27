@@ -63,7 +63,7 @@ func TestFrameCreateDelete(t *testing.T) {
 
 	uuid := createFrameViaDaemon(t, d, "lifecycle")
 
-	// Listed and present.
+	// Listed and present (by ref name while a ref is bound).
 	out, exit, err := sshExec(t, d, "root@lifecycle", "ts frames")
 	if err != nil || exit != 0 {
 		t.Fatalf("ts frames: err=%v exit=%d out=%q", err, exit, out)
@@ -73,28 +73,113 @@ func TestFrameCreateDelete(t *testing.T) {
 	}
 	t.Logf("ts frames lists lifecycle (uuid %s)", uuid)
 
-	// Delete the frame from the DEFAULT (empty) frame's session, not from
-	// within lifecycle itself: the daemon refuses to delete the currently
-	// active frame (the one the control socket belongs to).
+	// The frame still has the "lifecycle" ref attached, so deleting it must be
+	// REFUSED: the daemon requires zero refs before a frame can be deleted, so
+	// a frame reached by one ref cannot be torn out from under other refs that
+	// point at it. Assert the 409 (non-zero exit, message names the ref).
+	out, exit, err = sshExec(t, d, "root@", "ts frame --delete "+uuid)
+	if err != nil {
+		t.Fatalf("sshExec: %v", err)
+	}
+	if exit == 0 {
+		t.Fatalf("ts frame --delete with ref attached: expected non-zero exit, got 0 (out=%q)", out)
+	}
+	if !strings.Contains(out, "lifecycle") || !strings.Contains(out, "ref") {
+		t.Errorf("delete-with-refs error did not name the ref: %q", out)
+	} else {
+		t.Logf("delete with ref attached correctly refused (exit=%d): %q", exit, strings.TrimSpace(out))
+	}
+
+	// Delete the ref first, then the frame. The frame is addressed by UUID for
+	// the delete (from the DEFAULT frame's session, not from within the frame
+	// itself: the daemon refuses to delete the currently active frame).
+	if out, exit, err := sshExec(t, d, "root@", "ts ref delete --force lifecycle"); err != nil || exit != 0 {
+		t.Fatalf("ts ref delete lifecycle: err=%v exit=%d out=%q", err, exit, out)
+	}
 	out, exit, err = sshExec(t, d, "root@", "ts frame --delete "+uuid)
 	if err != nil || exit != 0 {
-		t.Fatalf("ts frame --delete: err=%v exit=%d out=%q", err, exit, out)
+		t.Fatalf("ts frame --delete after ref removed: err=%v exit=%d out=%q", err, exit, out)
 	}
 	t.Logf("deleted frame: %s", strings.TrimSpace(out))
 
-	// Confirm it is gone from the listing.
+	// Confirm it is gone from the listing. After the ref was removed the frame
+	// is listed by UUID (not "lifecycle"), so check for the UUID, not the ref
+	// name.
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		out, _, _ = sshExec(t, d, "root@", "ts frames")
-		if !strings.Contains(out, "lifecycle") {
+		if !strings.Contains(out, uuid) {
 			break
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
-	if strings.Contains(out, "lifecycle") {
-		t.Fatalf("ts frames still lists lifecycle after delete: %q", out)
+	if strings.Contains(out, uuid) {
+		t.Fatalf("ts frames still lists the frame after delete: %q", out)
 	}
 	t.Logf("frame gone from ts frames after delete")
+}
+
+// TestFrameDeleteRequiresAllRefsRemoved verifies that a frame cannot be
+// deleted while ANY ref points at it, and that the error names every ref so a
+// caller cannot accidentally tear a frame out from under other refs that depend
+// on it. This is the disaster the refs-must-be-removed-first rule prevents:
+// deleting by one ref used to silently kill the frame (and dangle the other
+// refs); now the delete is refused until every ref is gone. Create two refs on
+// one frame, assert the delete is refused naming both, drop one (still refused
+// naming the other), drop the last, then the delete succeeds.
+func TestFrameDeleteRequiresAllRefsRemoved(t *testing.T) {
+	env := newTestEnv(t)
+	d := startDaemon(t, env)
+
+	uuid := createFrameViaDaemon(t, d, "shared")
+
+	// Bind a second ref to the same frame (the first, "shared", is created by
+	// createFrameViaDaemon). Now two refs point at the frame.
+	if out, exit, err := sshExec(t, d, "root@shared", "ts ref create alias "+uuid); err != nil || exit != 0 {
+		t.Fatalf("ts ref create alias: err=%v exit=%d out=%q", err, exit, out)
+	}
+
+	// Delete by UUID must be refused, naming BOTH refs (so the caller sees the
+	// other critical ref, not just the one they were thinking of).
+	out, exit, err := sshExec(t, d, "root@", "ts frame --delete "+uuid)
+	if err != nil {
+		t.Fatalf("sshExec: %v", err)
+	}
+	if exit == 0 {
+		t.Fatalf("delete with 2 refs: expected non-zero exit, got 0 (out=%q)", out)
+	}
+	if !strings.Contains(out, "shared") || !strings.Contains(out, "alias") {
+		t.Errorf("delete-with-refs error did not name both refs: %q", out)
+	} else {
+		t.Logf("delete with 2 refs refused naming both (exit=%d): %q", exit, strings.TrimSpace(out))
+	}
+
+	// Drop one ref: the other still blocks the delete.
+	if out, exit, err := sshExec(t, d, "root@", "ts ref delete --force shared"); err != nil || exit != 0 {
+		t.Fatalf("ts ref delete shared: err=%v exit=%d out=%q", err, exit, out)
+	}
+	out, exit, err = sshExec(t, d, "root@", "ts frame --delete "+uuid)
+	if err != nil {
+		t.Fatalf("sshExec: %v", err)
+	}
+	if exit == 0 {
+		t.Fatalf("delete with 1 ref left: expected non-zero exit, got 0 (out=%q)", out)
+	}
+	if !strings.Contains(out, "alias") {
+		t.Errorf("delete-with-1-ref error did not name the remaining ref: %q", out)
+	} else {
+		t.Logf("delete with 1 ref left refused (exit=%d): %q", exit, strings.TrimSpace(out))
+	}
+
+	// Drop the last ref: the delete now succeeds.
+	if out, exit, err := sshExec(t, d, "root@", "ts ref delete --force alias"); err != nil || exit != 0 {
+		t.Fatalf("ts ref delete alias: err=%v exit=%d out=%q", err, exit, out)
+	}
+	out, exit, err = sshExec(t, d, "root@", "ts frame --delete "+uuid)
+	if err != nil || exit != 0 {
+		t.Fatalf("ts frame --delete after all refs removed: err=%v exit=%d out=%q", err, exit, out)
+	}
+	t.Logf("frame deleted once all refs were removed: %s", strings.TrimSpace(out))
 }
 
 // TestFrameFromSnapPreservesContent verifies that modifications made before a
@@ -230,6 +315,14 @@ func TestFrameFromNonExistentSnap(t *testing.T) {
 
 // TestDeleteRunningFrame verifies that deleting a frame that has an active SSH
 // session fails. Replaces not_e2e TestDeleteRunningFrame (fake control server).
+//
+// Under the refs-must-be-removed-first rule the frame's "running" ref has to
+// be gone before a frame delete is even considered, so the test deletes the ref
+// first (the frame is still addressable by UUID, and the long-running session
+// is unaffected), then issues the delete FROM the running frame (by UUID) so
+// the daemon's "cannot delete the currently active frame" guard is what blocks
+// it — proving the running-session rejection still holds, not just the ref
+// gate.
 func TestDeleteRunningFrame(t *testing.T) {
 	env := newTestEnv(t)
 	d := startDaemon(t, env)
@@ -257,8 +350,18 @@ func TestDeleteRunningFrame(t *testing.T) {
 	defer stdin.Close()
 	time.Sleep(500 * time.Millisecond) // let the session register
 
-	// Deleting the frame the session is attached to must fail.
-	out, exit, err := sshExec(t, d, "root@running", "ts frame --delete "+uuid)
+	// Remove the "running" ref so the frame has zero refs and the delete is
+	// not blocked by the ref gate. Run it from the running frame itself,
+	// addressed by UUID (the frame still exists; ref delete does not touch the
+	// live session). This leaves the frame reachable only by UUID.
+	if out, exit, err := sshExec(t, d, "root@"+uuid, "ts ref delete --force running"); err != nil || exit != 0 {
+		t.Fatalf("ts ref delete running: err=%v exit=%d out=%q", err, exit, out)
+	}
+
+	// Deleting the frame the session is attached to must fail. Issue it from
+	// the running frame (by UUID) so the daemon sees it as the currently active
+	// frame and refuses.
+	out, exit, err := sshExec(t, d, "root@"+uuid, "ts frame --delete "+uuid)
 	if err != nil {
 		t.Fatalf("sshExec: %v", err)
 	}
