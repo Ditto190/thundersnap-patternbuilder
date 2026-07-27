@@ -18,6 +18,89 @@ deliberately deferred. Cross them off as they land.
   subvols are by definition incomplete/un-indexed, so they are always safe to
   delete. (deepseek-v4-pro review, MEDIUM.)
 
+## `ts go` sessions / docker-image hygiene
+
+Surfaced while building the `nix` ref (see `README.nix.md` footguns #18–#20).
+The first three compound: the password-expiry hang makes an agent
+`timeout`-kill the `ts go -c`, which then wedges the frame (the fourth
+item is the isolation concern that prompted the investigation).
+
+- [ ] **Fresh docker images can ship `user` with password expiry enforced,
+      hanging every non-interactive `ts go -c` on the frame.** `debian:latest`
+      (trixie) sets `user`'s shadow entry to "password must be changed"; `ts
+      go -c` runs `su - user -c`, whose PAM prints "You are required to change
+      your password immediately" and blocks reading a password — so
+      `sudo ts go <ref> -c '...'` never returns. SSH-as-root
+      (`ssh root@<ref>@thundersnap`) is unaffected (no `su - user`).
+      `tsm.EnsureSudoers` (`tsm/stripuids.go:189`, called from
+      `cmd/thundersnapd/rootfs.go:282`) already writes a NOPASSWD sudoers
+      drop-in for `user` at frame creation; add a sibling that also makes
+      `user` non-interactively loginable — clear shadow password ageing
+      (`chage -d today -m 0 -M 99999 -I -1 -E -1 user && passwd -d user`) — at
+      least when `/etc/shadow` shows expiry. Mind the existing skip:
+      `EnsureSudoers` returns nil when `/etc/sudoers.d` doesn't exist (no sudo
+      installed, e.g. alpine), so the hygiene pass must either run after sudo
+      is installed or be done over SSH in the runbook. (README.nix.md #18.)
+
+- [ ] **`ts go -c` never sends a stdin EOF, so a stdin-reading child blocks
+      forever.** `runVsockSession` (`cmd/ts/main.go`) skips stdin forwarding
+      for `-c` ("Skip stdin forwarding when running a command") but never
+      sends the empty `FrameStdin` that `servePipe` (`vshdsession/vshdsession.go`)
+      treats as the EOF marker. So the child's stdin pipe stays open and
+      unwritten for the whole session. A child that reads stdin — e.g.
+      `su - user`'s PAM password prompt from the item above — blocks on that
+      read indefinitely instead of getting EOF and erroring out. This is the
+      *mechanism* of the password-expiry hang (and would hang any `ts go -c
+      'cat'`-style command too). Fix: for `-c`, send an empty `FrameStdin`
+      (EOF) right after the session starts, mirroring `ssh -T cmd` which
+      closes stdin when there's no input to forward. (The non-`-c` path
+      already gets EOF via `os.Stdin.Read` in its stdin-forward goroutine;
+      `-c` never enters that goroutine.)
+
+- [ ] **Killing a `ts go -c` mid-session wedges the frame (stale session
+      count, no reap, no recovery CLI).** If a `ts go <ref> -c '...'`
+      frontend is killed (agent `timeout`, SIGKILL) while the session runs,
+      `ts frames` can keep a non-`stopped` session count for that frame with
+      no live `session-serve` process to reap it; the frame then refuses all
+      new `ts go -c` sessions (they hang on attach). `servePipe` does
+      SIGHUP-then-SIGKILL the child when its *reader* errors
+      (`killChildOnDisconnect`), but a killed *frontend* doesn't promptly
+      close the server-side connection (the daemon's proxy can keep
+      session-serve alive), so the daemon's session bookkeeping never
+      decrements. There is no `ts frame --stop <ref>` / `ts session kill` CLI
+      to force-clear it. (`ts frame -d` is fixed in source — the server
+      accepts UUID or `frame_name`, `cmd/thundersnapd/main.go:2567` — so a
+      wedged frame *can* be deleted once the running daemon is current; my
+      failure was a stale PID-1 daemon predating that fix, not a regression.
+      But deletion is a sledgehammer that loses the frame.) Fix: the daemon
+      should reap sessions whose frontend has gone (watch the proxy
+      connection / the session-serve reader EOF) and decrement the count; and
+      add `ts frame --stop` / `ts session kill` for a manual unwedge without
+      destroying the frame. Workaround today: abandon the frame and rebuild
+      from the snap (`ts frame --ref <new> <snap>:nil:nil`). (README.nix.md
+      #19; compounds with the two items above — the password-expiry +
+      stdin-EOF hang is what prompts the kill.)
+
+- [ ] **`ts go -c` tty isolation: `Setsid` the pipe-mode child so it can
+      never reach a controlling tty (ssh-`-T` parity).** The caller's tty is
+      *not* inherited as stdio: `ts go -c` sends `ptyFlag="0"`
+      (`cmd/ts/main.go`, `isTTY = term.IsTerminal(...) && len(cmdArgs)==0`)
+      and `servePipe` sets the child's stdin/stdout/stderr to the vshdproto
+      pipe, not the caller's tty — so that part is already ssh-like. But
+      `servePipe` (`vshdsession/vshdsession.go`) does **not** `Setsid` the
+      child, unlike `servePTY` (which via `pty.Start` runs the child in a new
+      session with the fresh pty as controlling tty). So the pipe-mode child
+      shares `session-serve`'s session and could `open("/dev/tty")` to reach a
+      controlling terminal if `session-serve` had one. In current launch
+      paths `session-serve` has no controlling tty (vshd is a daemon), so
+      `/dev/tty` opens fail — but that's implicit, not enforced. Desired:
+      ssh-like isolation, where the pipe-mode child runs in its own session
+      with no controlling tty (exactly what `ssh -T` does). Fix: set
+      `cmd.SysProcAttr{Setsid: true}` (no Ctty) in `servePipe`, and add a
+      regression test (`ts go <ref> -c '...'` asserting the child has no
+      controlling tty and its fd 0/1/2 are not the caller's tty). (Surfaced
+      building the nix ref; related to README.nix.md #18.)
+
 ## Test coverage gaps (real-e2e)
 
 - [ ] **Mesh `download-snap` between two daemons has no real-e2e test.** The
