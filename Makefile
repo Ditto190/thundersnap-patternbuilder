@@ -27,11 +27,27 @@ BIN ?= ./bin
 
 all: build
 
-# Run all tests (requires CGO_ENABLED=0 for cmd/ts tests).
+# Run all unit tests (requires CGO_ENABLED=0 for cmd/ts tests).
+#
+# Two timeouts, layered:
+#   - go test -timeout 30s: PER-PACKAGE soft timeout. go test compiles each
+#     package into its own test binary and runs them in turn; -timeout caps
+#     each binary's run, so a 5s test that takes 29s counts as a pass but one
+#     that hits 30s panics (a should-be-fast test running long is caught).
+#     The build (go test -c, cache misses, module downloads) is NOT counted
+#     against this -- only the test run.
+#   - external `timeout -s KILL 60s`: GLOBAL hard safety net. go test's
+#     -timeout fires a panic on the test goroutine, which a goroutine blocked
+#     in a syscall (e.g. a test hung on a socket read) won't receive until the
+#     syscall returns -- so a truly hung test may not die from -timeout alone.
+#     The external SIGKILL guarantees the whole run ends. 60s is generous:
+#     unit tests are sub-second (for contrast the e2e suite boots real KVM VMs
+#     in ~0.1s and whole tests finish in seconds), so hitting either timeout
+#     almost always means a real hang/bug, not a slow test.
+#
 # If the tests pass, also verify all Go files are gofmt-formatted; fail if not.
-# Hard timeout of 60s to prevent hangs.
 test:
-	CGO_ENABLED=0 timeout 60s go test ./...
+	CGO_ENABLED=0 timeout -s KILL 60s go test -timeout 30s ./...
 	@echo "checking gofmt..."
 	@unformatted=$$(gofmt -l $$(find . -name '*.go' -not -path './.tmp-e2e/*' -not -path './vendor/*' 2>/dev/null)); \
 	if [ -n "$$unformatted" ]; then \
@@ -42,20 +58,27 @@ test:
 	fi
 	@echo "gofmt OK"
 
-# Run e2e tests (requires root and btrfs)
+# Run e2e tests (requires root and btrfs).
 # These are true end-to-end tests that start a real thundersnapd and SSH into it.
-# Compiles the test binary and dependencies as the current user, then runs with sudo.
-# TMPDIR must be on btrfs (not /tmp which is typically tmpfs).
-# -test.timeout is intentionally aggressive (well under Go's 10m default): these
-# tests are all fast, so a hang almost always means a real bug, not a slow test.
-# E2E_ARGS can be used to pass extra args (e.g., E2E_ARGS="-run TestFoo").
-# Hard timeout of 120s enforced at Makefile level to prevent long hangs.
+# Compiles the test binary and dependencies as the current user (untimed), then
+# runs with sudo. TMPDIR must be on btrfs (not /tmp which is typically tmpfs).
+#
+# Timeouts are extremely generous relative to reality: the tests boot real KVM
+# VMs in ~0.1s and each test finishes in a few seconds, so the 2m go-test
+# -test.timeout and the 120s Makefile-level hard cap both leave enormous
+# headroom — hitting either almost always means a real hang/bug, not a slow
+# test. E2E_ARGS can be used to pass extra args (e.g., E2E_ARGS="-run TestFoo").
+#
+# test-cleanup.sh reclaims leftover btrfs subvols and sets .tmp-e2e to 0700
+# root before the run (clean slate) and after a SUCCESSFUL run (reclaim
+# orphans). On failure the cleanup is skipped so orphans remain for debugging.
 E2E_TMPDIR ?= $(CURDIR)/.tmp-e2e
 E2E_TEST_TIMEOUT ?= 2m
 E2E_ARGS ?=
 NOT_E2E_TEST_TIMEOUT ?= 2m
 e2e: ts vshd thundersnapd
 	@mkdir -p $(E2E_TMPDIR)
+	@./test-cleanup.sh $(E2E_TMPDIR)
 	CGO_ENABLED=0 go test -tags e2e -c -o $(BIN)/e2e.test ./e2e
 	sudo -E timeout 120s env \
 		TMPDIR="$(E2E_TMPDIR)" \
@@ -63,12 +86,18 @@ e2e: ts vshd thundersnapd
 		VSHD_BINARY="$(CURDIR)/$(BIN)/vshd" \
 		THUNDERSNAPD_BINARY="$(CURDIR)/$(BIN)/thundersnapd" \
 		$(BIN)/e2e.test -test.v -test.failfast -test.timeout=$(E2E_TEST_TIMEOUT) $(E2E_ARGS)
+	@./test-cleanup.sh $(E2E_TMPDIR)
 
-# Run legacy "e2e" tests (not actually e2e - see not-e2e-enough.md)
-# These tests exercise individual components but don't go through the SSH front door.
-# Hard timeout of 240s enforced at Makefile level to prevent long hangs.
+# Run legacy "e2e" tests (not actually e2e - see not-e2e-enough.md).
+# These tests exercise individual components but don't go through the SSH front
+# door. Same timeout philosophy as `e2e`: the 2m go-test -test.timeout and 240s
+# Makefile-level hard cap are both extremely generous (the tests, including the
+# ones that boot KVM VMs, finish in seconds); a timeout means a real hang/bug.
+# test-cleanup.sh runs before (clean slate) and after a successful run; on
+# failure it is skipped so orphans remain for debugging.
 not_e2e: ts vshd thundersnapd
 	@mkdir -p $(E2E_TMPDIR)
+	@./test-cleanup.sh $(E2E_TMPDIR)
 	CGO_ENABLED=0 go test -tags e2e -c -o $(BIN)/not_e2e.test ./not_e2e
 	sudo -E timeout 240s env \
 		TMPDIR="$(E2E_TMPDIR)" \
@@ -76,6 +105,7 @@ not_e2e: ts vshd thundersnapd
 		VSHD_BINARY="$(CURDIR)/$(BIN)/vshd" \
 		THUNDERSNAPD_BINARY="$(CURDIR)/$(BIN)/thundersnapd" \
 		$(BIN)/not_e2e.test -test.v -test.failfast -test.timeout=$(NOT_E2E_TEST_TIMEOUT) $(E2E_ARGS)
+	@./test-cleanup.sh $(E2E_TMPDIR)
 
 # Build all binaries for local development
 binaries: ts vsh vshd thundersnapd tsm
