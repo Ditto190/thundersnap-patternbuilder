@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 
 	"github.com/tailscale/thundersnap/frames"
 	"github.com/tailscale/thundersnap/tsm"
@@ -77,6 +78,24 @@ func ensureRootFS(rootFS, baseUserFS string) error {
 	return ensureFrameFS(rootFS, &frames.Frame{Isolation: "container"})
 }
 
+// validSnapID reports whether id is safe to use as a snap-id path component
+// joined beneath *flagSnapsDir. A snap id is a content-addressed hash (or
+// "nil"/empty for a blank component); it must never contain a path separator
+// or be a parent-directory reference, or filepath.Join would escape the snaps
+// directory. Empty ("nil" components are emptied by parseFrameSpec) is valid.
+func validSnapID(id string) bool {
+	if id == "" {
+		return true
+	}
+	if strings.ContainsAny(id, "/\\") {
+		return false
+	}
+	if id == "." || id == ".." {
+		return false
+	}
+	return true
+}
+
 // ensureFrameFS creates a three-component frame from the given frame metadata.
 // It creates:
 // - rootFS: the rootfs subvolume (the frame directory itself)
@@ -86,6 +105,20 @@ func ensureRootFS(rootFS, baseUserFS string) error {
 // If meta.Rootfs is empty (nil:nil:nil frame spec), creates an empty rootfs
 // with minimal directory structure needed for the container to function.
 func ensureFrameFS(rootFS string, meta *frames.Frame) error {
+	// Snap IDs become filesystem paths via filepath.Join(*flagSnapsDir, id)
+	// below. They must be single, non-escaping path components: a snap id
+	// containing ".." or "/" (or an absolute path) could traverse out of the
+	// snaps directory — e.g. "../fs/<user>/<uuid>" resolves to another user's
+	// frame subvolume and would let a caller build a frame from a different
+	// tenant's data. Reject such ids before they reach the filesystem. (Ref
+	// names are validated by refs.ValidateName; snap ids in frame specs were
+	// not, so this closes the analogous hole.)
+	for _, id := range []string{meta.Rootfs, meta.Home, meta.Work} {
+		if !validSnapID(id) {
+			return fmt.Errorf("invalid snap id %q: must be a single path component with no '/' or '..'", id)
+		}
+	}
+
 	// Ensure the parent directory exists
 	parentDir := filepath.Dir(rootFS)
 	if err := os.MkdirAll(parentDir, 0755); err != nil {

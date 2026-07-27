@@ -14,6 +14,7 @@
 package e2e
 
 import (
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -72,6 +73,16 @@ func TestSnapFidelityPreservesSpecialFiles(t *testing.T) {
 	if out, exit, err := sshExec(t, d, "root@fid", "ln -s /work/orig.txt /work/link.txt"); err != nil || exit != 0 {
 		t.Fatalf("create symlink: err=%v exit=%d out=%q", err, exit, out)
 	}
+	// Hardlink of a SETUID file: /work/suidbin_link shares the inode of
+	// /work/suidbin (which also carries the setuid bit). This is the combined
+	// invariant from not_e2e TestHardlinkSetuidBinaryInSnapshot: after a
+	// snap+fork both paths must remain hardlinked (same inode, nlink >= 2) AND
+	// both must retain the setuid bit — a snapshot that strips special mode
+	// bits on hardlinked inodes, or breaks the link, would fail here. The
+	// single-file setuid and hardlink checks above do not exercise this combo.
+	if out, exit, err := sshExec(t, d, "root@fid", "echo '#!/bin/sh' > /work/suidbin && chmod 4755 /work/suidbin && ln /work/suidbin /work/suidbin_link"); err != nil || exit != 0 {
+		t.Fatalf("create setuid hardlink: err=%v exit=%d out=%q", err, exit, out)
+	}
 
 	triplet := tsSnapWait(t, d, "fid")
 	if out, exit, err := sshExec(t, d, "root@fid", "ts frame --ref=fidchild "+triplet); err != nil || exit != 0 {
@@ -106,6 +117,27 @@ func TestSnapFidelityPreservesSpecialFiles(t *testing.T) {
 		t.Errorf("hardlink broken: orig inode=%q hard inode=%q (want equal)", inoOrig, inoHard)
 	} else {
 		t.Logf("hardlink preserved: inode %s", inoOrig)
+	}
+
+	// Hardlink of a setuid file preserved: same inode, nlink >= 2, and BOTH
+	// paths retain the setuid bit. Replaces not_e2e
+	// TestHardlinkSetuidBinaryInSnapshot and the nlink>=2 check from
+	// TestHardlinkHandlingBasic, which the single-file checks above do not.
+	inoSuid := statField(t, d, "fidchild", "%i", "/work/suidbin")
+	inoSuidLink := statField(t, d, "fidchild", "%i", "/work/suidbin_link")
+	if inoSuid == "" || inoSuid != inoSuidLink {
+		t.Errorf("setuid hardlink broken: suidbin inode=%q link inode=%q (want equal)", inoSuid, inoSuidLink)
+	}
+	nlinkSuid := statField(t, d, "fidchild", "%h", "/work/suidbin")
+	if n, err := strconv.Atoi(nlinkSuid); err != nil || n < 2 {
+		t.Errorf("setuid hardlink nlink=%q, want >= 2 (err=%v)", nlinkSuid, err)
+	} else {
+		t.Logf("setuid hardlink nlink=%d", n)
+	}
+	if out, exit, _ := sshExec(t, d, "root@fidchild", "test -u /work/suidbin && test -u /work/suidbin_link && echo SUIDS"); exit != 0 || !strings.Contains(out, "SUIDS") {
+		t.Errorf("setuid bit not preserved on both hardlinked copies (out=%q exit=%d)", out, exit)
+	} else {
+		t.Logf("setuid bit preserved on both hardlinked copies")
 	}
 
 	// Symlink preserved: still a symlink reaching the target.

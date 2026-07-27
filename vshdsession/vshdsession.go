@@ -79,6 +79,8 @@ func servePTY(conn io.Writer, reader io.Reader, cmd *exec.Cmd, postStart func(pi
 			}
 		case vshdproto.FrameStdin:
 			leftoverStdin = p
+		default:
+			logf.logf("servePTY: unexpected first frame type %d, ignoring", t)
 		}
 	}
 	if initSize == nil {
@@ -102,9 +104,17 @@ func servePTY(conn io.Writer, reader io.Reader, cmd *exec.Cmd, postStart func(pi
 	logf.logf("pty session started with PID %d (size %dx%d)", cmd.Process.Pid, initSize.Rows, initSize.Cols)
 
 	// Replay any stdin that arrived as the first frame (when the caller did
-	// not send a winsize first) before the goroutine drains the rest.
-	if len(leftoverStdin) > 0 {
-		ptmx.Write(leftoverStdin)
+	// not send a winsize first) before the goroutine drains the rest. Use a
+	// write loop: io.Writer may short-write, and the goroutine below only reads
+	// SUBSEQUENT frames, so bytes dropped by a short write here would be
+	// silently lost.
+	for len(leftoverStdin) > 0 {
+		n, err := ptmx.Write(leftoverStdin)
+		if err != nil {
+			logf.logf("servePTY: replaying first stdin frame: %v", err)
+			break
+		}
+		leftoverStdin = leftoverStdin[n:]
 	}
 
 	// Client -> child: decode TLV frames, route stdin to the pty and winsize to

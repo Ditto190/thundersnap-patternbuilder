@@ -82,3 +82,47 @@ func TestErrorSnapSymlinkLoop(t *testing.T) {
 		t.Fatalf("snap of a symlink loop hung past 30s (indexer loop detection broken)")
 	}
 }
+
+// TestErrorSSHUnknownUser verifies that SSHing to a real frame as a user that
+// does not exist in the frame's /etc/passwd fails, rather than silently
+// dropping to a root shell. vshd runs `su - <sshuser>` via ts's built-in su;// before runAsSu rejected unknown users, a bogus username fell back to uid 0 —
+// an isolation bypass (any nonexistent username @ a frame got root). This is
+// the security regression test for that fix.
+func TestErrorSSHUnknownUser(t *testing.T) {
+	env := newTestEnv(t)
+	d := startDaemon(t, env)
+	createFrameViaDaemon(t, d, "userhost")
+
+	// SSH as a user that does not exist in the frame's /etc/passwd. The session
+	// must fail; a successful exit 0 here means the unknown user got a shell
+	// (as root, per the old fallback) — the bypass.
+	out, exit, err := sshExec(t, d, "nosuchuser@userhost", "id -u")
+	if err == nil && exit == 0 {
+		t.Errorf("SSH as unknown user: expected failure, got exit 0 (out=%q) — bogus username got a shell (root-shell privilege bypass)", out)
+	} else {
+		t.Logf("SSH as unknown user correctly failed (exit=%d): %q", exit, strings.TrimSpace(out))
+	}
+}
+
+// TestErrorInvalidFrameSpec verifies that a frame spec whose rootfs component
+// escapes the snaps directory (e.g. "../../etc/passwd") is rejected, not
+// resolved via filepath.Join into an arbitrary path. Restores the path-
+// traversal negative case from not_e2e TestErrorInvalidSnapshotFormat, which
+// the fake control server checked but the real daemon did not (a spec like
+// "../fs/<user>/<uuid>::" would have resolved to another tenant's frame
+// subvolume). The daemon now validates snap-id components.
+func TestErrorInvalidFrameSpec(t *testing.T) {
+	env := newTestEnv(t)
+	d := startDaemon(t, env)
+	createFrameViaDaemon(t, d, "spechost")
+
+	out, exit, err := sshExec(t, d, "root@spechost", "ts frame '../../etc/passwd::'")
+	if err != nil {
+		t.Fatalf("sshExec: %v", err)
+	}
+	if exit == 0 {
+		t.Errorf("ts frame with path-traversal spec: expected non-zero exit, got 0 (out=%q) — traversal was not rejected", out)
+	} else {
+		t.Logf("path-traversal frame spec correctly rejected (exit=%d): %q", exit, strings.TrimSpace(out))
+	}
+}

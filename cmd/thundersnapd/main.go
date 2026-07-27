@@ -2610,9 +2610,11 @@ func (c *controlServer) handleDeleteFrame(w http.ResponseWriter, r *http.Request
 
 	// Resolve the target frame to a UUID. `ts frame --delete <uuid>` addresses
 	// the frame directly; a FrameName is a ref resolved through the user's ref
-	// store. refName tracks which ref (if any) to drop after the frame is gone.
+	// store. refNames tracks every ref pointing at the frame so they can all be
+	// dropped after the frame is gone — a frame may have several refs (aliases)
+	// and leaving any behind would dangle.
 	var frameID frameid.ID
-	var refName string
+	var refNames []string
 	if req.UUID != "" {
 		id, err := frameid.Parse(req.UUID)
 		if err != nil {
@@ -2623,16 +2625,16 @@ func (c *controlServer) handleDeleteFrame(w http.ResponseWriter, r *http.Request
 			return
 		}
 		frameID = id
-		// Best-effort: find a ref pointing at this UUID so its config can be
-		// cleaned up alongside the frame.
-		names, err := refStore.List()
-		if err == nil {
+		// Best-effort: find every ref pointing at this UUID so their config
+		// can be cleaned up alongside the frame.
+		if names, err := refStore.List(); err == nil {
 			for _, n := range names {
 				if r, gerr := refStore.Get(n); gerr == nil && r.UUID == frameID {
-					refName = n
-					break
+					refNames = append(refNames, n)
 				}
 			}
+		} else {
+			log.Printf("Warning: listing refs for frame %s: %v", frameID, err)
 		}
 	} else {
 		ref, err := refStore.Get(req.FrameName)
@@ -2651,7 +2653,7 @@ func (c *controlServer) handleDeleteFrame(w http.ResponseWriter, r *http.Request
 			return
 		}
 		frameID = ref.UUID
-		refName = req.FrameName
+		refNames = []string{req.FrameName}
 	}
 	framePath := framePathForUserUUID(user, frameID)
 
@@ -2696,18 +2698,18 @@ func (c *controlServer) handleDeleteFrame(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	// Delete the frame metadata sidecar via the store, then drop any ref that
-	// pointed at it (best-effort: a UUID-based delete may have no ref).
+	// Delete the frame metadata sidecar via the store, then drop every ref that
+	// pointed at it (best-effort: a UUID-based delete may have no ref, or several).
 	if err := frameStore.Delete(frameID); err != nil && err != frames.ErrFrameNotFound {
 		log.Printf("Warning: delete frame metadata for %s: %v", frameID, err)
 	}
-	if refName != "" {
-		if err := refStore.Delete(refName); err != nil && err != refs.ErrRefNotFound {
-			log.Printf("Warning: delete ref %s: %v", refName, err)
+	for _, name := range refNames {
+		if err := refStore.Delete(name); err != nil && err != refs.ErrRefNotFound {
+			log.Printf("Warning: delete ref %s: %v", name, err)
 		}
 	}
 
-	log.Printf("Deleted frame %s (ref %q, user %s)", framePath, refName, user)
+	log.Printf("Deleted frame %s (refs %v, user %s)", framePath, refNames, user)
 
 	writeJSON(w, http.StatusOK, DeleteFrameResponse{
 		Status: "ok",
@@ -2986,6 +2988,22 @@ func (c *controlServer) handleCreateWithUUID(w http.ResponseWriter, req CreateRe
 
 	// Parse the snapshot spec
 	rootfsSpec, homeSpec, workSpec := parseFrameSpec(req.SnapshotSpec)
+
+	// Reject snap-id components that would escape the snaps directory via
+	// filepath.Join (e.g. "..", "/", or an absolute path). Without this a spec
+	// like "../fs/<user>/<uuid>::" resolves to another tenant's frame subvolume
+	// and would build a frame from their data. (ensureFrameFS re-checks this as
+	// a defense-in-depth chokepoint, but validating here returns a clean 400
+	// before the frame sidecar is written.)
+	for _, id := range []string{rootfsSpec, homeSpec, workSpec} {
+		if !validSnapID(id) {
+			writeJSON(w, http.StatusBadRequest, CreateResponse{
+				Status:  "error",
+				Message: fmt.Sprintf("invalid snap id %q: must be a single path component with no '/' or '..'", id),
+			})
+			return
+		}
+	}
 
 	// Check if this is a blank container request
 	isBlank, isExplicitNil := hasBlankRootfs(req.SnapshotSpec)

@@ -6,8 +6,8 @@ experiment. Over time we need to improve the quality of all the components.
 
 # Claude Code Project Notes
 
-- Always run "make test" after making changes. "make test" also enforces gofmt;
-  run "gofmt -w ." to fix formatting before committing.
+- Always run "make test" and then "make e2e" and then "make not_e2e" after making changes.
+  "make test" also enforces gofmt; run "gofmt -w ." to fix formatting before committing.
 - To build: "make binaries" (puts them in bin/) or "make ts" (just the ts binary)
 - e2e tests MUST NEVER SKIP. "make e2e" must either fully pass every validation
   or fail. Never add t.Skip/t.Skipf/t.SkipNow to e2e tests; if a precondition
@@ -24,24 +24,10 @@ experiment. Over time we need to improve the quality of all the components.
   - `busybox-static` (NOT `busybox` — the dynamic one can't exec inside
     nil:nil:nil frames which have no /lib64; `apt-get install busybox-static`)
   - `virtiofsd` and `passt` for VM tests (`apt-get install virtiofsd passt`)
-  - `/dev/kvm` for VM tests (not available inside containers without KVM
-    passthrough; the outer host must propagate it)
+  - `/dev/kvm` for VM tests (check for this! you almost certainly have it!)
   - VM binaries (`cloud-hypervisor`, `vmlinux`) in `vm/` or set
     `THUNDERSNAP_VM_DIR`
-- Running e2e tests inside a thundersnap container (nested development):
-  - Works, but requires the btrfs+setns fixes in `cmd/ts/` (see
-    `docs/nested-btrfs-setns.md` for the full explanation)
-  - The cgroup warnings (`failed to create parent cgroup`) are expected and
-    harmless — cgroup setup is best-effort and `/sys/fs/cgroup` is read-only
-    inside containers
-  - VM tests need `/dev/kvm` propagated into the container
 - This project workspace may be using the 'jj' tool instead of git. Always
-  check for jj first. If using jj, when making a fix, always `jj describe` it
-  when done and then `jj new` so you don't accidentally mix changes
-  together. Be careful that `jj log` shows not just this branch, but other
-  branches mixed into the hierarchy!
+  check for jj first.
 - Before assuming you can't run a command for lack of privileges, try `sudo`
-  first. This environment has passwordless sudo (`sudo -n true` works), so
-  `make e2e` (which needs root for btrfs/container ops) and other root-only
-  tooling are available even though the shell user is non-root (UID 7575).
-  `sudo -E` preserves the environment (needed for `make e2e`).
+  first. This environment has passwordless sudo.

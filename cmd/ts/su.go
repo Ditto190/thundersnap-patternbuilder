@@ -84,8 +84,13 @@ func runAsSu(args []string) {
 	}
 
 	// Resolve the target user. We run after chroot, so "/" is the container
-	// rootfs. If the user is missing from /etc/passwd, fall back to root so a
-	// bare `su -` still works in a frame with no passwd entry.
+	// rootfs. A bare `su -` (no username) defaults to root and must keep
+	// working even in a frame with no /etc/passwd, so an absent root entry falls
+	// back to uid/gid 0. But an explicitly-named user that is NOT in /etc/passwd
+	// must NOT silently become root — that would let a caller land a root shell
+	// by naming a bogus username (e.g. vshd passing an unvalidated SSH user such
+	// as `nosuchuser@frame`). Only the implicit/explicit root target may fall
+	// back to root.
 	ui := tsm.LookupUser("/", user)
 	uid, gid := uint32(0), uint32(0)
 	home := "/root"
@@ -98,6 +103,8 @@ func runAsSu(args []string) {
 		if ui.Shell != "" {
 			shell = ui.Shell
 		}
+	} else if user != "root" {
+		fatalSu("user %q does not exist", user)
 	}
 	if shellOverride != "" {
 		shell = shellOverride
@@ -111,20 +118,19 @@ func runAsSu(args []string) {
 	// Drop privileges to the target user. We must set groups+gid before uid
 	// (once uid is non-zero we lose the ability to change gid). These calls
 	// require CAP_SETGID/CAP_SETUID, which drop-caps-and-run retains in the
-	// bounding set; we are still root here, so they succeed. Switching to root
-	// (uid 0) is a no-op setuid(0) which is also fine.
-	if gid != 0 {
-		if err := unix.Setgroups([]int{int(gid)}); err != nil {
-			fatalSu("setgroups: %v", err)
-		}
-		if err := unix.Setgid(int(gid)); err != nil {
-			fatalSu("setgid: %v", err)
-		}
+	// bounding set; we are still root here, so they succeed. Always reset the
+	// supplementary groups and gid (even when switching to root) so the new
+	// session does not inherit the caller's group list; for a root target this
+	// is setgroups([0]) + setgid(0) + setuid(0), which drops any extra groups
+	// the caller had while leaving the uid root.
+	if err := unix.Setgroups([]int{int(gid)}); err != nil {
+		fatalSu("setgroups: %v", err)
 	}
-	if uid != 0 {
-		if err := unix.Setuid(int(uid)); err != nil {
-			fatalSu("setuid: %v", err)
-		}
+	if err := unix.Setgid(int(gid)); err != nil {
+		fatalSu("setgid: %v", err)
+	}
+	if err := unix.Setuid(int(uid)); err != nil {
+		fatalSu("setuid: %v", err)
 	}
 
 	// chdir to the user's home. A missing home is NOT fatal (busybox su makes

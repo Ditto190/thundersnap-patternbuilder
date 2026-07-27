@@ -47,6 +47,41 @@ deliberately deferred. Cross them off as they land.
       `ts undo -c 'read line < /marker && echo $line'` on the forked frame and
       assert the marker is `v2` — a stronger test of the actual fork-point fix.
       (deepseek-v4-pro review, LOW.)
+- [ ] **Nested-cgroup and nested-namespace probes were dropped, not ported.**
+      `not_e2e/nested_test.go` had `TestCgroupMultiLevelSubtreeControl` (a
+      dedicated regression guard that intermediate `cgroup.subtree_control`
+      writes succeed so leaf `memory.high`/`pids.max`/`cpu.weight` work),
+      `TestNestedThundersnapCgroup`, and `TestNestedThundersnapNamespaceIsolation`
+      (`unshare --pid --fork` inside a container). The replacements cited in
+      the commit (`e2e/nested_test.go` TestNestedThundersnap, TestContainer-
+      NamespaceSetup) assert SSH connectivity and single-level isolation, not
+      multi-level cgroup controller propagation or nested namespace creation.
+      `cgroup/cgroup_test.go` has no subtree_control test either. Port these as
+      SSH-driven nested tests against a real daemon, or as package tests on the
+      cgroup manager. Needs a writable cgroup v2 hierarchy (read-only in this
+      dev container). (Both reviews, MEDIUM.)
+- [ ] **`handleWhoHas` has zero test coverage.** The deleted `not_e2e` fakes
+      reimplemented the protocol and never exercised the real handler; nothing
+      has replaced them. The mesh `download-snap` item above covers the
+      two-daemon happy path; this item is the *error* path — `ts who-has
+      <bogus-snap>` and `handleWhoHas` with an empty/nonexistent snap should
+      return a clean error/empty result, not crash. Add a handler-level test
+      (httptest + a controlled `globalMeshState`) until the mesh peer-config
+      seam enables a two-daemon e2e test. (Both reviews, MEDIUM.)
+- [ ] **`list-snaps` robustness against a partially-corrupt `snaps/` dir is
+      untested.** The deleted `TestCorruptedSnapshotMetadata` planted a
+      non-subvol entry among the snapshots and verified `ts snaps` skipped it
+      and continued. No replacement asserts this; a stray file in `snaps/`
+      could make listing error out. Add an e2e/package test that drops a plain
+      file in the snaps dir and checks `ts snaps` still lists the real snaps.
+      (deepseek-v4-pro review, MEDIUM.)
+- [ ] **Setuid binaries are only checked for the *bit*, not that they execute.**
+      `e2e/fidelity_test.go` asserts `test -u` (the setuid bit is set) after a
+      snap+fork, but the deleted `TestSetuidBinaryExecution` verified the
+      setuid bit is *functional* (the kernel honors it). A minimal-rootfs
+      execution-as-non-root check is awkward (busybox + a setuid wrapper); at
+      minimum add `test -x` and ideally a non-root run that observes the euid
+      change. (deepseek-v4-pro review, MEDIUM.)
 
 ## not_e2e teardown (remaining)
 
@@ -66,8 +101,7 @@ to port onto the daemon-driven `vm/` SSH harness:
       the deep tests should go through `vm/` sessions against a real
       `thundersnapd` instead of hand-spawning cloud-hypervisor. Per
       not-e2e-enough.md W5, keep panic-recovery / insufficient-memory as
-      targeted negatives that still go through the daemon. Requires a host
-      with /dev/kvm passthrough to write and verify.
+      targeted negatives that still go through the daemon.
 
 ## SFTP / scp
 
