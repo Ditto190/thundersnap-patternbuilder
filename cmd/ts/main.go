@@ -40,28 +40,13 @@ import (
 )
 
 var sockPath = getopt.StringLong("sock", 0, "/id/thunder.sock", "path to control socket")
-var help = getopt.BoolLong("help", 'h', "show help")
+var help = getopt.BoolLong("help", 'h', "show this help and exit")
 
+// usage prints the main help to stderr and exits 1. It is the handler for
+// malformed/missing top-level arguments; an explicit --help goes through
+// printMainHelp on stdout with exit 0 instead.
 func usage() {
-	getopt.PrintUsage(os.Stderr)
-	fmt.Fprintln(os.Stderr, "")
-	fmt.Fprintln(os.Stderr, "commands:")
-	fmt.Fprintln(os.Stderr, "  ping           send a ping to thundersnapd")
-	fmt.Fprintln(os.Stderr, "  snap           create a snapshot of the current container/VM")
-	fmt.Fprintln(os.Stderr, "  snaps          list all snapshots with sizes")
-	fmt.Fprintln(os.Stderr, "  frame          resolve or create frames")
-	fmt.Fprintln(os.Stderr, "  frames         list all frames with status")
-	fmt.Fprintln(os.Stderr, "  go             enter a frame (create/resolve + start session)")
-	fmt.Fprintln(os.Stderr, "  undo           jump backward in time by one snap")
-	fmt.Fprintln(os.Stderr, "  ref            manage refs (named pointers to frames)")
-	fmt.Fprintln(os.Stderr, "  refs           list all refs")
-	fmt.Fprintln(os.Stderr, "  reflog         show ref history")
-	fmt.Fprintln(os.Stderr, "  log            show frame snapshot history")
-	fmt.Fprintln(os.Stderr, "  taint          add a taint to the current frame")
-	fmt.Fprintln(os.Stderr, "  autorun        configure a program to run automatically")
-	fmt.Fprintln(os.Stderr, "  download-docker download a Docker image as a snap")
-	fmt.Fprintln(os.Stderr, "  who-has        query peers to find which ones have a snap")
-	fmt.Fprintln(os.Stderr, "  download-snap  download a snap from mesh peers")
+	printMainHelp(os.Stderr)
 	os.Exit(1)
 }
 
@@ -107,7 +92,11 @@ func main() {
 	}
 	args := getopt.Args()
 
-	if *help || len(args) == 0 {
+	if *help {
+		printMainHelp(os.Stdout)
+		os.Exit(0)
+	}
+	if len(args) == 0 {
 		usage()
 	}
 
@@ -193,9 +182,13 @@ func main() {
 }
 
 func cmdPing(args []string) {
-	opts := getopt.New()
-	opts.SetProgram("ts ping")
-	opts.Parse(args)
+	opts, helpFlag := newCmdOpts("ping", "")
+	parseCmd(opts, "ping", args)
+
+	if *helpFlag {
+		printCommandHelp(os.Stdout, "ping", opts)
+		os.Exit(0)
+	}
 
 	if opts.NArgs() > 0 {
 		fmt.Fprintln(os.Stderr, "error: ping takes no arguments")
@@ -308,12 +301,15 @@ type meshPeer struct {
 }
 
 func cmdSnap(args []string) {
-	opts := getopt.New()
-	opts.SetProgram("ts snap")
+	opts, helpFlag := newCmdOpts("snap", "[<path>]")
 	deleteFlag := opts.BoolLong("delete", 'd', "delete a snapshot")
 	waitFlag := opts.BoolLong("wait", 'w', "wait for indexing to complete and print the snap ID (default: capture and return at once, indexing in the background)")
-	// Parse expects first element to be program name (like os.Args)
-	opts.Parse(append([]string{"ts snap"}, args...))
+	parseCmd(opts, "snap", args)
+
+	if *helpFlag {
+		printCommandHelp(os.Stdout, "snap", opts)
+		os.Exit(0)
+	}
 
 	if *deleteFlag {
 		if opts.NArgs() != 1 {
@@ -399,10 +395,13 @@ func resolveSnapSubdir(arg string) (string, error) {
 }
 
 func cmdSnaps(args []string) {
-	opts := getopt.New()
-	opts.SetProgram("ts snaps")
-	// Parse expects first element to be program name (like os.Args)
-	opts.Parse(append([]string{"ts snaps"}, args...))
+	opts, helpFlag := newCmdOpts("snaps", "")
+	parseCmd(opts, "snaps", args)
+
+	if *helpFlag {
+		printCommandHelp(os.Stdout, "snaps", opts)
+		os.Exit(0)
+	}
 
 	if opts.NArgs() > 0 {
 		fmt.Fprintln(os.Stderr, "error: snaps takes no arguments")
@@ -579,14 +578,16 @@ func doListSnaps(sockPath string) error {
 }
 
 func cmdFrame(args []string) {
-	opts := getopt.New()
-	opts.SetProgram("ts frame")
-	opts.SetParameters("[<spec>]")
+	opts, helpFlag := newCmdOpts("frame", "[<spec>]")
 	isolation := opts.StringLong("isolation", 0, "", "isolation level: vm, container, none")
 	refName := opts.StringLong("ref", 0, "", "create a ref with this name pointing at the new frame")
 	deleteFlag := opts.BoolLong("delete", 'd', "delete a frame by UUID")
-	// Parse expects first element to be program name (like os.Args)
-	opts.Parse(append([]string{"ts frame"}, args...))
+	parseCmd(opts, "frame", args)
+
+	if *helpFlag {
+		printCommandHelp(os.Stdout, "frame", opts)
+		os.Exit(0)
+	}
 
 	if *deleteFlag {
 		if opts.NArgs() != 1 {
@@ -721,10 +722,13 @@ func frameUsage() {
 }
 
 func cmdFrames(args []string) {
-	opts := getopt.New()
-	opts.SetProgram("ts frames")
-	// Parse expects first element to be program name (like os.Args)
-	opts.Parse(append([]string{"ts frames"}, args...))
+	opts, helpFlag := newCmdOpts("frames", "")
+	parseCmd(opts, "frames", args)
+
+	if *helpFlag {
+		printCommandHelp(os.Stdout, "frames", opts)
+		os.Exit(0)
+	}
 
 	if opts.NArgs() > 0 {
 		fmt.Fprintln(os.Stderr, "error: frames takes no arguments")
@@ -1071,11 +1075,13 @@ func doListFrames(sockPath string) error {
 }
 
 func cmdWhoHas(args []string) {
-	opts := getopt.New()
-	opts.SetProgram("ts who-has")
-	opts.SetParameters("<snapshot-id>")
-	// Parse expects first element to be program name (like os.Args)
-	opts.Parse(append([]string{"ts who-has"}, args...))
+	opts, helpFlag := newCmdOpts("who-has", "<snapshot-id>")
+	parseCmd(opts, "who-has", args)
+
+	if *helpFlag {
+		printCommandHelp(os.Stdout, "who-has", opts)
+		os.Exit(0)
+	}
 
 	if opts.NArgs() != 1 {
 		fmt.Fprintln(os.Stderr, "error: who-has requires exactly one argument: snapshot-id")
@@ -1180,11 +1186,13 @@ func doWhoHas(sockPath, snapshotID string) ([]tsm.PeerResult, error) {
 }
 
 func cmdTaint(args []string) {
-	opts := getopt.New()
-	opts.SetProgram("ts taint")
-	opts.SetParameters("[<taint-name>]")
-	// Parse expects first element to be program name (like os.Args)
-	opts.Parse(append([]string{"ts taint"}, args...))
+	opts, helpFlag := newCmdOpts("taint", "[<taint-name>]")
+	parseCmd(opts, "taint", args)
+
+	if *helpFlag {
+		printCommandHelp(os.Stdout, "taint", opts)
+		os.Exit(0)
+	}
 
 	// No argument: list the current frame's taints.
 	if opts.NArgs() == 0 {
@@ -1270,11 +1278,13 @@ func doListTaints(sockPath string) error {
 }
 
 func cmdDownloadDocker(args []string) {
-	opts := getopt.New()
-	opts.SetProgram("ts download-docker")
-	opts.SetParameters("<image-reference>")
-	// Parse expects first element to be program name (like os.Args)
-	opts.Parse(append([]string{"ts download-docker"}, args...))
+	opts, helpFlag := newCmdOpts("download-docker", "<image-reference>")
+	parseCmd(opts, "download-docker", args)
+
+	if *helpFlag {
+		printCommandHelp(os.Stdout, "download-docker", opts)
+		os.Exit(0)
+	}
 
 	if opts.NArgs() != 1 {
 		fmt.Fprintln(os.Stderr, "error: download-docker requires exactly one argument: image-reference")
@@ -1384,11 +1394,13 @@ func doDownloadDocker(sockPath, imageRef string) error {
 }
 
 func cmdDownloadSnap(args []string) {
-	opts := getopt.New()
-	opts.SetProgram("ts download-snap")
-	opts.SetParameters("<snapshot-id>")
-	// Parse expects first element to be program name (like os.Args)
-	opts.Parse(append([]string{"ts download-snap"}, args...))
+	opts, helpFlag := newCmdOpts("download-snap", "<snapshot-id>")
+	parseCmd(opts, "download-snap", args)
+
+	if *helpFlag {
+		printCommandHelp(os.Stdout, "download-snap", opts)
+		os.Exit(0)
+	}
 
 	if opts.NArgs() != 1 {
 		fmt.Fprintln(os.Stderr, "error: download-snap requires exactly one argument: snapshot-id")
@@ -1581,13 +1593,14 @@ func findExecutable(name string) (string, error) {
 // =====================================
 
 func cmdRef(args []string) {
+	// "ts ref --help" / "ts ref -h" prints the group help to stdout (exit 0);
+	// "ts ref" with no subcommand prints it to stderr (exit 1).
+	if len(args) > 0 && (args[0] == "--help" || args[0] == "-h") {
+		printRefGroupHelp(os.Stdout)
+		os.Exit(0)
+	}
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: ts ref <subcommand> [options]")
-		fmt.Fprintln(os.Stderr, "")
-		fmt.Fprintln(os.Stderr, "subcommands:")
-		fmt.Fprintln(os.Stderr, "  create <name> <uuid>      create a new ref pointing at a frame UUID")
-		fmt.Fprintln(os.Stderr, "  move <name> <uuid> [-f]   move a ref to point at a different UUID")
-		fmt.Fprintln(os.Stderr, "  delete <name> [-f]        delete a ref")
+		printRefGroupHelp(os.Stderr)
 		os.Exit(1)
 	}
 
@@ -1603,15 +1616,19 @@ func cmdRef(args []string) {
 		cmdRefDelete(subargs)
 	default:
 		fmt.Fprintf(os.Stderr, "error: unknown ref subcommand: %s\n", subcmd)
+		fmt.Fprintln(os.Stderr, "run 'ts ref --help' for the list of ref subcommands")
 		os.Exit(1)
 	}
 }
 
 func cmdRefCreate(args []string) {
-	opts := getopt.New()
-	opts.SetProgram("ts ref create")
-	opts.SetParameters("<name> <uuid>")
-	opts.Parse(append([]string{"ts ref create"}, args...))
+	opts, helpFlag := newCmdOpts("ref create", "<name> <uuid>")
+	parseCmd(opts, "ref create", args)
+
+	if *helpFlag {
+		printCommandHelp(os.Stdout, "ref create", opts)
+		os.Exit(0)
+	}
 
 	if opts.NArgs() != 2 {
 		fmt.Fprintln(os.Stderr, "error: ref create requires name and uuid")
@@ -1630,11 +1647,14 @@ func cmdRefCreate(args []string) {
 }
 
 func cmdRefMove(args []string) {
-	opts := getopt.New()
-	opts.SetProgram("ts ref move")
-	opts.SetParameters("<name> <uuid>")
+	opts, helpFlag := newCmdOpts("ref move", "<name> <uuid>")
 	force := opts.BoolLong("force", 'f', "force move even if frame has running processes")
-	opts.Parse(append([]string{"ts ref move"}, args...))
+	parseCmd(opts, "ref move", args)
+
+	if *helpFlag {
+		printCommandHelp(os.Stdout, "ref move", opts)
+		os.Exit(0)
+	}
 
 	if opts.NArgs() != 2 {
 		fmt.Fprintln(os.Stderr, "error: ref move requires name and uuid")
@@ -1653,11 +1673,14 @@ func cmdRefMove(args []string) {
 }
 
 func cmdRefDelete(args []string) {
-	opts := getopt.New()
-	opts.SetProgram("ts ref delete")
-	opts.SetParameters("<name>")
+	opts, helpFlag := newCmdOpts("ref delete", "<name>")
 	force := opts.BoolLong("force", 'f', "force delete even if frame has running processes or id dir is non-empty")
-	opts.Parse(append([]string{"ts ref delete"}, args...))
+	parseCmd(opts, "ref delete", args)
+
+	if *helpFlag {
+		printCommandHelp(os.Stdout, "ref delete", opts)
+		os.Exit(0)
+	}
 
 	if opts.NArgs() != 1 {
 		fmt.Fprintln(os.Stderr, "error: ref delete requires name")
@@ -1714,9 +1737,13 @@ func doRefDelete(sockPath, name string, force bool) error {
 }
 
 func cmdRefs(args []string) {
-	opts := getopt.New()
-	opts.SetProgram("ts refs")
-	opts.Parse(append([]string{"ts refs"}, args...))
+	opts, helpFlag := newCmdOpts("refs", "")
+	parseCmd(opts, "refs", args)
+
+	if *helpFlag {
+		printCommandHelp(os.Stdout, "refs", opts)
+		os.Exit(0)
+	}
 
 	if opts.NArgs() > 0 {
 		fmt.Fprintln(os.Stderr, "error: refs takes no arguments")
@@ -1777,10 +1804,13 @@ func doListRefs(sockPath string) error {
 }
 
 func cmdReflog(args []string) {
-	opts := getopt.New()
-	opts.SetProgram("ts reflog")
-	opts.SetParameters("[ref-name]")
-	opts.Parse(append([]string{"ts reflog"}, args...))
+	opts, helpFlag := newCmdOpts("reflog", "[ref-name]")
+	parseCmd(opts, "reflog", args)
+
+	if *helpFlag {
+		printCommandHelp(os.Stdout, "reflog", opts)
+		os.Exit(0)
+	}
 
 	var name string
 	if opts.NArgs() > 0 {
@@ -1847,10 +1877,13 @@ func doReflog(sockPath, name string) error {
 }
 
 func cmdLog(args []string) {
-	opts := getopt.New()
-	opts.SetProgram("ts log")
-	opts.SetParameters("[uuid]")
-	opts.Parse(append([]string{"ts log"}, args...))
+	opts, helpFlag := newCmdOpts("log", "[uuid]")
+	parseCmd(opts, "log", args)
+
+	if *helpFlag {
+		printCommandHelp(os.Stdout, "log", opts)
+		os.Exit(0)
+	}
 
 	var uuid string
 	if opts.NArgs() > 0 {
@@ -1916,12 +1949,15 @@ func doLog(sockPath, uuid string) error {
 }
 
 func cmdAutorun(args []string) {
-	opts := getopt.New()
-	opts.SetProgram("ts autorun")
-	opts.SetParameters("<program> [args...]")
+	opts, helpFlag := newCmdOpts("autorun", "<program> [args...]")
 	refName := opts.StringLong("ref", 0, "", "ref name (required)")
 	stop := opts.BoolLong("stop", 0, "clear autorun configuration")
-	opts.Parse(append([]string{"ts autorun"}, args...))
+	parseCmd(opts, "autorun", args)
+
+	if *helpFlag {
+		printCommandHelp(os.Stdout, "autorun", opts)
+		os.Exit(0)
+	}
 
 	if *refName == "" {
 		fmt.Fprintln(os.Stderr, "error: --ref is required")
@@ -1996,14 +2032,14 @@ type goArgs struct {
 	spec      string // frame spec (uuid, ref, or snap triplet)
 	isolation string // isolation level
 	command   string // command to run (if -c specified)
+	help      bool   // --help/-h was requested
 }
 
-// parseGoArgs parses the arguments for "ts go" and returns the parsed values.
-// Returns an error if the arguments are invalid.
-func parseGoArgs(args []string) (*goArgs, error) {
-	opts := getopt.New()
-	opts.SetProgram("ts go")
-	opts.SetParameters("[<spec>]")
+// parseGoArgs parses the arguments for "ts go" and returns the parsed values
+// along with the getopt set (so the caller can render --help). Returns an error
+// if the arguments are invalid.
+func parseGoArgs(args []string) (*goArgs, *getopt.Set, error) {
+	opts, helpFlag := newCmdOpts("go", "[<spec>]")
 	isolation := opts.StringLong("isolation", 0, "", "isolation level for new frames: vm, container, none")
 	cmdFlag := opts.StringLong("command", 'c', "", "run shell command instead of interactive session")
 
@@ -2013,7 +2049,7 @@ func parseGoArgs(args []string) (*goArgs, error) {
 	// "program name" for the second parse - that's fine, we just need to
 	// extract the spec before the second parse.
 	if err := opts.Getopt(append([]string{"ts go"}, args...), nil); err != nil {
-		return nil, err
+		return nil, opts, err
 	}
 	var spec string
 	if opts.NArgs() > 0 {
@@ -2021,24 +2057,25 @@ func parseGoArgs(args []string) (*goArgs, error) {
 		// Parse any flags that appear after the positional argument.
 		// Args()[0] (the spec) becomes the program name for this parse.
 		if err := opts.Getopt(opts.Args(), nil); err != nil {
-			return nil, err
+			return nil, opts, err
 		}
 	}
 
 	if opts.NArgs() > 0 {
-		return nil, fmt.Errorf("unexpected argument: %s", opts.Arg(0))
+		return nil, opts, fmt.Errorf("unexpected argument: %s", opts.Arg(0))
 	}
 
 	return &goArgs{
 		spec:      spec,
 		isolation: *isolation,
 		command:   *cmdFlag,
-	}, nil
+		help:      *helpFlag,
+	}, opts, nil
 }
 
 // cmdGo creates/resolves a frame and starts a new session inside it.
 func cmdGo(args []string) {
-	parsed, err := parseGoArgs(args)
+	parsed, opts, err := parseGoArgs(args)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "ts go: %v\n", err)
 		fmt.Fprintln(os.Stderr, "usage: ts go                         enter current frame (no-op)")
@@ -2046,7 +2083,12 @@ func cmdGo(args []string) {
 		fmt.Fprintln(os.Stderr, "       ts go <ref>                   enter frame by ref name")
 		fmt.Fprintln(os.Stderr, "       ts go <root:home:work>        create and enter new frame")
 		fmt.Fprintln(os.Stderr, "       ts go :: -c 'cmd'             create new frame, run cmd, exit")
+		fmt.Fprintln(os.Stderr, "run 'ts go --help' for full help")
 		os.Exit(1)
+	}
+	if parsed.help {
+		printCommandHelp(os.Stdout, "go", opts)
+		os.Exit(0)
 	}
 	spec := parsed.spec
 
@@ -2414,43 +2456,44 @@ func doGetLog(sockPath, uuid string) ([]LogEntry, error) {
 // undoArgs holds the parsed arguments for the "ts undo" command.
 type undoArgs struct {
 	command string // command to run (if -c specified)
+	help    bool   // --help/-h was requested
 }
 
 // parseUndoArgs parses the arguments for "ts undo" and returns the parsed
-// values. Returns an error if the arguments are invalid. Unlike "ts go",
-// undo takes no positional arguments, so a single Getopt pass suffices:
-// parsing stops at the first non-option, which the NArgs check rejects.
-func parseUndoArgs(args []string) (*undoArgs, error) {
-	opts := getopt.New()
-	opts.SetProgram("ts undo")
-	opts.SetParameters("")
+// values along with the getopt set (so the caller can render --help). Returns
+// an error if the arguments are invalid. Unlike "ts go", undo takes no
+// positional arguments, so a single Getopt pass suffices: parsing stops at the
+// first non-option, which the NArgs check rejects.
+func parseUndoArgs(args []string) (*undoArgs, *getopt.Set, error) {
+	opts, helpFlag := newCmdOpts("undo", "")
 	cmdFlag := opts.StringLong("command", 'c', "", "run shell command instead of interactive session")
 
 	if err := opts.Getopt(append([]string{"ts undo"}, args...), nil); err != nil {
-		return nil, err
+		return nil, opts, err
 	}
 	if opts.NArgs() > 0 {
-		return nil, fmt.Errorf("unexpected argument: %s", opts.Arg(0))
+		return nil, opts, fmt.Errorf("unexpected argument: %s", opts.Arg(0))
 	}
 
 	return &undoArgs{
 		command: *cmdFlag,
-	}, nil
+		help:    *helpFlag,
+	}, opts, nil
 }
 
 // cmdUndo jumps backward in time by one snap.
 func cmdUndo(args []string) {
-	parsed, err := parseUndoArgs(args)
+	parsed, opts, err := parseUndoArgs(args)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "ts undo: %v\n", err)
 		fmt.Fprintln(os.Stderr, "usage: ts undo                jump back one snap, enter new frame")
 		fmt.Fprintln(os.Stderr, "       ts undo -c 'cmd'       jump back one snap, run cmd, exit")
-		fmt.Fprintln(os.Stderr, "")
-		fmt.Fprintln(os.Stderr, "Jumps backward in time by one snap:")
-		fmt.Fprintln(os.Stderr, "1. Takes a snapshot of the current state")
-		fmt.Fprintln(os.Stderr, "2. Creates a new frame based on the previous snap")
-		fmt.Fprintln(os.Stderr, "3. Enters the new frame with pruned history")
+		fmt.Fprintln(os.Stderr, "run 'ts undo --help' for full help")
 		os.Exit(1)
+	}
+	if parsed.help {
+		printCommandHelp(os.Stdout, "undo", opts)
+		os.Exit(0)
 	}
 
 	// 1. Get current frame info and history

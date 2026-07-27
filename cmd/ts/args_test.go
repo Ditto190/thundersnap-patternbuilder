@@ -85,7 +85,7 @@ func TestParseGoArgs(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := parseGoArgs(tt.args)
+			got, _, err := parseGoArgs(tt.args)
 			if tt.wantErr {
 				if err == nil {
 					t.Errorf("parseGoArgs(%v) = %+v, want error", tt.args, got)
@@ -160,7 +160,7 @@ func TestParseUndoArgs(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := parseUndoArgs(tt.args)
+			got, _, err := parseUndoArgs(tt.args)
 			if tt.wantErr {
 				if err == nil {
 					t.Errorf("parseUndoArgs(%v) = %+v, want error", tt.args, got)
