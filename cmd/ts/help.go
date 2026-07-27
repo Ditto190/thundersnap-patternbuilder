@@ -94,13 +94,19 @@ session inside it over the container/VM control socket. With no argument,
 re-enters the current frame. Given a UUID or ref, enters that frame. Given
 a snap triplet, creates a new frame and enters it; "::" forks the current
 frame. With -c, runs a single shell command non-interactively and exits
-with its status.`,
+with its status.
+
+Any spec may carry a "<user>@" prefix to run the session as a specific
+Unix user (e.g. ts go root@myref, ts go alice@::); without it the host
+auto-detects the user. The username is validated server-side before the
+session's su is invoked.`,
 		outputs: `The session's stdout and stderr are forwarded to this process's
 stdout and stderr. The process exits with the session's exit code.`,
 		examples: `  ts go                          re-enter the current frame
   ts go myref                    enter the frame named "myref"
+  ts go root@myref               enter "myref" as user root
   ts go ::                       fork the current frame and enter it
-  ts go :: -c 'make test'        fork, run "make test", exit with its status`,
+  ts go alice@:: -c 'make test'  fork as alice, run "make test", exit with its status`,
 	},
 	{
 		name:     "undo",

@@ -53,6 +53,11 @@ var cgroupMgr *cgroup.Manager
 // container rootfs path for VMX mode; all lookups are resolved beneath it.
 // Detection order: explicit targetUser -> "ubuntu" (if /home/ubuntu exists) ->
 // "user" (if its /etc/passwd home exists) -> "root".
+//
+// selectUser does NOT validate targetUser; callers must run validateTargetUser
+// on a non-empty targetUser before relying on the result, since the returned
+// name is later passed to `su - <user>` as a bare argv element and a name
+// starting with '-' (e.g. "-c") would be parsed as a su flag.
 func selectUser(rootPrefix, targetUser string) string {
 	if targetUser != "" {
 		return targetUser
@@ -71,6 +76,43 @@ func selectUser(rootPrefix, targetUser string) string {
 	}
 
 	return "root"
+}
+
+// validateTargetUser checks that a caller-requested Unix username is safe to
+// hand to `su - <user>` (or the in-container `ts su` fallback). The username is
+// ultimately placed into `su`'s argv as a bare element, so the critical rule is
+// that it must not start with '-': `su - -c '<cmd>'` would parse `-c` as su's
+// own option and run <cmd> as root rather than as a lookup of a user named
+// "-c". It also bounds the length and rejects characters outside the portable
+// Unix username set so the name can never smuggle a path separator, whitespace,
+// or shell metacharacter into a future caller.
+//
+// The auto-detected defaults produced by selectUser ("root", "user", "ubuntu")
+// always satisfy this, so callers only need to validate when targetUser is
+// non-empty (i.e. when the client specified a user).
+func validateTargetUser(name string) error {
+	if name == "" {
+		return fmt.Errorf("empty username")
+	}
+	if len(name) > 256 {
+		return fmt.Errorf("username too long (%d bytes, max 256)", len(name))
+	}
+	if name[0] == '-' {
+		return fmt.Errorf("username must not start with '-'")
+	}
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		switch {
+		case c >= 'a' && c <= 'z',
+			c >= 'A' && c <= 'Z',
+			c >= '0' && c <= '9',
+			c == '_' || c == '-' || c == '.':
+			// allowed
+		default:
+			return fmt.Errorf("username contains invalid character %q", rune(c))
+		}
+	}
+	return nil
 }
 
 // lookupUserHome reads <rootPrefix>/etc/passwd and returns the home directory
@@ -240,6 +282,20 @@ func handleConnection(conn io.ReadWriteCloser) {
 	if err != nil {
 		log.Printf("[conn %d] failed to read args: %v", id, err)
 		return
+	}
+
+	// Validate a caller-specified user before it reaches `su`. A name starting
+	// with '-' (e.g. "-c") would be parsed as a su flag and run the supplied
+	// command as root; see validateTargetUser. Auto-detection (targetUser == "")
+	// always yields a safe default, so only non-empty requests are checked.
+	if targetUser != "" {
+		if err := validateTargetUser(targetUser); err != nil {
+			log.Printf("[conn %d] rejecting invalid target user %q: %v", id, targetUser, err)
+			vshdproto.WriteFrame(conn, vshdproto.FrameStderr,
+				[]byte(fmt.Sprintf("vshd: invalid user %q: %v\n", targetUser, err)))
+			vshdproto.WriteFrame(conn, vshdproto.FrameExit, vshdproto.EncodeExit(1))
+			return
+		}
 	}
 
 	runAsUser := selectUser(rootPrefix, targetUser)

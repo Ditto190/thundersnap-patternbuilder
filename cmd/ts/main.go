@@ -2029,7 +2029,8 @@ func doAutorunStop(sockPath, refName string) error {
 
 // goArgs holds the parsed arguments for the "ts go" command.
 type goArgs struct {
-	spec      string // frame spec (uuid, ref, or snap triplet)
+	spec      string // frame spec (uuid, ref, ::, or snap triplet), with any <user>@ stripped
+	user      string // optional <user>@ prefix; empty means auto-detect on the host
 	isolation string // isolation level
 	command   string // command to run (if -c specified)
 	help      bool   // --help/-h was requested
@@ -2065,8 +2066,23 @@ func parseGoArgs(args []string) (*goArgs, *getopt.Set, error) {
 		return nil, opts, fmt.Errorf("unexpected argument: %s", opts.Arg(0))
 	}
 
+	// Split an optional "<user>@" prefix from the spec. The frame spec
+	// itself (UUID, ref, "::", or snap triplet) never contains '@': UUIDs are
+	// hex+hyphens, refs are letters/digits/dash/underscore (refs.ValidateName),
+	// and snap ids are hex. So the first '@' unambiguously separates the
+	// requested Unix user from the frame identifier, for every spec form.
+	var user string
+	if idx := strings.Index(spec, "@"); idx != -1 {
+		user = spec[:idx]
+		spec = spec[idx+1:]
+		if user == "" {
+			return nil, opts, fmt.Errorf("empty user before '@'")
+		}
+	}
+
 	return &goArgs{
 		spec:      spec,
+		user:      user,
 		isolation: *isolation,
 		command:   *cmdFlag,
 		help:      *helpFlag,
@@ -2083,6 +2099,7 @@ func cmdGo(args []string) {
 		fmt.Fprintln(os.Stderr, "       ts go <ref>                   enter frame by ref name")
 		fmt.Fprintln(os.Stderr, "       ts go <root:home:work>        create and enter new frame")
 		fmt.Fprintln(os.Stderr, "       ts go :: -c 'cmd'             create new frame, run cmd, exit")
+		fmt.Fprintln(os.Stderr, "       ts go <user>@<spec>           enter/create frame as <user>")
 		fmt.Fprintln(os.Stderr, "run 'ts go --help' for full help")
 		os.Exit(1)
 	}
@@ -2176,7 +2193,7 @@ func cmdGo(args []string) {
 	}
 
 	// Connect to the target frame via vsock and start session
-	exitCode, err := runVsockSession(targetUUID, cmdArgs)
+	exitCode, err := runVsockSession(targetUUID, parsed.user, cmdArgs)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
@@ -2226,7 +2243,7 @@ func dialEnter() (net.Conn, *bufio.Reader, error) {
 // runVsockSession connects to the /enter endpoint and runs a session with optional command.
 // If cmdArgs is empty, runs an interactive login shell.
 // It returns the exit code from the remote session.
-func runVsockSession(frameUUID string, cmdArgs []string) (int, error) {
+func runVsockSession(frameUUID, user string, cmdArgs []string) (int, error) {
 	// Connect to /enter endpoint via vsock (VM) or control socket (container)
 	conn, reader, err := dialEnter()
 	if err != nil {
@@ -2242,8 +2259,8 @@ func runVsockSession(frameUUID string, cmdArgs []string) (int, error) {
 	if isPTY {
 		ptyFlag = "1"
 	}
-	// Empty user means auto-detect
-	fmt.Fprintf(conn, "%s\x00\x00%s\x00%d\x00", frameUUID, ptyFlag, len(cmdArgs))
+	// Empty user means auto-detect on the host.
+	fmt.Fprintf(conn, "%s\x00%s\x00%s\x00%d\x00", frameUUID, user, ptyFlag, len(cmdArgs))
 	for _, arg := range cmdArgs {
 		fmt.Fprintf(conn, "%s\x00", arg)
 	}
@@ -2567,7 +2584,7 @@ func cmdUndo(args []string) {
 		cmdArgs = []string{"sh", "-c", parsed.command}
 	}
 	fmt.Fprintf(os.Stderr, "Undoing to snap %s...\n", prevSnap)
-	exitCode, err := runVsockSession(newUUID, cmdArgs)
+	exitCode, err := runVsockSession(newUUID, "", cmdArgs)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)

@@ -12,6 +12,7 @@ func TestParseGoArgs(t *testing.T) {
 		name     string
 		args     []string
 		wantSpec string
+		wantUser string
 		wantCmd  string
 		wantIso  string
 		wantErr  bool
@@ -72,6 +73,49 @@ func TestParseGoArgs(t *testing.T) {
 			wantIso:  "container",
 		},
 		{
+			name:     "user@ref",
+			args:     []string{"root@myref"},
+			wantSpec: "myref",
+			wantUser: "root",
+		},
+		{
+			name:     "user@double colon fork",
+			args:     []string{"alice@::"},
+			wantSpec: "::",
+			wantUser: "alice",
+		},
+		{
+			name:     "user@snap triplet",
+			args:     []string{"bob@abc:def:ghi"},
+			wantSpec: "abc:def:ghi",
+			wantUser: "bob",
+		},
+		{
+			name:     "user@uuid-ish spec",
+			args:     []string{"root@01234567-89ab-cdef-0123-456789abcdef"},
+			wantSpec: "01234567-89ab-cdef-0123-456789abcdef",
+			wantUser: "root",
+		},
+		{
+			name:     "user@ with -c after spec",
+			args:     []string{"alice@::", "-c", "make test"},
+			wantSpec: "::",
+			wantUser: "alice",
+			wantCmd:  "make test",
+		},
+		{
+			name:     "user@ with -c before spec",
+			args:     []string{"-c", "make test", "alice@myref"},
+			wantSpec: "myref",
+			wantUser: "alice",
+			wantCmd:  "make test",
+		},
+		{
+			name:    "empty user before at",
+			args:    []string{"@myref"},
+			wantErr: true,
+		},
+		{
 			name:    "too many positional args",
 			args:    []string{"foo", "bar"},
 			wantErr: true,
@@ -97,6 +141,9 @@ func TestParseGoArgs(t *testing.T) {
 			}
 			if got.spec != tt.wantSpec {
 				t.Errorf("spec = %q, want %q", got.spec, tt.wantSpec)
+			}
+			if got.user != tt.wantUser {
+				t.Errorf("user = %q, want %q", got.user, tt.wantUser)
 			}
 			if got.command != tt.wantCmd {
 				t.Errorf("command = %q, want %q", got.command, tt.wantCmd)

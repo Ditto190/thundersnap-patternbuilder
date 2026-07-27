@@ -76,6 +76,50 @@ func TestSelectUserExplicit(t *testing.T) {
 	}
 }
 
+func TestValidateTargetUser(t *testing.T) {
+	tests := []struct {
+		name    string
+		user    string
+		wantErr bool
+	}{
+		// Valid: the auto-detected defaults and ordinary usernames.
+		{name: "root", user: "root", wantErr: false},
+		{name: "user", user: "user", wantErr: false},
+		{name: "ubuntu", user: "ubuntu", wantErr: false},
+		{name: "simple", user: "alice", wantErr: false},
+		{name: "hyphen", user: "some-user", wantErr: false},
+		{name: "underscore", user: "some_user", wantErr: false},
+		{name: "dot", user: "john.doe", wantErr: false},
+		{name: "digits", user: "user123", wantErr: false},
+		{name: "leading digit", user: "1user", wantErr: false}, // not a su flag risk
+		{name: "max length", user: strings.Repeat("a", 256), wantErr: false},
+
+		// Invalid: the security-critical cases for `su - <user>`.
+		{name: "empty", user: "", wantErr: true},
+		{name: "leading dash c", user: "-c", wantErr: true},
+		{name: "leading dash dash help", user: "--help", wantErr: true},
+		{name: "too long", user: strings.Repeat("a", 257), wantErr: true},
+		{name: "slash", user: "a/b", wantErr: true},
+		{name: "backslash", user: "a\\b", wantErr: true},
+		{name: "space", user: "a b", wantErr: true},
+		{name: "colon", user: "a:b", wantErr: true},
+		{name: "at", user: "a@b", wantErr: true},
+		{name: "nul", user: "a\x00b", wantErr: true},
+		{name: "newline", user: "a\nb", wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateTargetUser(tt.user)
+			if tt.wantErr && err == nil {
+				t.Errorf("validateTargetUser(%q) = nil, want error", tt.user)
+			}
+			if !tt.wantErr && err != nil {
+				t.Errorf("validateTargetUser(%q) = %v, want nil", tt.user, err)
+			}
+		})
+	}
+}
+
 func TestReadArgs(t *testing.T) {
 	t.Run("valid", func(t *testing.T) {
 		r := bufio.NewReader(strings.NewReader("2\x00ls\x00-l\x00"))

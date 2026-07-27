@@ -114,3 +114,27 @@ to port onto the daemon-driven `vm/` SSH harness:
 - [ ] **`parseSnapProgress` hardcodes 3 components** (root/home/work) and may
       mis-handle `nil:nil:nil` frames whose `ts snap` progress only has a root
       component. Make it handle 1–3 components. (deepseek-v4-pro review, NIT.)
+
+## Internal subcommands / CLI hardening
+
+- [ ] **Internal commands should live under `ts internal <cmd>` with purely
+      positional, mandatory args and no flag parser.** The hidden in-binary
+      commands that thundersnapd/vshd reexec into (`ts su`, `ts session-serve`,
+      `ts drop-caps-and-run`, `ts join-and-run`, `ts container-init`,
+      `ts nsenter`, `ts check-dev`, `ts check-isolation`) are today dispatched
+      as top-level subcommands alongside the user-facing ones, and several
+      hand-parse their args. The motivating case is `ts su` (`cmd/ts/su.go`,
+      `runAsSu`): it scans `argv` for `-c`/`-s`/`-m` flags before treating the
+      first non-flag element as the username, so a username starting with `-`
+      (e.g. `su - -c '<cmd>'`) would be parsed as a flag and silently run the
+      command as root. This is currently guarded only upstream — vshd's
+      `validateTargetUser` rejects names starting with `-` before they reach
+      `su` — so the `ts su` entry point itself is unsafe if anything ever
+      calls it directly (including the `/bin/su -> ts` symlink in a frame).
+      Move all of these under a `ts internal <cmd> <arg1> <arg2> ...` dispatcher
+      that takes fixed-arity positional args with no getopt/flag parsing at
+      all, so a value that happens to start with `-` is never reinterpreted as
+      an option. This makes parse errors impossible by construction and lets
+      each internal command assert its exact arg count up front. Surfaced by
+      the `ts go <user>@<frame>` work (which added the vshd-side validation);
+      the deeper fix is to not rely on validation alone.
