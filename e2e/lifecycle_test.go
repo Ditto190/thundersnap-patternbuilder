@@ -57,9 +57,7 @@ func snapTriplet(t *testing.T, triplet string) (root, home, work string) {
 // and confirm it is gone. Replaces not_e2e TestFrameLifecycleBasic (which used
 // a fake control server) and exercises the daemon's /delete-frame handler
 // through the SSH front door — the path the fake-server test never touched.
-func TestFrameCreateDelete(t *testing.T) {
-	env := newTestEnv(t)
-	d := startDaemon(t, env)
+func testFrameCreateDelete(t *testing.T, d *daemonInstance) {
 
 	uuid := createFrameViaDaemon(t, d, "lifecycle")
 
@@ -127,9 +125,7 @@ func TestFrameCreateDelete(t *testing.T) {
 // refs); now the delete is refused until every ref is gone. Create two refs on
 // one frame, assert the delete is refused naming both, drop one (still refused
 // naming the other), drop the last, then the delete succeeds.
-func TestFrameDeleteRequiresAllRefsRemoved(t *testing.T) {
-	env := newTestEnv(t)
-	d := startDaemon(t, env)
+func testFrameDeleteRequiresAllRefsRemoved(t *testing.T, d *daemonInstance) {
 
 	uuid := createFrameViaDaemon(t, d, "shared")
 
@@ -187,9 +183,7 @@ func TestFrameDeleteRequiresAllRefsRemoved(t *testing.T) {
 // a new frame from the snap, ssh into the new frame, and read the marker back.
 // Replaces not_e2e TestIntegrationWorkflowBasic and TestSnapshotWithModifiedFiles
 // (which hand-rolled btrfs snapshots).
-func TestFrameFromSnapPreservesContent(t *testing.T) {
-	env := newTestEnv(t)
-	d := startDaemon(t, env)
+func testFrameFromSnapPreservesContent(t *testing.T, d *daemonInstance) {
 
 	createFrameViaDaemon(t, d, "src")
 
@@ -230,9 +224,7 @@ func TestFrameFromSnapPreservesContent(t *testing.T) {
 // work snap (nil root), and confirm both contents are present. Replaces
 // not_e2e TestFrameWithHomeSpec, TestFrameWithAllThreeSpecs, and
 // TestWorkflowHomeWorkSeparation (which used a fake control server).
-func TestFrameHomeWorkSpec(t *testing.T) {
-	env := newTestEnv(t)
-	d := startDaemon(t, env)
+func testFrameHomeWorkSpec(t *testing.T, d *daemonInstance) {
 
 	createFrameViaDaemon(t, d, "hwspec")
 
@@ -268,9 +260,7 @@ func TestFrameHomeWorkSpec(t *testing.T) {
 // same work snap: write to /work in frame A, snap, build frame B with A's work
 // snap, and confirm B sees the content. Replaces not_e2e
 // TestCrossFrameDataSharingViaWorkVolume (which hand-rolled btrfs subvolumes).
-func TestCrossFrameWorkSharing(t *testing.T) {
-	env := newTestEnv(t)
-	d := startDaemon(t, env)
+func testCrossFrameWorkSharing(t *testing.T, d *daemonInstance) {
 
 	createFrameViaDaemon(t, d, "shareA")
 	if _, exit, err := sshExec(t, d, "root@shareA", "echo SHARED > /work/shared.txt"); err != nil || exit != 0 {
@@ -297,9 +287,7 @@ func TestCrossFrameWorkSharing(t *testing.T) {
 // TestFrameFromNonExistentSnap verifies that creating a frame from a bogus snap
 // id fails over SSH (non-zero exit). Replaces not_e2e
 // TestFrameFromNonExistentSnapshot (fake control server).
-func TestFrameFromNonExistentSnap(t *testing.T) {
-	env := newTestEnv(t)
-	d := startDaemon(t, env)
+func testFrameFromNonExistentSnap(t *testing.T, d *daemonInstance) {
 
 	createFrameViaDaemon(t, d, "badsrc")
 	out, exit, err := sshExec(t, d, "root@badsrc", "ts frame --ref=nope BOGUSNAPNOTREAL::")
@@ -323,9 +311,7 @@ func TestFrameFromNonExistentSnap(t *testing.T) {
 // the daemon's "cannot delete the currently active frame" guard is what blocks
 // it — proving the running-session rejection still holds, not just the ref
 // gate.
-func TestDeleteRunningFrame(t *testing.T) {
-	env := newTestEnv(t)
-	d := startDaemon(t, env)
+func testDeleteRunningFrame(t *testing.T, d *daemonInstance) {
 
 	uuid := createFrameViaDaemon(t, d, "running")
 
@@ -380,9 +366,7 @@ func TestDeleteRunningFrame(t *testing.T) {
 // frame was cloned from succeeds (btrfs COW) and the frame remains usable.
 // Replaces not_e2e TestSnapshotDeletion and TestDeleteSnapshotWithReference
 // (fake control server / raw btrfs).
-func TestSnapDeleteSucceedsAndFrameIntact(t *testing.T) {
-	env := newTestEnv(t)
-	d := startDaemon(t, env)
+func testSnapDeleteSucceedsAndFrameIntact(t *testing.T, d *daemonInstance) {
 
 	createFrameViaDaemon(t, d, "snapdel")
 	if out, exit, err := sshExec(t, d, "root@snapdel", "echo KEEP > /home/keep.txt"); err != nil || exit != 0 {
@@ -423,9 +407,7 @@ func TestSnapDeleteSucceedsAndFrameIntact(t *testing.T) {
 // handlers (which call into refid.Ensure/Move/Remove on real btrfs) through
 // the SSH front door. Replaces not_e2e refid_test.go's three tests (which
 // called refid package functions directly on hand-rolled subvolumes).
-func TestRefMoveAndForceDelete(t *testing.T) {
-	env := newTestEnv(t)
-	d := startDaemon(t, env)
+func testRefMoveAndForceDelete(t *testing.T, d *daemonInstance) {
 
 	uuidA := createFrameViaDaemon(t, d, "refmvA")
 	uuidB := createFrameViaDaemon(t, d, "refmvB")
@@ -483,9 +465,7 @@ func dialSSH(t *testing.T, d *daemonInstance, user string) (*ssh.Client, error) 
 // "user" account (UID 7575) and /etc/group has the matching "user" group
 // (GID 7575), so the unprivileged login user has a nameless primary GID-free
 // identity. Replaces not_e2e TestFrameUserGroupCreated (fake control server).
-func TestFrameUserAndGroup(t *testing.T) {
-	env := newTestEnv(t)
-	d := startDaemon(t, env)
+func testFrameUserAndGroup(t *testing.T, d *daemonInstance) {
 	createFrameViaDaemon(t, d, "usergrp")
 
 	passwd, exit, err := sshExec(t, d, "root@usergrp", "while IFS= read -r l; do echo \"$l\"; done < /etc/passwd")
@@ -511,9 +491,7 @@ func TestFrameUserAndGroup(t *testing.T) {
 // when the home subvolume already contains a real "work" entry (so a home
 // snapshot's /home/work is preserved rather than clobbered). Replaces not_e2e
 // TestFrameHomeWorkSymlink and TestFrameHomeWorkSymlinkNotOverwritten.
-func TestFrameHomeWorkSymlink(t *testing.T) {
-	env := newTestEnv(t)
-	d := startDaemon(t, env)
+func testFrameHomeWorkSymlink(t *testing.T, d *daemonInstance) {
 
 	// Fresh frame: /home/work is a symlink, and it functionally reaches /work
 	// (write to /work, read back through /home/work). No readlink needed.
@@ -556,9 +534,7 @@ func TestFrameHomeWorkSymlink(t *testing.T) {
 // secret to /id, snap, fork a new frame from the snap, and confirm the new
 // frame's /id is empty. Replaces not_e2e TestIdSubvolumeNotCloned (fake
 // control server + raw btrfs).
-func TestFrameIdNotCloned(t *testing.T) {
-	env := newTestEnv(t)
-	d := startDaemon(t, env)
+func testFrameIdNotCloned(t *testing.T, d *daemonInstance) {
 
 	createFrameViaDaemon(t, d, "idclone")
 	// Write a secret into /id. /id is root-owned (the identity subvolume), so
@@ -591,9 +567,7 @@ func TestFrameIdNotCloned(t *testing.T) {
 // (fake control server) and TestMultipleConcurrentSessions (fake control
 // server; the live-session-count half is already covered by
 // TestSSHContainerBasic).
-func TestFrameStatePersistsAcrossSessions(t *testing.T) {
-	env := newTestEnv(t)
-	d := startDaemon(t, env)
+func testFrameStatePersistsAcrossSessions(t *testing.T, d *daemonInstance) {
 	createFrameViaDaemon(t, d, "persist")
 
 	if out, exit, err := sshExec(t, d, "root@persist", "echo session1 > /home/s1.txt"); err != nil || exit != 0 {
@@ -617,10 +591,8 @@ func TestFrameStatePersistsAcrossSessions(t *testing.T) {
 // survived. Replaces not_e2e TestLargeDirectoryTree (fake control server +
 // raw btrfs); the TSM/TSC format's many-entry handling is also covered by the
 // tsm package's indexer unit tests.
-func TestSnapManyFiles(t *testing.T) {
+func testSnapManyFiles(t *testing.T, d *daemonInstance) {
 	const n = 100
-	env := newTestEnv(t)
-	d := startDaemon(t, env)
 	createFrameViaDaemon(t, d, "many")
 
 	// Upload n files into /work via SFTP.

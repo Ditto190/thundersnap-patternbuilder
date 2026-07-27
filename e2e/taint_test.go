@@ -57,9 +57,7 @@ func addTaint(t *testing.T, d *daemonInstance, ref, name string) {
 // them, and deduplicates repeats. Replaces not_e2e TestTaintSystemBasic,
 // TestMultipleTaintsOnFrame, TestTaintDeduplication, and TestQueryFrameTaints
 // (fake control server).
-func TestTaintAddListDedup(t *testing.T) {
-	env := newTestEnv(t)
-	d := startDaemon(t, env)
+func testTaintAddListDedup(t *testing.T, d *daemonInstance) {
 	createFrameViaDaemon(t, d, "tnt")
 
 	addTaint(t, d, "tnt", "pii:customers")
@@ -95,9 +93,7 @@ func TestTaintAddListDedup(t *testing.T) {
 // snap, and confirm the forked frame's `ts taint` lists the same taints.
 // This is the real propagation the not_e2e TestTaintPropagation stub never
 // checked (the fake server did not propagate taints).
-func TestTaintPropagatesThroughFork(t *testing.T) {
-	env := newTestEnv(t)
-	d := startDaemon(t, env)
+func testTaintPropagatesThroughFork(t *testing.T, d *daemonInstance) {
 	createFrameViaDaemon(t, d, "tprop")
 
 	addTaint(t, d, "tprop", "pii:source-data")

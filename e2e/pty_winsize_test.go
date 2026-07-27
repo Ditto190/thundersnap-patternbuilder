@@ -28,9 +28,7 @@ import (
 // This single test guards the shared vshdsession.servePTY / relay echo path;
 // the container and VM session paths share it, so we do not duplicate the
 // check on the VM path.
-func TestContainerPtyEcho(t *testing.T) {
-	env := newTestEnv(t)
-	d := startDaemon(t, env)
+func testContainerPtyEcho(t *testing.T, d *daemonInstance) {
 	createFrameViaDaemon(t, d, "echopty")
 
 	// root@ runs /bin/sh -l directly (no su); the shell is ts's built-in
@@ -88,9 +86,7 @@ func TestContainerPtyEcho(t *testing.T) {
 // winsize. (The interactive-shell form can't do this: the prompt position is
 // nondeterministic and `stty -echo` cannot suppress the echo of the line it is
 // typed on, so no exact suffix is reliably producible.)
-func TestContainerPtyWinsize(t *testing.T) {
-	env := newTestEnv(t)
-	d := startDaemon(t, env)
+func testContainerPtyWinsize(t *testing.T, d *daemonInstance) {
 	createFrameViaDaemon(t, d, "cptywin")
 	installBusyboxAppletInFrame(t, d, "cptywin", "stty")
 
@@ -127,9 +123,7 @@ func TestContainerPtyWinsize(t *testing.T) {
 // stderr, C3 to stdout, in that order; the client must receive exactly
 // "A1B2C3". It runs non-interactively (sshPtyRun) so the stream is only the
 // command's output -- no prompt or echo to obscure a reordering.
-func TestContainerPtyWriteOrder(t *testing.T) {
-	env := newTestEnv(t)
-	d := startDaemon(t, env)
+func testContainerPtyWriteOrder(t *testing.T, d *daemonInstance) {
 	createFrameViaDaemon(t, d, "ptyorder")
 
 	// printf is a builtin in ts's mvdan.cc/sh, so no busybox install needed.

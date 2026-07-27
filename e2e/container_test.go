@@ -54,9 +54,7 @@ func checkIsolation(t *testing.T, d *daemonInstance, ref string) map[string]stri
 // namespaces. Replaces not_e2e TestContainerIsolationBasic,
 // TestBlankContainerIsolation, and TestBlankContainerDevSetup (which ran
 // `ts drop-caps-and-run` / `ts check-dev` directly).
-func TestContainerIsolationOverSSH(t *testing.T) {
-	env := newTestEnv(t)
-	d := startDaemon(t, env)
+func testContainerIsolationOverSSH(t *testing.T, d *daemonInstance) {
 	// A nil:nil:nil frame is the "blank container" case.
 	createFrameViaDaemon(t, d, "iso")
 
@@ -99,9 +97,7 @@ func TestContainerIsolationOverSSH(t *testing.T) {
 // user-reported "both sessions share one pty" bug). Replaces not_e2e
 // TestContainerConcurrentSessionDistinctPTS and TestContainerSharedDevpts
 // (which hand-drove `ts drop-caps-and-run` and stat'd /dev/pts).
-func TestContainerConcurrentDistinctPTS(t *testing.T) {
-	env := newTestEnv(t)
-	d := startDaemon(t, env)
+func testContainerConcurrentDistinctPTS(t *testing.T, d *daemonInstance) {
 	createFrameViaDaemon(t, d, "pts")
 	// `tty` is an external command; install the busybox applet so each PTY
 	// session can report its own terminal device.

@@ -43,9 +43,7 @@ func newestLogRootSnap(logOut string) (string, bool) {
 }
 
 // TestTsFrame tests the ts frame command with various syntaxes.
-func TestTsFrame(t *testing.T) {
-	env := newTestEnv(t)
-	d := startDaemon(t, env)
+func testTsFrame(t *testing.T, d *daemonInstance) {
 
 	// Create a frame to work with
 	createFrameViaDaemon(t, d, "frametest")
@@ -154,9 +152,7 @@ func TestTsFrame(t *testing.T) {
 }
 
 // TestTsLog tests ts log shows frame history.
-func TestTsLog(t *testing.T) {
-	env := newTestEnv(t)
-	d := startDaemon(t, env)
+func testTsLog(t *testing.T, d *daemonInstance) {
 
 	// Create a frame
 	createFrameViaDaemon(t, d, "logtest")
@@ -199,9 +195,7 @@ func TestTsLog(t *testing.T) {
 // TestTsFrameCreatesNewFrameWithHistory tests that creating a new frame
 // via ts frame clones the parent's history when done via ts go.
 // This is a simpler test that just verifies ts frame creates frames.
-func TestTsFrameCreatesNewFrame(t *testing.T) {
-	env := newTestEnv(t)
-	d := startDaemon(t, env)
+func testTsFrameCreatesNewFrame(t *testing.T, d *daemonInstance) {
 
 	// Create initial frame
 	createFrameViaDaemon(t, d, "parent")
@@ -263,9 +257,7 @@ func TestTsFrameCreatesNewFrame(t *testing.T) {
 // TestTsFrameColonColonCreatesNewFrame tests that "ts frame ::" creates a new
 // frame (cloning the current one) and returns a NEW UUID each time, not the
 // current frame's UUID.
-func TestTsFrameColonColonCreatesNewFrame(t *testing.T) {
-	env := newTestEnv(t)
-	d := startDaemon(t, env)
+func testTsFrameColonColonCreatesNewFrame(t *testing.T, d *daemonInstance) {
 
 	createFrameViaDaemon(t, d, "fcctest")
 
@@ -318,9 +310,7 @@ func TestTsFrameColonColonCreatesNewFrame(t *testing.T) {
 //
 // Since ts go enters an interactive vsock session that's hard to drive from
 // a test, we verify the frame creation aspect via ts frames before/after.
-func TestTsGoNoArgsCreatesThenEnters(t *testing.T) {
-	env := newTestEnv(t)
-	d := startDaemon(t, env)
+func testTsGoNoArgsCreatesThenEnters(t *testing.T, d *daemonInstance) {
 
 	createFrameViaDaemon(t, d, "gotest")
 
@@ -384,9 +374,7 @@ func TestTsGoNoArgsCreatesThenEnters(t *testing.T) {
 
 // TestTsGoWithCommand tests "ts go :: -c 'command'" which creates a new frame,
 // runs the command, and exits. This allows non-interactive testing of ts go.
-func TestTsGoWithCommand(t *testing.T) {
-	env := newTestEnv(t)
-	d := startDaemon(t, env)
+func testTsGoWithCommand(t *testing.T, d *daemonInstance) {
 
 	createFrameViaDaemon(t, d, "gocmdtest")
 
@@ -482,9 +470,7 @@ func TestTsGoWithCommand(t *testing.T) {
 }
 
 // TestTsGoWithCommandExitCode tests that ts go -c propagates the command's exit code.
-func TestTsGoWithCommandExitCode(t *testing.T) {
-	env := newTestEnv(t)
-	d := startDaemon(t, env)
+func testTsGoWithCommandExitCode(t *testing.T, d *daemonInstance) {
 
 	createFrameViaDaemon(t, d, "goexittest")
 
@@ -510,9 +496,7 @@ func TestTsGoWithCommandExitCode(t *testing.T) {
 
 // TestTsGoWithCommandToExistingFrame tests ts go <ref> -c 'command' which
 // runs a command in an existing frame without creating a new one.
-func TestTsGoWithCommandToExistingFrame(t *testing.T) {
-	env := newTestEnv(t)
-	d := startDaemon(t, env)
+func testTsGoWithCommandToExistingFrame(t *testing.T, d *daemonInstance) {
 
 	// Create two frames
 	createFrameViaDaemon(t, d, "goref1")
@@ -541,15 +525,79 @@ func TestTsGoWithCommandToExistingFrame(t *testing.T) {
 	t.Logf("ts go goref2 -c output: %s", output)
 }
 
+// TestTsGoUserAtFrame tests the "<user>@<frame>" form of "ts go": the optional
+// user prefix is parsed off the spec, sent in the /enter protocol, and honored
+// by vshd's `su - <user>`. Identity is probed by side effect (the same technique
+// as TestSSHContainerUserNonRoot): root can write a file directly under /
+// (mode 0755, root-owned) while the unprivileged "user" account cannot, so the
+// same probe run as root@ vs user@ must produce different results. echo and
+// output redirection are shell builtins, so no busybox install is needed in the
+// minimal frame. It also checks that a bare "@frame" (empty user) is rejected
+// client-side rather than silently auto-detecting.
+func testTsGoUserAtFrame(t *testing.T, d *daemonInstance) {
+
+	// gou1 is the frame we sit in to run ts go; gou2 is the target frame we
+	// enter as a chosen user. Both are nil:nil:nil minimal frames, which always
+	// have the "user" account in /etc/passwd (see rootfs.go).
+	createFrameViaDaemon(t, d, "gou1")
+	createFrameViaDaemon(t, d, "gou2")
+
+	// Probe: write a file directly under /. Root succeeds (owns /, mode 0755);
+	// "user" (uid 7575) lacks write permission and fails.
+	probe := "echo x > /_ts_go_userprobe 2>/dev/null && echo ROOT || echo NONROOT"
+
+	// As root@gou2: the probe must report ROOT.
+	output, exitCode, err := sshExec(t, d, "root@gou1", "ts go root@gou2 -c '"+probe+"'")
+	if err != nil {
+		t.Fatalf("ts go root@gou2: %v", err)
+	}
+	if exitCode != 0 {
+		t.Errorf("ts go root@gou2: exit %d (output: %q)", exitCode, output)
+	}
+	if !strings.Contains(output, "ROOT") || strings.Contains(output, "NONROOT") {
+		t.Errorf("ts go root@gou2: expected ROOT, got %q", output)
+	}
+	t.Logf("ts go root@gou2: %q", output)
+
+	// As user@gou2: the same probe must report NONROOT, proving the user@
+	// prefix was honored (not auto-detected as root).
+	output, exitCode, err = sshExec(t, d, "root@gou1", "ts go user@gou2 -c '"+probe+"'")
+	if err != nil {
+		t.Fatalf("ts go user@gou2: %v", err)
+	}
+	if exitCode != 0 {
+		t.Errorf("ts go user@gou2: exit %d (output: %q)", exitCode, output)
+	}
+	if !strings.Contains(output, "NONROOT") {
+		t.Errorf("ts go user@gou2: expected NONROOT, got %q", output)
+	}
+	t.Logf("ts go user@gou2: %q", output)
+
+	// Empty user before '@' is rejected client-side. The -c is a safety net so
+	// that a parsing regression would produce a non-interactive failure rather
+	// than hang on an interactive session; the command must never run.
+	output, exitCode, err = sshExec(t, d, "root@gou1", "ts go @gou2 -c 'echo SHOULD_NOT_RUN'")
+	if err != nil {
+		t.Fatalf("ts go @gou2: %v", err)
+	}
+	if exitCode == 0 {
+		t.Errorf("ts go @gou2: expected non-zero exit for empty user, got 0 (output: %q)", output)
+	}
+	if !strings.Contains(output, "empty user before") {
+		t.Errorf("ts go @gou2: expected 'empty user before' error, got %q", output)
+	}
+	if strings.Contains(output, "SHOULD_NOT_RUN") {
+		t.Errorf("ts go @gou2: command unexpectedly ran (output: %q)", output)
+	}
+}
+
 // TestTsUndo tests that ts undo moves the session back to the previous snap:
 // it snapshots the current state, creates a new frame from the snap before
 // it, and enters that frame. The -c flag runs the verification commands
 // inside the undone frame in ONE invocation (each ts undo snapshots first
 // and creates a new frame, so a second invocation would undo a different,
 // newer state).
-func TestTsUndo(t *testing.T) {
-	env := newTestEnv(t)
-	d := startDaemon(t, env)
+func testTsUndo(t *testing.T, d *daemonInstance) {
 
 	createFrameViaDaemon(t, d, "undotest")
 
@@ -622,9 +670,7 @@ func TestTsUndo(t *testing.T) {
 }
 
 // TestTsUndoEmptyLog tests that ts undo with no snapshots in history errors.
-func TestTsUndoEmptyLog(t *testing.T) {
-	env := newTestEnv(t)
-	d := startDaemon(t, env)
+func testTsUndoEmptyLog(t *testing.T, d *daemonInstance) {
 
 	createFrameViaDaemon(t, d, "undoempty")
 
@@ -659,9 +705,7 @@ func TestTsUndoEmptyLog(t *testing.T) {
 // interactive vsock session that can't be driven from a test, matching the
 // approach in TestTsUndo): it reads the forked frame's ts log, takes history[0],
 // builds a frame from it, and checks the on-disk state is the fork point.
-func TestForkUndoRollsBackToForkPoint(t *testing.T) {
-	env := newTestEnv(t)
-	d := startDaemon(t, env)
+func testForkUndoRollsBackToForkPoint(t *testing.T, d *daemonInstance) {
 
 	createFrameViaDaemon(t, d, "forksrc")
 
@@ -691,13 +735,13 @@ func TestForkUndoRollsBackToForkPoint(t *testing.T) {
 	if forkedUUID == "" {
 		t.Fatalf("ts frame :: returned no UUID: %q", forkOut)
 	}
-	if _, exitCode, err := sshExec(t, d, "root@forksrc", "ts ref create forked "+forkedUUID); err != nil || exitCode != 0 {
-		t.Fatalf("ts ref create forked: err=%v exit=%d", err, exitCode)
+	if _, exitCode, err := sshExec(t, d, "root@forksrc", "ts ref create forkpt "+forkedUUID); err != nil || exitCode != 0 {
+		t.Fatalf("ts ref create forkpt: err=%v exit=%d", err, exitCode)
 	}
 
 	// Sanity: the forked frame's live state is the fork point (v2). If this
 	// fails the fork didn't clone the live state and the test setup is wrong.
-	if out, exitCode, err := sshExec(t, d, "root@forked", "read line < /marker && echo $line"); err != nil || exitCode != 0 {
+	if out, exitCode, err := sshExec(t, d, "root@forkpt", "read line < /marker && echo $line"); err != nil || exitCode != 0 {
 		t.Fatalf("read marker in forked frame: err=%v exit=%d", err, exitCode)
 	} else if got := strings.TrimSpace(out); got != "v2" {
 		t.Fatalf("forked frame live state = %q, want v2 (fork point); test setup wrong", got)
@@ -729,7 +773,7 @@ func TestForkUndoRollsBackToForkPoint(t *testing.T) {
 	// The forked frame's history[0] must be the fork-point snap (v2), not the
 	// source's pre-fork snap (v1). Reproduce ts undo: build a frame from
 	// history[0] and inspect its /marker.
-	forkedLog, _, _, err := sshExecSplit(t, d, "root@forked", "ts log")
+	forkedLog, _, _, err := sshExecSplit(t, d, "root@forkpt", "ts log")
 	if err != nil {
 		t.Fatalf("ts log (forked): %v", err)
 	}
@@ -739,7 +783,7 @@ func TestForkUndoRollsBackToForkPoint(t *testing.T) {
 	}
 	t.Logf("forked frame history[0] root snap = %s (ts log: %q)", rootSnap, strings.TrimSpace(forkedLog))
 
-	if _, exitCode, err := sshExec(t, d, "root@forked", "ts frame --ref=forkundo "+rootSnap+":nil:nil"); err != nil || exitCode != 0 {
+	if _, exitCode, err := sshExec(t, d, "root@forkpt", "ts frame --ref=forkundo "+rootSnap+":nil:nil"); err != nil || exitCode != 0 {
 		t.Fatalf("ts frame from forked history[0]: err=%v exit=%d", err, exitCode)
 	}
 	out, exitCode, err := sshExec(t, d, "root@forkundo", "read line < /marker && echo $line")

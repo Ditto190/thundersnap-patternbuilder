@@ -15,9 +15,7 @@ import (
 // `ts snap` (without --wait) captures the frame and returns immediately with
 // no snap ID on stdout, while indexing runs in the background and the snap
 // appears in `ts snaps` once it finishes. See background-indexing.md.
-func TestSnapBackgroundIndexing(t *testing.T) {
-	env := newTestEnv(t)
-	d := startDaemon(t, env)
+func testSnapBackgroundIndexing(t *testing.T, d *daemonInstance) {
 
 	createFrameViaDaemon(t, d, "bgtest")
 
@@ -91,9 +89,7 @@ func TestSnapBackgroundIndexing(t *testing.T) {
 // and it never started the indexing worker because it called daemon internals
 // directly instead of running the real binary). The real e2e harness runs the
 // actual thundersnapd, so initSnapQueue() runs and the worker is live.
-func TestSnapBackgroundCapturesAtCallTime(t *testing.T) {
-	env := newTestEnv(t)
-	d := startDaemon(t, env)
+func testSnapBackgroundCapturesAtCallTime(t *testing.T, d *daemonInstance) {
 
 	createFrameViaDaemon(t, d, "captest")
 
@@ -167,9 +163,7 @@ func TestSnapBackgroundCapturesAtCallTime(t *testing.T) {
 // the queue dropped the second job or finalized only one of the two — exactly
 // the concurrency regression the test purports to guard. Asserting both land
 // catches a dropped/overwritten second pending entry.
-func TestSnapRapidDoubleBackgroundIndexing(t *testing.T) {
-	env := newTestEnv(t)
-	d := startDaemon(t, env)
+func testSnapRapidDoubleBackgroundIndexing(t *testing.T, d *daemonInstance) {
 
 	createFrameViaDaemon(t, d, "bgdouble")
 

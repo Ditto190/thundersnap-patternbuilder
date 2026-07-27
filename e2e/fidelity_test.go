@@ -45,9 +45,7 @@ func statField(t *testing.T, d *daemonInstance, ref, format, path string) string
 // Replaces not_e2e uid_test.go (TestUIDPermissionsBasic, TestSetuidPreservation,
 // TestSetgidBinaryExecution, TestSetuidBinaryExecution, TestUIDPreservation,
 // TestHardlinkSetuidBinaryInSnapshot) and hardlink_test.go (all three).
-func TestSnapFidelityPreservesSpecialFiles(t *testing.T) {
-	env := newTestEnv(t)
-	d := startDaemon(t, env)
+func testSnapFidelityPreservesSpecialFiles(t *testing.T, d *daemonInstance) {
 	createFrameViaDaemon(t, d, "fid")
 
 	// The minimal rootfs only has the ts shell; install busybox applets for

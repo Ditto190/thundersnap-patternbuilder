@@ -21,9 +21,7 @@ import (
 // finalize. (The fully-concurrent variant — taint added *during* indexing — is
 // a structural property of the per-frame lock and is not reliably triggerable
 // with tiny test frames; see README.codereview.md.)
-func TestTaintSurvivesBackgroundSnap(t *testing.T) {
-	env := newTestEnv(t)
-	d := startDaemon(t, env)
+func testTaintSurvivesBackgroundSnap(t *testing.T, d *daemonInstance) {
 
 	createFrameViaDaemon(t, d, "tainttest")
 

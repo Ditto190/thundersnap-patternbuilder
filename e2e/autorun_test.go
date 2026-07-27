@@ -14,9 +14,7 @@ import (
 
 // TestAutorunBasic tests that the ts autorun command correctly stores the
 // autorun configuration and that it's displayed in ts refs.
-func TestAutorunBasic(t *testing.T) {
-	env := newTestEnv(t)
-	d := startDaemon(t, env)
+func testAutorunBasic(t *testing.T, d *daemonInstance) {
 
 	// Create frame via daemon (true e2e - no manual data structure manipulation)
 	createFrameViaDaemon(t, d, "autoref")
@@ -67,9 +65,7 @@ func TestAutorunBasic(t *testing.T) {
 
 // TestAutorunRefMove tests that when a ref is moved, the reflog records the move.
 // NOTE: Autorun process restart on ref move is not implemented yet.
-func TestAutorunRefMove(t *testing.T) {
-	env := newTestEnv(t)
-	d := startDaemon(t, env)
+func testAutorunRefMove(t *testing.T, d *daemonInstance) {
 
 	// Create two frames via daemon. First one gets the moveref, second is target.
 	createFrameViaDaemon(t, d, "moveref")
@@ -137,9 +133,7 @@ func TestAutorunRefMove(t *testing.T) {
 }
 
 // TestAutorunStop tests that ts autorun --stop correctly clears the autorun config.
-func TestAutorunStop(t *testing.T) {
-	env := newTestEnv(t)
-	d := startDaemon(t, env)
+func testAutorunStop(t *testing.T, d *daemonInstance) {
 
 	// Create frame via daemon (true e2e - no manual data structure manipulation)
 	createFrameViaDaemon(t, d, "stopref")
@@ -189,9 +183,7 @@ func TestAutorunStop(t *testing.T) {
 }
 
 // TestAutorunWithNonExistentRef tests that setting autorun on a non-existent ref fails.
-func TestAutorunWithNonExistentRef(t *testing.T) {
-	env := newTestEnv(t)
-	d := startDaemon(t, env)
+func testAutorunWithNonExistentRef(t *testing.T, d *daemonInstance) {
 
 	// Create frame via daemon (true e2e - no manual data structure manipulation)
 	createFrameViaDaemon(t, d, "realref")
@@ -212,9 +204,7 @@ func TestAutorunWithNonExistentRef(t *testing.T) {
 }
 
 // TestAutorunShowsInRefs tests that refs with autorun configs are displayed correctly.
-func TestAutorunShowsInRefs(t *testing.T) {
-	env := newTestEnv(t)
-	d := startDaemon(t, env)
+func testAutorunShowsInRefs(t *testing.T, d *daemonInstance) {
 
 	// Create two frames via daemon (true e2e - no manual data structure manipulation)
 	createFrameViaDaemon(t, d, "ref-with-autorun")
@@ -260,9 +250,7 @@ func TestAutorunShowsInRefs(t *testing.T) {
 
 // TestAutorunMultiWordCommand tests that autorun commands with multiple arguments
 // are stored and displayed correctly.
-func TestAutorunMultiWordCommand(t *testing.T) {
-	env := newTestEnv(t)
-	d := startDaemon(t, env)
+func testAutorunMultiWordCommand(t *testing.T, d *daemonInstance) {
 
 	// Create frame via daemon (true e2e - no manual data structure manipulation)
 	createFrameViaDaemon(t, d, "multiref")
@@ -292,9 +280,7 @@ func TestAutorunMultiWordCommand(t *testing.T) {
 
 // TestAutorunProcessStarts tests that setting autorun actually starts the process.
 // The process creates a marker file; we verify the file appears via SSH.
-func TestAutorunProcessStarts(t *testing.T) {
-	env := newTestEnv(t)
-	d := startDaemon(t, env)
+func testAutorunProcessStarts(t *testing.T, d *daemonInstance) {
 
 	// Create frame via daemon (true e2e - no manual data structure manipulation)
 	createFrameViaDaemon(t, d, "procstart")
@@ -331,9 +317,7 @@ func TestAutorunProcessStarts(t *testing.T) {
 }
 
 // TestAutorunProcessStops tests that clearing autorun stops the running process.
-func TestAutorunProcessStops(t *testing.T) {
-	env := newTestEnv(t)
-	d := startDaemon(t, env)
+func testAutorunProcessStops(t *testing.T, d *daemonInstance) {
 
 	// Create frame via daemon (true e2e - no manual data structure manipulation)
 	createFrameViaDaemon(t, d, "procstop")
@@ -378,9 +362,7 @@ func TestAutorunProcessStops(t *testing.T) {
 
 // TestAutorunProcessRestartsOnRefMove tests that moving a ref stops the process
 // in the old frame and starts it in the new frame.
-func TestAutorunProcessRestartsOnRefMove(t *testing.T) {
-	env := newTestEnv(t)
-	d := startDaemon(t, env)
+func testAutorunProcessRestartsOnRefMove(t *testing.T, d *daemonInstance) {
 
 	// Create two frames via daemon. First gets the procmove ref, second is target.
 	createFrameViaDaemon(t, d, "procmove")
@@ -441,9 +423,7 @@ func TestAutorunProcessRestartsOnRefMove(t *testing.T) {
 }
 
 // TestAutorunProcessAutoRestart tests that if an autorun process dies, it gets restarted.
-func TestAutorunProcessAutoRestart(t *testing.T) {
-	env := newTestEnv(t)
-	d := startDaemon(t, env)
+func testAutorunProcessAutoRestart(t *testing.T, d *daemonInstance) {
 
 	// Create frame via daemon (true e2e - no manual data structure manipulation)
 	createFrameViaDaemon(t, d, "autorestart")

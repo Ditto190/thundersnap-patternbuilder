@@ -53,9 +53,7 @@ func startVMDaemon(t *testing.T, env *testEnv) *daemonInstance {
 // work, root can write to /, a non-root user cannot, and the login shell
 // starts in /home. Replaces not_e2e ssh_vm_test.go and the VM half of
 // ssh_cwd_test.go.
-func TestVMSSHSessionMatrix(t *testing.T) {
-	env := newTestEnv(t)
-	d := startVMDaemon(t, env)
+func testVMSSHSessionMatrix(t *testing.T, d *daemonInstance) {
 	createFrameViaDaemon(t, d, "vmmatrix")
 
 	// "vm/<frame>" routes through runVMXSession: the daemon boots a VM and
@@ -124,9 +122,7 @@ func TestVMSSHSessionMatrix(t *testing.T) {
 // output -- no shell prompt, no typed-input echo, no greeting -- for an
 // exact-match assertion. See TestContainerPtyEcho for the interactive echo
 // invariant and TestContainerPtyWriteOrder for the stdout/stderr race guard.
-func TestVMXPtyWinsize(t *testing.T) {
-	env := newTestEnv(t)
-	d := startVMDaemon(t, env)
+func testVMXPtyWinsize(t *testing.T, d *daemonInstance) {
 	createFrameViaDaemon(t, d, "vmwin")
 	installBusyboxAppletInFrame(t, d, "vmwin", "stty")
 

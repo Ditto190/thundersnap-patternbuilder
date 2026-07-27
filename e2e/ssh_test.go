@@ -535,12 +535,7 @@ func verifySnaphashOutput(t *testing.T, output string) {
 // TestSSHContainerBasic is a true end-to-end test: start daemon, SSH in,
 // create a frame via `ts frame`, then exercise ts snap/snaps/log/frames.
 // No manual frame/ref creation - everything goes through the daemon.
-func TestSSHContainerBasic(t *testing.T) {
-	env := newTestEnv(t)
-
-	// Start the daemon with no pre-created frames
-	d := startDaemon(t, env)
-
+func testSSHContainerBasic(t *testing.T, d *daemonInstance) {
 	// SSH to the default (empty) frame as root to run ts commands.
 	// The empty frame name (root@@host) should give us a minimal shell.
 	output, exitCode, err := sshExec(t, d, "root@", "echo hello")
@@ -811,9 +806,7 @@ func TestSSHContainerBasic(t *testing.T) {
 // TestSSHContainerUserRoot tests SSH as root user to a container frame.
 // Identity is probed by side effect: only uid 0 can create a file directly
 // under / (mode 0755, owned by root), so a successful write proves we are root.
-func TestSSHContainerUserRoot(t *testing.T) {
-	env := newTestEnv(t)
-	d := startDaemon(t, env)
+func testSSHContainerUserRoot(t *testing.T, d *daemonInstance) {
 
 	// Create frame via daemon (true e2e - no manual data structure manipulation)
 	createFrameViaDaemon(t, d, "rootframe")
@@ -840,9 +833,7 @@ func TestSSHContainerUserRoot(t *testing.T) {
 // has no real su, so the daemon symlinks /bin/su -> ts, whose built-in su
 // mode (runAsSu) does the setuid. This test therefore also exercises the
 // native ts su path end to end.
-func TestSSHContainerUserNonRoot(t *testing.T) {
-	env := newTestEnv(t)
-	d := startDaemon(t, env)
+func testSSHContainerUserNonRoot(t *testing.T, d *daemonInstance) {
 
 	// Create frame via daemon (true e2e - no manual data structure manipulation)
 	createFrameViaDaemon(t, d, "userframe")
@@ -866,9 +857,7 @@ func TestSSHContainerUserNonRoot(t *testing.T) {
 // user's home directory. The "user" account's home is /home (the shared home
 // subvolume), so pwd must be exactly /home. vshd reaches it via `su - user`,
 // which the daemon's /bin/su -> ts symlink serves with ts's built-in su mode.
-func TestSSHContainerWorkingDir(t *testing.T) {
-	env := newTestEnv(t)
-	d := startDaemon(t, env)
+func testSSHContainerWorkingDir(t *testing.T, d *daemonInstance) {
 
 	createFrameViaDaemon(t, d, "cwdframe")
 
@@ -898,9 +887,7 @@ func TestSSHContainerWorkingDir(t *testing.T) {
 // stdout buffer and this test fails.
 //
 // Runs as user@ (non-root), exercising the native ts su path.
-func TestSSHContainerStdoutStderrSeparate(t *testing.T) {
-	env := newTestEnv(t)
-	d := startDaemon(t, env)
+func testSSHContainerStdoutStderrSeparate(t *testing.T, d *daemonInstance) {
 
 	// Create frame via daemon (true e2e - no manual data structure manipulation)
 	createFrameViaDaemon(t, d, "streamframe")
@@ -971,9 +958,7 @@ func (b *safeBuffer) String() string {
 // raw mode. Until busybox is added to libexec and auto-copied to frames by the daemon,
 // this test must install it directly. This is a known exception to the "no manual
 // data structure manipulation" rule.
-func TestSSHContainerPtyRawNoCRInjection(t *testing.T) {
-	env := newTestEnv(t)
-	d := startDaemon(t, env)
+func testSSHContainerPtyRawNoCRInjection(t *testing.T, d *daemonInstance) {
 
 	// Create frame via daemon
 	createFrameViaDaemon(t, d, "rawframe")
@@ -1057,9 +1042,7 @@ func TestSSHContainerPtyRawNoCRInjection(t *testing.T) {
 //
 // NOTE: The minimal rootfs has only shell builtins and ts, so all checks use
 // shell builtins (read, echo, test) or read files via shell redirection.
-func TestContainerNamespaceSetup(t *testing.T) {
-	env := newTestEnv(t)
-	d := startDaemon(t, env)
+func testContainerNamespaceSetup(t *testing.T, d *daemonInstance) {
 
 	// Create frame via daemon (true e2e - no manual data structure manipulation)
 	createFrameViaDaemon(t, d, "nstest")
@@ -1163,32 +1146,7 @@ func TestContainerNamespaceSetup(t *testing.T) {
 //
 // NOTE: This test requires VM dependencies (cloud-hypervisor, vmlinux, virtiofsd, passt).
 // If VM deps are not available, the test fails (e2e tests never skip).
-func TestVMNamespaceSetup(t *testing.T) {
-	// Require VM dependencies
-	_ = requireVMDeps(t)
-
-	env := newTestEnv(t)
-
-	// Create a policy that allows vmx isolation
-	policyPath := filepath.Join(env.root, "policy.json")
-	policyContent := `{
-		"grants": [
-			{
-				"principals": ["*"],
-				"cap": {
-					"role": "developer",
-					"isolation": "vmx",
-					"maxFrames": 10
-				}
-			}
-		]
-	}`
-	if err := os.WriteFile(policyPath, []byte(policyContent), 0644); err != nil {
-		t.Fatalf("write policy file: %v", err)
-	}
-
-	d := startDaemonWithPolicy(t, env, policyPath)
-
+func testVMNamespaceSetup(t *testing.T, d *daemonInstance) {
 	// Create frame via daemon
 	createFrameViaDaemon(t, d, "vmnstest")
 

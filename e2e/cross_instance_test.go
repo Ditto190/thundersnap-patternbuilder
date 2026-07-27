@@ -35,9 +35,11 @@ import (
 // wall-clock and would differ) are excluded from the hashed tree. The subdir
 // snap's root (/det) has its timestamps zeroed in the hash, so only the files
 // inside /det — fully under the test's control — contribute.
-func TestCrossInstanceSnapDeterminism(t *testing.T) {
-	env1 := newTestEnv(t)
-	d1 := startDaemon(t, env1)
+func testCrossInstanceSnapDeterminism(t *testing.T, d1 *daemonInstance) {
+	// d1 is the shared container-mode daemon from TestContainer. Spin up an
+	// independent second daemon (separate state dir) so the determinism check
+	// still compares two separate thundersnapd processes — the whole point of
+	// this scenario. Only d2 is local to this subtest; d1 is reused.
 	env2 := newTestEnv(t)
 	d2 := startDaemon(t, env2)
 

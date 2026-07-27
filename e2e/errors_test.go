@@ -21,9 +21,7 @@ import (
 // fails (the daemon's frame resolution surfaces an error rather than silently
 // creating/connecting a phantom frame). Replaces not_e2e
 // TestErrorSnapNonexistentFrame (fake control server).
-func TestErrorSSHUnknownFrame(t *testing.T) {
-	env := newTestEnv(t)
-	d := startDaemon(t, env)
+func testErrorSSHUnknownFrame(t *testing.T, d *daemonInstance) {
 
 	// Connect to a frame name that was never created.
 	out, exit, err := sshExec(t, d, "root@does-not-exist", "echo hi")
@@ -37,9 +35,7 @@ func TestErrorSSHUnknownFrame(t *testing.T) {
 // TestErrorDeleteNonexistentFrame verifies that deleting a nonexistent frame
 // UUID over SSH fails. Replaces not_e2e TestErrorDeleteNonexistentFrame (fake
 // control server).
-func TestErrorDeleteNonexistentFrame(t *testing.T) {
-	env := newTestEnv(t)
-	d := startDaemon(t, env)
+func testErrorDeleteNonexistentFrame(t *testing.T, d *daemonInstance) {
 	createFrameViaDaemon(t, d, "errhost") // a real frame to run the command from
 
 	out, exit, err := sshExec(t, d, "root@errhost", "ts frame --delete 00000000-0000-0000-0000-000000000000")
@@ -57,9 +53,7 @@ func TestErrorDeleteNonexistentFrame(t *testing.T) {
 // a symlink loop completes (the indexer detects the loop rather than recursing
 // forever). Replaces not_e2e TestSymlinkLoopDetection (fake control server)
 // for the live snap path.
-func TestErrorSnapSymlinkLoop(t *testing.T) {
-	env := newTestEnv(t)
-	d := startDaemon(t, env)
+func testErrorSnapSymlinkLoop(t *testing.T, d *daemonInstance) {
 	createFrameViaDaemon(t, d, "loop")
 	installBusyboxAppletInFrame(t, d, "loop", "ln")
 
@@ -88,9 +82,7 @@ func TestErrorSnapSymlinkLoop(t *testing.T) {
 // dropping to a root shell. vshd runs `su - <sshuser>` via ts's built-in su;// before runAsSu rejected unknown users, a bogus username fell back to uid 0 —
 // an isolation bypass (any nonexistent username @ a frame got root). This is
 // the security regression test for that fix.
-func TestErrorSSHUnknownUser(t *testing.T) {
-	env := newTestEnv(t)
-	d := startDaemon(t, env)
+func testErrorSSHUnknownUser(t *testing.T, d *daemonInstance) {
 	createFrameViaDaemon(t, d, "userhost")
 
 	// SSH as a user that does not exist in the frame's /etc/passwd. The session
@@ -111,9 +103,7 @@ func TestErrorSSHUnknownUser(t *testing.T) {
 // the fake control server checked but the real daemon did not (a spec like
 // "../fs/<user>/<uuid>::" would have resolved to another tenant's frame
 // subvolume). The daemon now validates snap-id components.
-func TestErrorInvalidFrameSpec(t *testing.T) {
-	env := newTestEnv(t)
-	d := startDaemon(t, env)
+func testErrorInvalidFrameSpec(t *testing.T, d *daemonInstance) {
 	createFrameViaDaemon(t, d, "spechost")
 
 	out, exit, err := sshExec(t, d, "root@spechost", "ts frame '../../etc/passwd::'")
@@ -133,9 +123,7 @@ func TestErrorInvalidFrameSpec(t *testing.T) {
 // filesystem path. Ref names must start with a letter and contain only
 // letters/digits/dash/underscore (no dots, no slashes); a dot or slash in a
 // frame name is a path-traversal hazard, so it is refused.
-func TestErrorInvalidFrameName(t *testing.T) {
-	env := newTestEnv(t)
-	d := startDaemon(t, env)
+func testErrorInvalidFrameName(t *testing.T, d *daemonInstance) {
 	createFrameViaDaemon(t, d, "namehost")
 
 	// `ts frame <bad>` is rejected client-side for a non-UUID, non-ref name.
