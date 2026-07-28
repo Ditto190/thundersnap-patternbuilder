@@ -221,6 +221,37 @@ func createFrameForMCP(t *testing.T, d *daemonInstance, refName string) string {
 	return createFrameViaDaemon(t, d, refName)
 }
 
+// installBusyboxAppletsInFrame installs the named busybox applets into a
+// frame's /bin over the daemon's SFTP subsystem. A nil:nil:nil frame ships
+// only the `ts` binary (plus /bin/sh and /bin/su symlinks to it); the MCP
+// tool command builders (view/create_file/bash) call out to standard POSIX
+// utilities (mkdir, awk, find, head, sort, base64, ...), so the e2e harness
+// must install them the same way the rest of the suite does (see
+// installBusyboxAppletInFrame). Each applet is a copy of the host's
+// busybox-static, which dispatches on argv[0].
+func installBusyboxAppletsInFrame(t *testing.T, d *daemonInstance, refName string, applets ...string) {
+	t.Helper()
+	for _, a := range applets {
+		installBusyboxAppletInFrame(t, d, refName, a)
+	}
+}
+
+// mcpFrameApplets are the POSIX utilities the MCP tool command builders
+// invoke inside a frame. They are installed once per frame so the bash/view/
+// create_file tools work in a minimal nil:nil:nil frame (which has only `ts`).
+var mcpFrameApplets = []string{
+	"mkdir",   // create_file: mkdir -p $(dirname ...)
+	"dirname", // create_file: $(dirname ...)
+	"base64",  // create_file: base64 -d <<heredoc
+	"awk",     // view (file): awk line-numbering
+	"find",    // view (dir): find -maxdepth 2
+	"sort",    // view (dir): | sort
+	"head",    // view (dir): | head -200
+	"stat",    // view (image): stat -c %s (also useful for general tests)
+	"sleep",   // timeout/reap tests: foreground long-running command
+	"ps",      // reap tests: inspect leftover processes
+}
+
 // TestMCPToolsRoundTrip is the core MCP e2e test (Phase 4, T5). It exercises
 // every tool end-to-end against a fresh frame: list_frames/list_refs before
 // and after frame creation, bash (zero + non-zero exit), view (file + dir +
@@ -268,6 +299,10 @@ func TestMCPToolsRoundTrip(t *testing.T) {
 
 	// --- create a real frame via SSH (ts frame), so MCP has something to target ---
 	uuid := createFrameForMCP(t, d, "mcpframe")
+	// nil:nil:nil frames ship only `ts`; install the POSIX utilities the tool
+	// command builders call (mkdir/awk/find/head/sort/base64/...). str_replace
+	// is host-side and needs nothing in-frame.
+	installBusyboxAppletsInFrame(t, d, "mcpframe", mcpFrameApplets...)
 
 	// --- list_frames now shows it, named by the ref ---
 	{
@@ -503,4 +538,168 @@ func TestMCPHTTPMuxResponds(t *testing.T) {
 	if err := session.Close(); err != nil {
 		t.Logf("MCP session close: %v", err)
 	}
+}
+
+// TestMCPTimeoutAndReap (Phase 4, T2+T4) is the cancellation/timeout spike the
+// design doc flags as a prerequisite: a command that runs past its per-call
+// timeout must (a) return a timeout error result with the partial output, and
+// (b) leave NO process behind — including a backgrounded child, which is the
+// case the SSH path never proved. "Leaves no process behind" is the whole
+// point: closing the vshd socket mid-stream must tear down the process group,
+// not orphan it. vshdsession now sets Setpgid and kills the group on disconnect
+// (without that, `sleep N &` survives as a reparented orphan); this test pins
+// that contract so a regression is caught.
+func TestMCPTimeoutAndReap(t *testing.T) {
+	env := newTestEnv(t)
+	d, httpBase := startDaemonWithHTTP(t, env)
+	session := mcpClient(t, httpBase)
+	createFrameForMCP(t, d, "timeoutframe")
+	installBusyboxAppletsInFrame(t, d, "timeoutframe", "sleep", "ps")
+
+	// Foreground long sleep + a backgrounded long sleep. The 2s timeout fires
+	// well before either exits (30s). On timeout runInFrame closes the vshd
+	// socket; vshdsession reaps the whole process group.
+	start := time.Now()
+	out, isErr := callTool(t, session, "thundersnap_bash", map[string]any{
+		"command": "sleep 30 & sleep 30",
+		"frame":   "timeoutframe",
+		"timeout": 2,
+	})
+	elapsed := time.Since(start)
+
+	if !isErr {
+		t.Fatalf("timeout bash: expected IsError=true, got false (output %q)", out)
+	}
+	if !strings.Contains(out, "timed out") {
+		t.Errorf("timeout bash: output %q missing 'timed out' marker", out)
+	}
+	// The timeout should fire near the 2s deadline, not run the full 30s. Allow
+	// generous slack for the reap teardown + CI noise.
+	if elapsed > 20*time.Second {
+		t.Errorf("timeout bash: took %v, expected ~2s (teardown may have hung)", elapsed)
+	}
+	t.Logf("timeout bash returned in %v: %q", elapsed, out)
+
+	// Give vshd a moment to tear down the process group after the conn close.
+	time.Sleep(1500 * time.Millisecond)
+
+	// Assert no leftover `sleep 30` processes in the frame's PID namespace.
+	// ps (busybox) lists every process in the namespace; parse in Go so we
+	// don't need a `grep` applet.
+	psOut, _, err := sshExec(t, d, "root@timeoutframe", "ps")
+	if err != nil {
+		t.Fatalf("ssh ps after timeout: %v", err)
+	}
+	t.Logf("ps after timeout:\n%s", psOut)
+	// ps itself and the sh that ran it appear in the output; only `sleep 30`
+	// would indicate a leak.
+	if n := strings.Count(psOut, "sleep 30"); n > 0 {
+		t.Errorf("timeout left %d 'sleep 30' process(es) behind (process-group reap failed):\n%s", n, psOut)
+	}
+}
+
+// TestMCPFrameResolution (Phase 4, T6) covers the `frame` argument semantics:
+//   - frame="" auto-creates a fresh unattached frame and runs there; the new
+//     frame then appears in list_frames (proving runInFrame's auto-create path
+//     and the frames.Store sidecar are wired together).
+//   - frame=<uuid> resolves a frame by UUID.
+//   - frame=<ref> resolves a frame by ref name.
+//   - frame=<bad> errors cleanly with a resolve error.
+//
+// It does not depend on timeout/reap; it's purely the frame-resolution matrix.
+func TestMCPFrameResolution(t *testing.T) {
+	env := newTestEnv(t)
+	d, httpBase := startDaemonWithHTTP(t, env)
+	session := mcpClient(t, httpBase)
+
+	// --- frame="" auto-creates a fresh frame ---
+	// A fresh user has no frames; bash with frame="" must auto-create one and
+	// run there. We write a marker file we can later read back by UUID.
+	autoOut, isErr := callTool(t, session, "thundersnap_bash", map[string]any{
+		"command": "echo auto-created > /work/marker.txt",
+		"frame":   "",
+	})
+	if isErr {
+		t.Fatalf("bash frame=\"\" auto-create: unexpected error %q", autoOut)
+	}
+
+	// list_frames must now show exactly one frame (the auto-created one). It's
+	// unattached (no ref), so it's listed by UUID.
+	listOut, isErr := callTool(t, session, "thundersnap_list_frames", nil)
+	if isErr {
+		t.Fatalf("list_frames after auto-create: unexpected error %q", listOut)
+	}
+	var lf struct {
+		Frames []struct {
+			Name   string `json:"name"`
+			Status string `json:"status"`
+		} `json:"frames"`
+	}
+	if err := json.Unmarshal([]byte(listOut), &lf); err != nil {
+		t.Fatalf("list_frames: unmarshal %q: %v", listOut, err)
+	}
+	if len(lf.Frames) != 1 {
+		t.Fatalf("list_frames after auto-create: want 1 frame, got %d (%+v)", len(lf.Frames), lf.Frames)
+	}
+	autoUUID := lf.Frames[0].Name
+	if _, perr := uuidParse(autoUUID); perr != nil {
+		t.Fatalf("auto-created frame name %q is not a UUID: %v", autoUUID, perr)
+	}
+	t.Logf("auto-created frame UUID: %s", autoUUID)
+
+	// --- frame=<uuid> resolves the auto-created frame and reads the marker ---
+	// Use shell builtins (read/echo) rather than `cat`, which isn't present in a
+	// nil:nil:nil frame; this keeps the auto-create path applet-free.
+	uuidOut, isErr := callTool(t, session, "thundersnap_bash", map[string]any{
+		"command": "while IFS= read -r line; do echo \"$line\"; done < /work/marker.txt",
+		"frame":   autoUUID,
+	})
+	if isErr {
+		t.Fatalf("bash frame=<uuid>: unexpected error %q", uuidOut)
+	}
+	if !strings.Contains(uuidOut, "auto-created") {
+		t.Errorf("bash frame=<uuid>: output %q missing marker content", uuidOut)
+	}
+
+	// --- frame=<ref> resolves a named ref ---
+	refUUID := createFrameForMCP(t, d, "namedframe")
+	refOut, isErr := callTool(t, session, "thundersnap_bash", map[string]any{
+		"command": "echo via-ref > /work/from-ref.txt",
+		"frame":   "namedframe",
+	})
+	if isErr {
+		t.Fatalf("bash frame=<ref>: unexpected error %q", refOut)
+	}
+	// Verify via UUID that the ref-resolved call landed in the right frame.
+	uuidReadOut, isErr := callTool(t, session, "thundersnap_bash", map[string]any{
+		"command": "while IFS= read -r line; do echo \"$line\"; done < /work/from-ref.txt",
+		"frame":   refUUID,
+	})
+	if isErr {
+		t.Fatalf("bash frame=<ref-uuid> readback: unexpected error %q", uuidReadOut)
+	}
+	if !strings.Contains(uuidReadOut, "via-ref") {
+		t.Errorf("frame=<ref> did not land in the ref's frame: readback %q", uuidReadOut)
+	}
+
+	// --- frame=<bad> errors cleanly ---
+	badOut, isErr := callTool(t, session, "thundersnap_bash", map[string]any{
+		"command": "echo nope",
+		"frame":   "definitely-not-a-real-frame",
+	})
+	if !isErr {
+		t.Errorf("bash frame=<bad>: expected IsError=true, got false (output %q)", badOut)
+	}
+	if !strings.Contains(badOut, "resolve frame") && !strings.Contains(badOut, "no such frame") && !strings.Contains(badOut, "not found") {
+		t.Errorf("bash frame=<bad>: output %q missing resolve/not-found error", badOut)
+	}
+}
+
+// uuidParse parses a UUID string and returns an error if it's malformed. Used
+// by TestMCPFrameResolution to assert the auto-created frame is listed by UUID.
+func uuidParse(s string) (struct{}, error) {
+	if len(s) != 36 || strings.Count(s, "-") != 4 {
+		return struct{}{}, fmt.Errorf("not a UUID: %q", s)
+	}
+	return struct{}{}, nil
 }

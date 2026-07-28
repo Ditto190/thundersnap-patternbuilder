@@ -21,12 +21,15 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -143,6 +146,14 @@ func mcpAuthMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+// errMCPCommandTimeout is returned by runInFrame when the per-call context
+// deadline fires before the command produced a FrameExit. Handlers surface
+// the partial output (with the timeout marker runInFrame appends) as an
+// IsError=true result so the LLM sees the timeout rather than a silent
+// success. It is distinct from a setup error (resolve/dial failure), where
+// runInFrame returns a wrapped error and a nil result.
+var errMCPCommandTimeout = errors.New("command timed out")
+
 // --- The launcher: vshd one-shot exec in a frame ---------------------------
 
 // runInFrame runs `sh -c <command>` in the named frame for the given user,
@@ -236,8 +247,28 @@ func runInFrame(ctx context.Context, user, frame, workdir, command string) (*mcp
 				r.res.Output += marker
 			}
 		}
-		return r.res, r.err
+		return r.res, errMCPCommandTimeout
 	}
+}
+
+// isWithinRootFS reports whether path is rootFS itself or a descendant of it
+// after cleaning. It guards host-side file operations (str_replace) against
+// path-traversal escapes from the frame's rootfs: a tool path like
+// "/../../etc/shadow" must resolve inside the frame, not the host.
+func isWithinRootFS(path, rootFS string) bool {
+	absRoot, err := filepath.Abs(rootFS)
+	if err != nil {
+		return false
+	}
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return false
+	}
+	rel, err := filepath.Rel(absRoot, absPath)
+	if err != nil {
+		return false
+	}
+	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
 // --- Command builders (ported from aperture chat/sandbox) -------------------
@@ -318,38 +349,11 @@ func buildCreateFileCommand(path, fileText string) string {
 	)
 }
 
-// strReplaceScript is the Python program piped over the heredoc. Ported from
-// aperture chat/sandbox/tool_str_replace.go. surrogateescape so non-UTF-8
-// files survive byte-for-byte.
-const strReplaceScript = `import base64, sys
-buf = sys.stdin.read().splitlines()
-old = base64.b64decode(buf[0]).decode()
-new = base64.b64decode(buf[1]).decode()
-path = sys.argv[1]
-with open(path, encoding='utf-8', errors='surrogateescape') as f:
-    content = f.read()
-count = content.count(old)
-if count == 0:
-    print('Error: string not found in ' + path, file=sys.stderr)
-    sys.exit(1)
-if count > 1:
-    print('Error: string appears ' + str(count) + ' times in ' + path + ' (must be unique)', file=sys.stderr)
-    sys.exit(1)
-with open(path, 'w', encoding='utf-8', errors='surrogateescape') as f:
-    f.write(content.replace(old, new, 1))
-print('Replaced in ' + path)
-`
-
-// buildStrReplaceCommand returns the shell program that runs the embedded
-// Python str-replace against path. Ported from aperture
-// chat/sandbox/tool_str_replace.go.
-func buildStrReplaceCommand(path, oldStr, newStr string) string {
-	b64Old := base64.StdEncoding.EncodeToString([]byte(oldStr))
-	b64New := base64.StdEncoding.EncodeToString([]byte(newStr))
-	qpath := shellQuote(path)
-	return fmt.Sprintf("python3 -c %s %s <<'B64EOF'\n%s\n%s\nB64EOF\n",
-		shellQuote(strReplaceScript), qpath, b64Old, b64New)
-}
+// str_replace has no command builder: it is implemented host-side (see
+// mcpStrReplaceToolHandler) because thundersnap's default nil:nil:nil frames
+// ship no python3 and the daemon has direct rootfs access. The other tools'
+// builders (shellQuote, buildViewCommand, buildCreateFileCommand) remain
+// exec-based below.
 
 // --- Tool timeout constants (match aperture + design doc) ------------------
 
@@ -370,18 +374,17 @@ const (
 // unique) are returned as CallToolResult with IsError=true, matching aperture's
 // chatToolToMCPHandler convention (the LLM must see these to self-correct).
 
-// textResult builds a single-TextContent CallToolResult. A non-nil Go error
-// becomes an MCP error result (IsError=true); a nil error becomes a normal
-// result. This mirrors aperture's chatToolToMCPHandler split.
-func textResult(text string, err error) (*mcp.CallToolResult, error) {
-	if err != nil {
-		return &mcp.CallToolResult{
-			Content: []mcp.Content{&mcp.TextContent{Text: err.Error()}},
-			IsError: true,
-		}, nil
-	}
+// textResult builds a single-TextContent CallToolResult. isError=true marks a
+// tool-level failure (non-zero exit, file not found, string not unique,
+// timeout, invalid input) so the LLM sees it and can self-correct; the output
+// text is always preserved in Content. This mirrors aperture's
+// chatToolToMCPHandler convention: protocol/transport errors come back as Go
+// errors from the handler, while command/soft failures come back as
+// IsError=true results so the LLM can read the output and retry.
+func textResult(text string, isError bool) (*mcp.CallToolResult, error) {
 	return &mcp.CallToolResult{
 		Content: []mcp.Content{&mcp.TextContent{Text: text}},
+		IsError: isError,
 	}, nil
 }
 
@@ -395,11 +398,11 @@ func mcpBashToolHandler(ctx context.Context, req *mcp.CallToolRequest) (*mcp.Cal
 	}
 	if req.Params != nil && len(req.Params.Arguments) > 0 {
 		if err := json.Unmarshal(req.Params.Arguments, &params); err != nil {
-			return textResult("", fmt.Errorf("invalid input: %w", err))
+			return textResult(fmt.Sprintf("invalid input: %v", err), true)
 		}
 	}
 	if params.Command == "" {
-		return textResult("", fmt.Errorf("command is required"))
+		return textResult("command is required", true)
 	}
 
 	timeout := mcpBashDefaultTimeout
@@ -415,9 +418,16 @@ func mcpBashToolHandler(ctx context.Context, req *mcp.CallToolRequest) (*mcp.Cal
 
 	res, err := runInFrame(ctx, mcpUserFromContext(ctx), params.Frame, params.Workdir, params.Command)
 	if err != nil {
-		return textResult("", fmt.Errorf("exec failed: %w", err))
+		if errors.Is(err, errMCPCommandTimeout) && res != nil {
+			// Timeout: runInFrame already appended a marker to res.Output;
+			// surface the partial output as an error result.
+			return textResult(mcpexec.FormatExit(res), true)
+		}
+		return textResult(fmt.Sprintf("exec failed: %v", err), true)
 	}
-	return textResult(mcpexec.FormatExit(res), nil)
+	// A non-zero exit is a tool-level failure (the LLM should see the output
+	// and self-correct), not a protocol error.
+	return textResult(mcpexec.FormatExit(res), res.ExitCode != 0)
 }
 
 // mcpViewToolHandler is the ToolHandler for thundersnap_view.
@@ -429,15 +439,15 @@ func mcpViewToolHandler(ctx context.Context, req *mcp.CallToolRequest) (*mcp.Cal
 	}
 	if req.Params != nil && len(req.Params.Arguments) > 0 {
 		if err := json.Unmarshal(req.Params.Arguments, &params); err != nil {
-			return textResult("", fmt.Errorf("invalid input: %w", err))
+			return textResult(fmt.Sprintf("invalid input: %v", err), true)
 		}
 	}
 	if params.Path == "" {
-		return textResult("", fmt.Errorf("path is required"))
+		return textResult("path is required", true)
 	}
 	cmd, err := buildViewCommand(params.Path, params.ViewRange)
 	if err != nil {
-		return textResult("", err)
+		return textResult(err.Error(), true)
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, mcpViewTimeout)
@@ -445,12 +455,15 @@ func mcpViewToolHandler(ctx context.Context, req *mcp.CallToolRequest) (*mcp.Cal
 
 	res, err := runInFrame(ctx, mcpUserFromContext(ctx), params.Frame, "", cmd)
 	if err != nil {
-		return textResult("", fmt.Errorf("view failed: %w", err))
+		if errors.Is(err, errMCPCommandTimeout) && res != nil {
+			return textResult(truncateUTF8(res.Output, mcpMaxViewOutput, "\n\n... output truncated ..."), true)
+		}
+		return textResult(fmt.Sprintf("view failed: %v", err), true)
 	}
-	if res.ExitCode != 0 {
-		return textResult(fmt.Sprintf("Error: %s", res.Output), nil)
-	}
-	return textResult(truncateUTF8(res.Output, mcpMaxViewOutput, "\n\n... output truncated ..."), nil)
+	// A non-zero exit (e.g. path not found) is a tool-level failure. The view
+	// command writes its own "Error: <path> not found" to stderr, so the
+	// output already carries the message; just mark it IsError.
+	return textResult(truncateUTF8(res.Output, mcpMaxViewOutput, "\n\n... output truncated ..."), res.ExitCode != 0)
 }
 
 // mcpCreateFileToolHandler is the ToolHandler for thundersnap_create_file.
@@ -462,11 +475,11 @@ func mcpCreateFileToolHandler(ctx context.Context, req *mcp.CallToolRequest) (*m
 	}
 	if req.Params != nil && len(req.Params.Arguments) > 0 {
 		if err := json.Unmarshal(req.Params.Arguments, &params); err != nil {
-			return textResult("", fmt.Errorf("invalid input: %w", err))
+			return textResult(fmt.Sprintf("invalid input: %v", err), true)
 		}
 	}
 	if params.Path == "" {
-		return textResult("", fmt.Errorf("path is required"))
+		return textResult("path is required", true)
 	}
 	cmd := buildCreateFileCommand(params.Path, params.FileText)
 
@@ -475,15 +488,33 @@ func mcpCreateFileToolHandler(ctx context.Context, req *mcp.CallToolRequest) (*m
 
 	res, err := runInFrame(ctx, mcpUserFromContext(ctx), params.Frame, "", cmd)
 	if err != nil {
-		return textResult("", fmt.Errorf("create_file failed: %w", err))
+		if errors.Is(err, errMCPCommandTimeout) && res != nil {
+			return textResult(res.Output, true)
+		}
+		return textResult(fmt.Sprintf("create_file failed: %v", err), true)
 	}
 	if res.ExitCode != 0 {
-		return textResult(fmt.Sprintf("Error: %s", res.Output), nil)
+		return textResult(res.Output, true)
 	}
-	return textResult(fmt.Sprintf("Created %s (%d bytes)", params.Path, len(params.FileText)), nil)
+	return textResult(fmt.Sprintf("Created %s (%d bytes)", params.Path, len(params.FileText)), false)
 }
 
 // mcpStrReplaceToolHandler is the ToolHandler for thundersnap_str_replace.
+//
+// Unlike the other tools, str_replace does NOT run a command in the frame.
+// Aperture's tool_str_replace.go pipes an embedded Python program over a
+// heredoc because Aperture's sandbox is a remote HTTP backend with no direct
+// filesystem access — it must run python3 *inside* the sandbox. Thundersnap's
+// daemon, by contrast, has direct host access to the frame's rootfs (a local
+// btrfs subvolume), so the read/count/replace/write is done in-process on the
+// host. This is a deliberate, documented deviation from the design doc's
+// "byte-identical to Aperture" note: thundersnap's default nil:nil:nil frames
+// ship no python3 (and no /lib64 for a dynamic one), so the Python approach
+// fails there. The host-side implementation is binary-safe (it operates on
+// raw []byte, so non-UTF-8 files survive byte-for-byte — the same property
+// Aperture's surrogateescape buys) and works in every frame, minimal or full.
+// The contract is unchanged: error on 0 or >1 occurrences, replace exactly
+// once, preserve the file's existing mode/owner.
 func mcpStrReplaceToolHandler(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	var params struct {
 		Path   string `json:"path"`
@@ -493,28 +524,73 @@ func mcpStrReplaceToolHandler(ctx context.Context, req *mcp.CallToolRequest) (*m
 	}
 	if req.Params != nil && len(req.Params.Arguments) > 0 {
 		if err := json.Unmarshal(req.Params.Arguments, &params); err != nil {
-			return textResult("", fmt.Errorf("invalid input: %w", err))
+			return textResult(fmt.Sprintf("invalid input: %v", err), true)
 		}
 	}
 	if params.Path == "" {
-		return textResult("", fmt.Errorf("path is required"))
+		return textResult("path is required", true)
 	}
 	if params.OldStr == "" {
-		return textResult("", fmt.Errorf("old_str is required"))
+		return textResult("old_str is required", true)
 	}
-	cmd := buildStrReplaceCommand(params.Path, params.OldStr, params.NewStr)
+
+	user := mcpUserFromContext(ctx)
+	if user == "" {
+		return textResult("no MCP user resolved for request", true)
+	}
 
 	ctx, cancel := context.WithTimeout(ctx, mcpStrReplaceTimeout)
 	defer cancel()
 
-	res, err := runInFrame(ctx, mcpUserFromContext(ctx), params.Frame, "", cmd)
+	rootFS, _, err := resolveFrameRootFS(user, params.Frame)
 	if err != nil {
-		return textResult("", fmt.Errorf("str_replace failed: %w", err))
+		return textResult(fmt.Sprintf("resolve frame: %v", err), true)
 	}
-	if res.ExitCode != 0 {
-		return textResult(fmt.Sprintf("Error: %s", res.Output), nil)
+	if err := prepareContainerRootFS(rootFS, ""); err != nil {
+		return textResult(fmt.Sprintf("prepare frame rootfs: %v", err), true)
 	}
-	return textResult(res.Output, nil)
+
+	// Resolve the in-frame path to a host path under rootFS, refusing to
+	// escape the frame (a path like /../../etc/shadow must not reach the host).
+	rel := strings.TrimPrefix(filepath.Clean("/"+params.Path), "/")
+	hostPath := filepath.Join(rootFS, rel)
+	if !isWithinRootFS(hostPath, rootFS) {
+		return textResult(fmt.Sprintf("path %q escapes the frame", params.Path), true)
+	}
+
+	content, err := os.ReadFile(hostPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return textResult(fmt.Sprintf("Error: %s not found", params.Path), true)
+		}
+		return textResult(fmt.Sprintf("read %s: %v", params.Path, err), true)
+	}
+
+	oldBytes := []byte(params.OldStr)
+	count := bytes.Count(content, oldBytes)
+	if count == 0 {
+		return textResult(fmt.Sprintf("Error: string not found in %s", params.Path), true)
+	}
+	if count > 1 {
+		return textResult(fmt.Sprintf("Error: string appears %d times in %s (must be unique)", count, params.Path), true)
+	}
+
+	newContent := bytes.Replace(content, oldBytes, []byte(params.NewStr), 1)
+	// Preserve the existing file mode; os.WriteFile truncates the existing
+	// inode (no chown, no mode change for an existing file) so owner/perm
+	// survive. Stat first to surface a directory/pipe/etc. as a clean error.
+	info, err := os.Stat(hostPath)
+	if err != nil {
+		return textResult(fmt.Sprintf("stat %s: %v", params.Path, err), true)
+	}
+	if err := os.WriteFile(hostPath, newContent, info.Mode()); err != nil {
+		return textResult(fmt.Sprintf("write %s: %v", params.Path, err), true)
+	}
+
+	if ctx.Err() == context.DeadlineExceeded {
+		return textResult(fmt.Sprintf("str_replace timed out writing %s", params.Path), true)
+	}
+	return textResult(fmt.Sprintf("Replaced in %s", params.Path), false)
 }
 
 // mcpListFramesToolHandler is the ToolHandler for thundersnap_list_frames. It
@@ -524,14 +600,14 @@ func mcpStrReplaceToolHandler(ctx context.Context, req *mcp.CallToolRequest) (*m
 func mcpListFramesToolHandler(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	user := mcpUserFromContext(ctx)
 	if user == "" {
-		return textResult("", fmt.Errorf("no MCP user resolved for request"))
+		return textResult("no MCP user resolved for request", true)
 	}
 	frameStore := userFrameStore(user)
 	refStore := userRefStore(user)
 
 	uuids, err := frameStore.List()
 	if err != nil {
-		return textResult("", fmt.Errorf("list frames: %w", err))
+		return textResult(fmt.Sprintf("list frames: %v", err), true)
 	}
 
 	refByUUID := map[frameid.ID]string{}
@@ -565,9 +641,9 @@ func mcpListFramesToolHandler(ctx context.Context, req *mcp.CallToolRequest) (*m
 	}
 	out, err := json.Marshal(map[string]any{"frames": frames})
 	if err != nil {
-		return textResult("", fmt.Errorf("marshal frames: %w", err))
+		return textResult(fmt.Sprintf("marshal frames: %v", err), true)
 	}
-	return textResult(string(out), nil)
+	return textResult(string(out), false)
 }
 
 // mcpListRefsToolHandler is the ToolHandler for thundersnap_list_refs. It does
@@ -575,12 +651,12 @@ func mcpListFramesToolHandler(ctx context.Context, req *mcp.CallToolRequest) (*m
 func mcpListRefsToolHandler(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	user := mcpUserFromContext(ctx)
 	if user == "" {
-		return textResult("", fmt.Errorf("no MCP user resolved for request"))
+		return textResult("no MCP user resolved for request", true)
 	}
 	refStore := userRefStore(user)
 	names, err := refStore.List()
 	if err != nil {
-		return textResult("", fmt.Errorf("list refs: %w", err))
+		return textResult(fmt.Sprintf("list refs: %v", err), true)
 	}
 	type refEntry struct {
 		Name    string   `json:"name"`
@@ -600,9 +676,9 @@ func mcpListRefsToolHandler(ctx context.Context, req *mcp.CallToolRequest) (*mcp
 	}
 	out, err := json.Marshal(map[string]any{"refs": refs})
 	if err != nil {
-		return textResult("", fmt.Errorf("marshal refs: %w", err))
+		return textResult(fmt.Sprintf("marshal refs: %v", err), true)
 	}
-	return textResult(string(out), nil)
+	return textResult(string(out), false)
 }
 
 // --- MCP server factory + HTTP mount ---------------------------------------

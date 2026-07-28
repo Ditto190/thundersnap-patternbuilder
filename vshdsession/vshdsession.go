@@ -164,7 +164,9 @@ func servePTY(conn io.Writer, reader io.Reader, cmd *exec.Cmd, postStart func(pi
 
 	<-done
 	logf.logf("signaling pty session to exit")
-	cmd.Process.Signal(syscall.SIGHUP)
+	// pty.Start set Setsid, so the child leads its own process group; signal
+	// the whole group so backgrounded children die with the shell, not orphaned.
+	_ = killProcessGroup(cmd, syscall.SIGHUP)
 	code := waitExitCode(cmd)
 	vshdproto.WriteFrame(conn, vshdproto.FrameExit, vshdproto.EncodeExit(code))
 	logf.logf("pty session exited (code %d)", code)
@@ -186,6 +188,11 @@ func servePipe(conn io.Writer, reader io.Reader, cmd *exec.Cmd, postStart func(p
 	var writeMu sync.Mutex
 	cmd.Stdout = &frameWriter{conn: conn, typ: vshdproto.FrameStdout, mu: &writeMu}
 	cmd.Stderr = &frameWriter{conn: conn, typ: vshdproto.FrameStderr, mu: &writeMu}
+
+	// Put the child in its own process group so disconnect can reap the
+	// whole tree (command + backgrounded children) with kill(-pgid). See
+	// ensureProcessGroup.
+	ensureProcessGroup(cmd)
 
 	if err := cmd.Start(); err != nil {
 		logf.logf("start command: %v", err)
@@ -235,31 +242,66 @@ func servePipe(conn io.Writer, reader io.Reader, cmd *exec.Cmd, postStart func(p
 	logf.logf("command exited (code %d)", code)
 }
 
-// killChildOnDisconnect signals cmd to exit because the client disconnected.
-// It sends SIGHUP (the signal a terminal sends on hangup, matching servePTY),
-// then escalates to SIGKILL after a 2s grace in case the child ignores or traps
-// SIGHUP. Signalling an already-exited child is harmless (the kernel returns
-// ESRCH, which we ignore). It runs the escalation in its own goroutine so the
-// caller (the stdin reader loop) can return immediately; the main servePipe
-// goroutine unblocks on cmd.Wait() once the child exits.
+// ensureProcessGroup puts cmd in its own process group (Setpgid) so that on
+// client disconnect the whole session tree — the command AND any backgrounded
+// children it forked (e.g. `sleep 30 &` inside `sh -c '...'`) — can be reaped
+// with a single kill(-pgid) instead of orphaning the grandchildren. Without
+// this, killChildOnDisconnect only signals the direct child: a shell that ran
+// `sleep N &` exits on SIGHUP but the backgrounded sleep is reparented to
+// init and keeps running, leaking until the frame is destroyed.
+//
+// It is a no-op if the caller already set SysProcAttr (e.g. a future caller
+// that needs a different PGID policy); otherwise it sets Setpgid so the child
+// becomes the leader of a fresh PG with PGID == child PID.
+func ensureProcessGroup(cmd *exec.Cmd) {
+	if cmd.SysProcAttr == nil {
+		cmd.SysProcAttr = &syscall.SysProcAttr{}
+	}
+	cmd.SysProcAttr.Setpgid = true
+}
+
+// killProcessGroup sends sig to every process in cmd's process group. cmd must
+// have been started with Setpgid (see ensureProcessGroup) so that
+// -cmd.Process.Pid denotes the group. Signalling an already-dead group is
+// harmless (the kernel returns ESRCH, which we ignore).
+func killProcessGroup(cmd *exec.Cmd, sig syscall.Signal) error {
+	if cmd.Process == nil {
+		return nil
+	}
+	return syscall.Kill(-cmd.Process.Pid, sig)
+}
+
+// killChildOnDisconnect signals cmd's process group to exit because the client
+// disconnected. It sends SIGHUP to the whole group (the signal a terminal sends
+// on hangup, matching servePTY), then escalates to SIGKILL after a 2s grace in
+// case any child ignores or traps SIGHUP. Signalling an already-exited group is
+// harmless (the kernel returns ESRCH, which we ignore). It runs the escalation
+// in its own goroutine so the caller (the stdin reader loop) can return
+// immediately; the main servePipe goroutine unblocks on cmd.Wait() once the
+// child exits.
+//
+// Killing the whole group (not just the direct child) is what reaps
+// backgrounded grandchildren — the core MCP timeout/cancellation requirement
+// (and the SSH-disconnect-from-a-backgrounded-command case that previously
+// leaked).
 func killChildOnDisconnect(cmd *exec.Cmd, logf Logf) {
 	if cmd.Process == nil {
 		return
 	}
 	go func() {
-		if err := cmd.Process.Signal(syscall.SIGHUP); err != nil {
-			return // child already exited
+		if err := killProcessGroup(cmd, syscall.SIGHUP); err != nil {
+			return // group already gone
 		}
-		logf.logf("client disconnected; sent SIGHUP to child PID %d", cmd.Process.Pid)
+		logf.logf("client disconnected; sent SIGHUP to process group %d", cmd.Process.Pid)
 		timer := time.NewTimer(2 * time.Second)
 		defer timer.Stop()
 		<-timer.C
-		// Still running? Force kill. ProcessState is set once Wait reaps the
-		// child; checking it races favorably enough here (worst case we SIGKILL
-		// a just-exited process, which is a harmless no-op).
+		// Still running? Force-kill the whole group. ProcessState is set once
+		// Wait reaps the direct child; checking it races favorably enough here
+		// (worst case we SIGKILL a just-exited group, which is a harmless no-op).
 		if cmd.ProcessState == nil {
-			_ = cmd.Process.Signal(syscall.SIGKILL)
-			logf.logf("child PID %d did not exit on SIGHUP; sent SIGKILL", cmd.Process.Pid)
+			_ = killProcessGroup(cmd, syscall.SIGKILL)
+			logf.logf("process group %d did not exit on SIGHUP; sent SIGKILL", cmd.Process.Pid)
 		}
 	}()
 }
