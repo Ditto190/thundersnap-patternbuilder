@@ -158,6 +158,7 @@ func TestVM(t *testing.T) {
 	}{
 		{"VMSSHSessionMatrix", testVMSSHSessionMatrix},
 		{"VMNamespaceSetup", testVMNamespaceSetup},
+		{"VMDeepWorkflow", testVMDeepWorkflow},
 		{"VMXPtyWinsize", testVMXPtyWinsize},
 	}
 

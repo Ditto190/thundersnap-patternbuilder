@@ -132,9 +132,17 @@ func testContainerConcurrentDistinctPTS(t *testing.T, d *daemonInstance) {
 // stdin pipe to write commands through.
 func startPtyShell(t *testing.T, d *daemonInstance, ref string) (*ssh.Client, *ssh.Session, *safeBuffer, io.WriteCloser) {
 	t.Helper()
-	client, session, err := sshInteractive(t, d, "root@"+ref)
+	return startPtyShellUser(t, d, "root@"+ref)
+}
+
+// startPtyShellUser is the isolation-agnostic form of startPtyShell. The VM
+// workflow uses it with a vm/root@frame username so the same real SSH/PTTY
+// path can be checked inside the daemon-managed VM.
+func startPtyShellUser(t *testing.T, d *daemonInstance, user string) (*ssh.Client, *ssh.Session, *safeBuffer, io.WriteCloser) {
+	t.Helper()
+	client, session, err := sshInteractive(t, d, user)
 	if err != nil {
-		t.Fatalf("sshInteractive (%s): %v", ref, err)
+		t.Fatalf("sshInteractive (%s): %v", user, err)
 	}
 	var outBuf safeBuffer
 	session.Stdout = &outBuf
@@ -169,8 +177,14 @@ func ptyTTYOf(t *testing.T, session *ssh.Session, stdin io.WriteCloser, outBuf *
 	}
 	for _, line := range strings.Split(outBuf.String(), "\n") {
 		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "/dev/pts/") {
-			return line
+		if i := strings.Index(line, "/dev/pts/"); i >= 0 {
+			// Interactive shells may prefix command output with "$ ". Return
+			// only the tty path, stopping before any following whitespace.
+			tty := line[i:]
+			if end := strings.IndexAny(tty, " \t\r"); end >= 0 {
+				tty = tty[:end]
+			}
+			return tty
 		}
 	}
 	return strings.TrimSpace(outBuf.String())

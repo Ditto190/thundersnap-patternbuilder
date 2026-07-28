@@ -17,10 +17,14 @@
 package e2e
 
 import (
+	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 // startVMDaemon starts a thundersnapd with a vmx-isolation policy and returns
@@ -122,6 +126,85 @@ func testVMSSHSessionMatrix(t *testing.T, d *daemonInstance) {
 // output -- no shell prompt, no typed-input echo, no greeting -- for an
 // exact-match assertion. See TestContainerPtyEcho for the interactive echo
 // invariant and TestContainerPtyWriteOrder for the stdout/stderr race guard.
+func testVMDeepWorkflow(t *testing.T, d *daemonInstance) {
+	for _, ref := range []string{"vmdeepa", "vmdeepb"} {
+		createFrameViaDaemon(t, d, ref)
+	}
+
+	// Hostname/networking are properties of the daemon-launched outer VM. The
+	// old tests hand-built a cloud-hypervisor command line; checking them here
+	// also covers the daemon's passt and VMConfig wiring.
+	out, exit, err := sshExec(t, d, "vm/root@vmdeepa", "read h < /proc/sys/kernel/hostname; echo HOST=$h; test -d /sys/class/net/eth0 && echo ETH0; read c < /proc/cmdline; case $c in *ip=10.0.2.15*) echo IPCONFIG;; esac")
+	if err != nil || exit != 0 {
+		t.Fatalf("VM network/hostname probe: err=%v exit=%d out=%q", err, exit, out)
+	}
+	for _, marker := range []string{"HOST=", "ETH0", "IPCONFIG"} {
+		if !strings.Contains(out, marker) {
+			t.Errorf("VM network/hostname probe missing %q: %q", marker, out)
+		}
+	}
+
+	// Keep sessions to two different frames alive concurrently. They must both
+	// execute successfully through the shared outer VM while retaining separate
+	// frame root filesystems.
+	installBusyboxAppletInFrame(t, d, "vmdeepa", "sleep")
+	installBusyboxAppletInFrame(t, d, "vmdeepb", "sleep")
+	const sessions = 4
+	var wg sync.WaitGroup
+	errs := make(chan error, sessions)
+	for i := 0; i < sessions; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			ref := "vmdeepa"
+			if i%2 != 0 {
+				ref = "vmdeepb"
+			}
+			marker := fmt.Sprintf("VMCONCURRENT%d", i)
+			out, exit, err := sshExec(t, d, "vm/root@"+ref, "echo "+marker+"; sleep 1")
+			if err != nil || exit != 0 || !strings.Contains(out, marker) {
+				errs <- fmt.Errorf("%s: err=%v exit=%d out=%q", ref, err, exit, out)
+			}
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Error(err)
+	}
+
+	// The nil:nil:nil frame deliberately contains only ts as /bin/sh. Exercise
+	// the built-in shell through the complete daemon -> SSH -> VM -> vshd path.
+	script := `x=hello; echo "$x world"; echo $(echo nested); for i in a b c; do echo LOOP$i; done; echo REDIRECT > /tmp/minimal; read v < /tmp/minimal; echo $v; false || echo CAUGHT`
+	out, exit, err = sshExec(t, d, "vm/root@vmdeepa", script)
+	if err != nil || exit != 0 {
+		t.Fatalf("minimal VM shell: err=%v exit=%d out=%q", err, exit, out)
+	}
+	for _, marker := range []string{"hello world", "nested", "LOOPa", "LOOPb", "LOOPc", "REDIRECT", "CAUGHT"} {
+		if !strings.Contains(out, marker) {
+			t.Errorf("minimal VM shell missing %q: %q", marker, out)
+		}
+	}
+
+	// Finally verify concurrent PTYs are allocated in the container's shared
+	// devpts instance, rather than in vshd's outer mount namespace.
+	installBusyboxAppletInFrame(t, d, "vmdeepa", "tty")
+	clientA, sessA, outA, inA := startPtyShellUser(t, d, "vm/root@vmdeepa")
+	defer clientA.Close()
+	defer sessA.Close()
+	clientB, sessB, outB, inB := startPtyShellUser(t, d, "vm/root@vmdeepa")
+	defer clientB.Close()
+	defer sessB.Close()
+	ttyA := ptyTTYOf(t, sessA, inA, outA)
+	ttyB := ptyTTYOf(t, sessB, inB, outB)
+	if !strings.HasPrefix(ttyA, "/dev/pts/") || !strings.HasPrefix(ttyB, "/dev/pts/") || ttyA == ttyB {
+		t.Errorf("VM concurrent PTYs: want distinct /dev/pts/N, got %q and %q", ttyA, ttyB)
+	}
+}
+
+// testVMXPtyWinsize verifies both the initial PTY size and a live SSH
+// window-change request. The latter was covered only by the hand-driven vshd
+// protocol test before this daemon-level workflow was added.
 func testVMXPtyWinsize(t *testing.T, d *daemonInstance) {
 	createFrameViaDaemon(t, d, "vmwin")
 	installBusyboxAppletInFrame(t, d, "vmwin", "stty")
@@ -139,5 +222,34 @@ func testVMXPtyWinsize(t *testing.T, d *daemonInstance) {
 		t.Errorf("vm PTY winsize: expected exactly %q, got %q", want, out)
 	} else {
 		t.Logf("vm PTY size = 40 x 80")
+	}
+
+	client, session, err := sshInteractive(t, d, "vm/root@vmwin")
+	if err != nil {
+		t.Fatalf("interactive VM PTY: %v", err)
+	}
+	defer client.Close()
+	defer session.Close()
+	var buf safeBuffer
+	session.Stdout, session.Stderr = &buf, &buf
+	stdin, err := session.StdinPipe()
+	if err != nil {
+		t.Fatalf("VM PTY stdin: %v", err)
+	}
+	if err := session.Shell(); err != nil {
+		t.Fatalf("VM PTY shell: %v", err)
+	}
+	if err := session.WindowChange(50, 120); err != nil {
+		t.Fatalf("VM PTY resize: %v", err)
+	}
+	if _, err := io.WriteString(stdin, "stty size; echo RESIZE''DONE; exit\n"); err != nil {
+		t.Fatalf("VM PTY command: %v", err)
+	}
+	deadline := time.Now().Add(15 * time.Second)
+	for !strings.Contains(buf.String(), "RESIZEDONE") && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if got := buf.String(); !strings.Contains(got, "50 120") {
+		t.Errorf("resized VM PTY: expected 50 120, got %q", got)
 	}
 }
