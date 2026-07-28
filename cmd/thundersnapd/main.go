@@ -1682,10 +1682,13 @@ func startControlServer(sockPath, rootFS string) (*controlServer, error) {
 	sockDir := filepath.Dir(sockPath)   // e.g., rootFS/id
 
 	// Ensure the socket directory exists. The /id directory may not have been
-	// created yet if no ref has been associated with this frame.
+	// created yet if no ref has been associated with this frame. Reapply its
+	// ownership here so frames created by older versions and fast forks are
+	// usable by the default unprivileged user too.
 	if err := os.MkdirAll(sockDir, 0755); err != nil {
 		return nil, fmt.Errorf("create socket dir %s: %w", sockDir, err)
 	}
+	configureIDDir(sockDir)
 
 	cwd, err := os.Getwd()
 	if err != nil {

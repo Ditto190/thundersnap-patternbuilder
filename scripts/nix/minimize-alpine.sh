@@ -1,6 +1,6 @@
 #!/bin/sh
 # Copy an Alpine Nix frame and remove packages needed only to bootstrap Nix.
-# Usage: sudo ./minimize-alpine.sh FRAME
+# Usage: ./minimize-alpine.sh FRAME
 
 set -eu
 exec 3>&1 1>&2

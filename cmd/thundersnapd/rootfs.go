@@ -249,25 +249,26 @@ func ensureFrameFS(rootFS string, meta *frames.Frame) error {
 		if err := btrfsCreateSubvol(idPath); err != nil {
 			return err
 		}
-		// Set permissions: 0700, owned by the thundersnap user. /id holds the
-		// frame's control socket (thunder.sock, chmod 0666 by startControlServer)
-		// and any frame-local secrets; the frame's default user (uid 7575) must
-		// be able to traverse /id to reach the socket so non-root `ts` subcommands
-		// (ts frame/snap/ref, ts go -c, autorun, ...) work. Root retains access
-		// (bypasses perms); other users are excluded. This matches /home and
-		// /work, which are also chowned to the thundersnap user when created
-		// fresh. Keep 0700 (not 0755) so only the owner can list /id contents.
-		if err := os.Chmod(idPath, 0700); err != nil {
-			log.Printf("Warning: failed to chmod /id subvolume: %v", err)
-		}
-		if err := os.Chown(idPath, tsm.ThundersnapUID, tsm.ThundersnapGID); err != nil {
-			log.Printf("Warning: failed to chown /id subvolume: %v", err)
-		}
 	}
+	configureIDDir(idPath)
 
 	log.Printf("Created frame %s with rootfs:%s home:%s work:%s taints:%v",
 		rootFS, meta.Rootfs, meta.Home, meta.Work, meta.Taints)
 	return nil
+}
+
+// configureIDDir makes the frame-local identity directory accessible to the
+// frame's default unprivileged user while keeping it private from other users.
+// It is deliberately applied even to an existing subvolume so frames created
+// by older versions (and fast forks) are repaired when they are assembled or
+// entered. The control socket itself is chmod 0666 by startControlServer.
+func configureIDDir(idPath string) {
+	if err := os.Chown(idPath, tsm.ThundersnapUID, tsm.ThundersnapGID); err != nil {
+		log.Printf("Warning: failed to chown /id subvolume: %v", err)
+	}
+	if err := os.Chmod(idPath, 0700); err != nil {
+		log.Printf("Warning: failed to chmod /id subvolume: %v", err)
+	}
 }
 
 // finalizeFrameRootfs performs the common post-clone setup for a frame's root

@@ -30,7 +30,7 @@ item is the isolation concern that prompted the investigation).
       (trixie) sets `user`'s shadow entry to "password must be changed"; `ts
       go -c` runs `su - user -c`, whose PAM prints "You are required to change
       your password immediately" and blocks reading a password — so
-      `sudo ts go <ref> -c '...'` never returns. SSH-as-root
+      `ts go <ref> -c '...'` never returns. SSH-as-root
       (`ssh root@<ref>@thundersnap`) is unaffected (no `su - user`).
       `tsm.EnsureSudoers` (`tsm/stripuids.go:189`, called from
       `cmd/thundersnapd/rootfs.go:282`) already writes a NOPASSWD sudoers

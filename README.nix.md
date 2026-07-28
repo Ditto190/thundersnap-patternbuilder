@@ -6,11 +6,11 @@ prints one new frame UUID on stdout, so builds are nondestructive and can run in
 parallel.
 
 ```bash
-DEBIAN_FRAME=$(sudo ./scripts/nix/build-debian.sh)
-ALPINE_FRAME=$(sudo ./scripts/nix/build-alpine.sh)
+DEBIAN_FRAME=$(./scripts/nix/build-debian.sh)
+ALPINE_FRAME=$(./scripts/nix/build-alpine.sh)
 
-sudo ts go "$DEBIAN_FRAME"
-sudo ts go "$ALPINE_FRAME"
+ts go "$DEBIAN_FRAME"
+ts go "$ALPINE_FRAME"
 ```
 
 Both builders start from a clean `<docker-snap>:nil:nil` frame, leaving `/home`
@@ -33,14 +33,14 @@ The implementation is split into:
 Build the experimental minimal Alpine variant in one step:
 
 ```bash
-MINIMAL_FRAME=$(sudo ./scripts/nix/build-alpine-minimal.sh)
-sudo ts go "$MINIMAL_FRAME"
+MINIMAL_FRAME=$(./scripts/nix/build-alpine-minimal.sh)
+ts go "$MINIMAL_FRAME"
 ```
 
 Or copy and minimize an existing Alpine Nix frame without modifying it:
 
 ```bash
-MINIMAL_FRAME=$(sudo ./scripts/nix/minimize-alpine.sh "$ALPINE_FRAME")
+MINIMAL_FRAME=$(./scripts/nix/minimize-alpine.sh "$ALPINE_FRAME")
 ```
 
 The minimizer currently removes `curl`, `xz`, and GNU `coreutils`. It keeps
@@ -52,17 +52,14 @@ from-scratch Nix root.
 
 ## What you're working with
 
-- You're already inside a thundersnap instance. `sudo ts ...` works (the
-  outer shell user is `user`, uid 7575, in the `sudo` group with
-  passwordless sudo).
-- `sudo ts` prints `sudo: unable to send audit message: Operation not
-  permitted` on stderr for every invocation. This is harmless nested-
-  container noise. Pipe through `grep -v "audit message"` or just ignore it.
+- You're already inside a thundersnap instance. The frame's `/id` directory
+  is owned by the default `user` account (uid 7575), so ordinary `ts ...`
+  commands can reach the control socket without `sudo`.
 - `ts go <frame-or-ref> -c 'cmd'` runs a command inside a frame and exits. **Its
   stdout is clean** (no PTY escape noise) — verified with `cat -A` — so you
   can capture output from it. This is how you run things inside a frame
   without dropping into an interactive session. Always pass `-c` (or wrap
-  in a timeout); a bare `sudo ts go` opens an interactive session and will
+  in a timeout); a bare `ts go` opens an interactive session and will
   hang an automated agent.
 - `ts go ::` is the fast "fork current frame" path: it captures the current
   frame as a background snap and clones a new frame from the live
@@ -116,7 +113,7 @@ install.
 The first time, we forked the current frame:
 
 ```bash
-FORK=$(sudo ts frame ::)   # prints a new frame UUID
+FORK=$(ts frame ::)   # prints a new frame UUID
 echo "$FORK"
 ```
 
@@ -129,7 +126,7 @@ identical for anyone who follows the recipe.
 ### 2. Install single-user Nix inside the frame
 
 ```bash
-sudo ts go "$FORK" -c '
+ts go "$FORK" -c '
   set -e
   curl -sSL https://nixos.org/nix/install -o /tmp/nix-install.sh
   sh /tmp/nix-install.sh --no-daemon --yes
@@ -169,7 +166,7 @@ Notes on this step:
   must be changed" enforced; `su - user` (what `ts go -c` runs) then
   prints "You are required to change your password immediately" and
   prompts on a non-existent TTY, hanging the non-interactive session
-  forever. Symptom: `sudo ts go nixbase -c '...'` never returns, and `ts
+  forever. Symptom: `ts go nixbase -c '...'` never returns, and `ts
   frames` shows a stale session count for the frame with no live
   `session-serve` to reap. Fix it in the bootstrap step (as root via
   `ts go root@<frame> -c`): `chage -d "$(date +%F)" -m 0 -M 99999 -I -1
@@ -180,7 +177,7 @@ Notes on this step:
 ### 3. Snapshot the frame
 
 ```bash
-sudo ts go "$FORK" -c 'sudo ts snap -w' | tee /tmp/nix.triplet
+ts go "$FORK" -c 'ts snap -w' | tee /tmp/nix.triplet
 ```
 
 This prints the triplet, e.g.:
@@ -190,12 +187,6 @@ TH-doXTy...:Uu982kXp...:OVt2g6gr...
 
 **Footguns on this step:**
 
-- **`sudo ts snap`, not `ts snap`.** The `ts go` session logs in as
-  `user`, and the control socket `/id/thunder.sock` is root-owned. A bare
-  `ts snap` inside the frame fails with
-  `dial unix /id/thunder.sock: connect: permission denied`. You must
-  `sudo` it. (Confusing because outside the frame you're already
-  sudo-ing `ts` — but inside the frame the session is unprivileged.)
 - **`-w` (wait) is required to get the triplet on stdout.** Without it,
   `ts snap` captures and returns immediately with indexing in the
   background and prints *nothing* on stdout — you can't script the ID.
@@ -214,9 +205,9 @@ TH-doXTy...:Uu982kXp...:OVt2g6gr...
 
 ```bash
 TRIPLET=$(cat /tmp/nix.triplet)
-NIXUUID=$(sudo ts frame --ref nix "$TRIPLET")
+NIXUUID=$(ts frame --ref nix "$TRIPLET")
 echo "nix -> $NIXUUID"
-sudo ts refs   # should now list nix
+ts refs   # should now list nix
 ```
 
 **Footgun on this step:**
@@ -230,7 +221,7 @@ sudo ts refs   # should now list nix
 ### 5. Verify it works end to end
 
 ```bash
-sudo ts go nix -c '
+ts go nix -c '
   echo "user=$(whoami) uid=$(id -u) HOME=$HOME"
   command -v nix && nix --version
   nix-build -E "(import <nixpkgs> {}).hello" && ./result/bin/hello
@@ -351,9 +342,9 @@ plus a custom home snap (e.g. one with the user's `.bashrc`, `.profile`,
 # nix-root is the root component of the nix ref's snap triplet:
 #   ts refs        # nix -> <uuid>
 #   ts snaps | grep <uuid>   # or read the triplet off the ref's frame
-NIXROOT=$(sudo ts snaps | awk '/<nix-snap-id>/{print $1}')   # root snap id
-MYHOME=$(sudo ts snaps | awk '/<my-home-snap-id>/{print $1}') # home snap id
-sudo ts frame "${NIXROOT}:${MYHOME}:nil"
+NIXROOT=$(ts snaps | awk '/<nix-snap-id>/{print $1}')   # root snap id
+MYHOME=$(ts snaps | awk '/<my-home-snap-id>/{print $1}') # home snap id
+ts frame "${NIXROOT}:${MYHOME}:nil"
 ```
 
 Verified: a frame built from the nix root snap + a custom home (containing
@@ -382,7 +373,7 @@ channel.
 - If you made a temporary ref to point at a construction frame, delete
   just the ref:
   ```bash
-  sudo ts ref delete nixbase
+  ts ref delete nixbase
   ```
 - **Ref names must start with an alphanumeric.** A leading underscore or
   dash is rejected (`invalid ref name: must start with alphanumeric,
@@ -391,18 +382,17 @@ channel.
 
 ## Footguns reference (the stuff that wasted time)
 
-1. **`ts` subcommands don't understand `--help`.** `sudo ts download-snap
+1. **`ts` subcommands don't understand `--help`.** `ts download-snap
    --help` prints `unknown option: -` and the usage. To learn a
    subcommand's options, run it with no args / bad args and read the
    usage it prints, or read `cmd/ts/main.go`.
-2. **The control socket is root-owned.** Anything that talks to the
-   daemon (`ts snap`, `ts frame`, `ts ref`, ...) needs `sudo`, both
-   outside the frame and inside a `ts go -c` session.
+2. **`ts` commands do not need `sudo`.** `/id` is private to the default
+   frame user, but that user owns it and can reach `/id/thunder.sock`.
 3. **`ts go` sessions are unprivileged.** They log in as `user` (uid
    7575), `HOME=/home`, `shell` = `/bin/sh` (older `deb` ref, alpine) or
    `/bin/bash` (`debian:latest`/trixie) — not root. This is why
-   single-user nix (owned by `user`) is the right install mode, and why
-   you must re-`sudo` any `ts` command run inside a `ts go -c`.
+   single-user nix (owned by `user`) is the right install mode. Use an
+   explicit `root@` prefix only for commands that actually need root.
 4. **`ts go` takes an optional `<user>@` prefix to run as a specific
    user.** `ts go root@<ref> -c '...'` runs the session as root; without
    a prefix it auto-detects `user` (uid 7575). This is now the
@@ -414,7 +404,7 @@ channel.
    one-shot bootstrap commands.
 5. **`ts go -c` stdout is clean** (no PTY escape codes). You can capture
    snap IDs and command output from it directly.
-6. **A bare `sudo ts go` opens an interactive session and hangs.** Always
+6. **A bare `ts go` opens an interactive session and hangs.** Always
    pass `-c 'cmd'` (and a timeout) in automated contexts.
 7. **Which profile `ts go -c` sources depends on `user`'s login shell.**
    `ts go -c` runs `su - user -c`, i.e. `user`'s login shell. `/bin/sh`
@@ -495,7 +485,7 @@ channel.
 20. **`ts download-docker` appends " (cached)" to the snap ID on stdout
     when the image is already local.** A repeat pull prints
     `F3-... (cached)` on stdout (progress goes to stderr), so
-    `DEB=$(sudo ts download-docker debian:latest)` captures
+    `DEB=$(ts download-docker debian:latest)` captures
     `F3-... (cached)` and `"${DEB}:nil:nil"` then fails with "rootfs
     snapshot ... not found". Take only the first token:
     `... | awk '{print $1}'`. (First-ever pulls print the bare ID and

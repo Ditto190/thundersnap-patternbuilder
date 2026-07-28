@@ -739,12 +739,13 @@ func testForkUndoRollsBackToForkPoint(t *testing.T, d *daemonInstance) {
 		t.Fatalf("ts ref create forkpt: err=%v exit=%d", err, exitCode)
 	}
 
-	// Sanity: the forked frame's live state is the fork point (v2). If this
-	// fails the fork didn't clone the live state and the test setup is wrong.
-	if out, exitCode, err := sshExec(t, d, "root@forkpt", "read line < /marker && echo $line"); err != nil || exitCode != 0 {
-		t.Fatalf("read marker in forked frame: err=%v exit=%d", err, exitCode)
-	} else if got := strings.TrimSpace(out); got != "v2" {
-		t.Fatalf("forked frame live state = %q, want v2 (fork point); test setup wrong", got)
+	// Sanity: the forked frame's live state is the fork point (v2). Enter as
+	// the unprivileged default user and call `ts frame` too: fast forks used to
+	// leave /id root-owned, making every ts command fail without sudo.
+	if out, exitCode, err := sshExec(t, d, "user@forkpt", "ts frame; read line < /marker && echo $line"); err != nil || exitCode != 0 {
+		t.Fatalf("use ts and read marker as user in forked frame: err=%v exit=%d out=%q", err, exitCode, out)
+	} else if lines := strings.Fields(out); len(lines) < 2 || lines[len(lines)-1] != "v2" {
+		t.Fatalf("forked frame user output = %q, want frame UUID followed by v2", out)
 	}
 
 	// Wait for the fork-point snap to finalize. It is a background snap of the

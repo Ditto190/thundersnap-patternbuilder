@@ -68,5 +68,5 @@ prepare_frame
 install_nix
 verify_nix
 log "Built frame: $FRAME"
-log "Enter with: sudo ts go $FRAME"
+log "Enter with: ts go $FRAME"
 printf '%s\n' "$FRAME" >&3

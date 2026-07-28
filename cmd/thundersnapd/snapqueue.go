@@ -819,10 +819,8 @@ func cloneFrameSetup(framePath string, job *snapJob, meta *frames.Frame) error {
 		if err := btrfsCreateSubvol(idPath); err != nil {
 			return fmt.Errorf("create id subvol: %w", err)
 		}
-		if err := os.Chmod(idPath, 0700); err != nil {
-			log.Printf("Warning: failed to chmod /id subvolume: %v", err)
-		}
 	}
+	configureIDDir(idPath)
 
 	// Sidecar + stamp. The stamp reflects the source frame's last finalized
 	// root snap; the new frame's first snap chains past it via the pending map.

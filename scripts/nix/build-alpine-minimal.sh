@@ -8,5 +8,5 @@ FRAME=$($SCRIPT_DIR/build-alpine.sh)
 FRAME=$($SCRIPT_DIR/minimize-alpine.sh "$FRAME")
 
 printf '>> Built minimal Alpine frame: %s\n' "$FRAME" >&2
-printf '>> Enter with: sudo ts go %s\n' "$FRAME" >&2
+printf '>> Enter with: ts go %s\n' "$FRAME" >&2
 printf '%s\n' "$FRAME"
