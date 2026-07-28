@@ -6,6 +6,7 @@
 package e2e
 
 import (
+	"bufio"
 	"fmt"
 	"io"
 	"net"
@@ -14,6 +15,25 @@ import (
 
 	"github.com/tailscale/thundersnap/vshdproto"
 )
+
+// dialVsock connects to a cloud-hypervisor guest vsock port.
+func dialVsock(vsockSock string, port int) (net.Conn, error) {
+	conn, err := net.Dial("unix", vsockSock)
+	if err != nil {
+		return nil, err
+	}
+	conn.SetDeadline(time.Now().Add(30 * time.Second))
+	if _, err := fmt.Fprintf(conn, "CONNECT %d\n", port); err != nil {
+		conn.Close()
+		return nil, err
+	}
+	response, err := bufio.NewReader(conn).ReadString('\n')
+	if err != nil || !strings.HasPrefix(strings.TrimSpace(response), "OK") {
+		conn.Close()
+		return nil, fmt.Errorf("vsock handshake: %q: %w", response, err)
+	}
+	return conn, nil
+}
 
 // writeVshdHeader writes the null-delimited vshd request header. When framePath
 // is non-empty it emits the VMX form; pty signals a terminal session. This

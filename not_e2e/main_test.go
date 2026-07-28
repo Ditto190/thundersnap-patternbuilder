@@ -57,13 +57,11 @@ func TestMain(m *testing.M) {
 		// package's own _test.go and the e2e snap tests).
 		{"snapshot", `^Test(E2EBasicSnapshot|E2EOwnership|E2EDevSetup|ConcurrentModificationDuringSnapshot|Symlink).*$`},
 
-		// Tier 2: VM/VMX tests (slowest: boot cloud-hypervisor). The container
-		// SSH tests now live in the real e2e/ssh_test.go and the VM SSH session
-		// matrix in e2e/vm_test.go; the remaining tests here hand-spawn VMs.
-		// (mesh/streaming fake-control-server tests were deleted as false-green
-		// C-bucket fakes; the real /who-has and /download-snap handlers still
-		// need a mesh peer-config seam for real e2e coverage.)
-		{"vm", `^Test(VM|E2EVMPanicRecovery|Vshd|MinimalShell).*$`},
+		// Tier 2: targeted VM negatives (slowest: boot cloud-hypervisor). The
+		// observable VM/VMX workflows now live in the daemon-driven TestVM e2e
+		// workflow. Low-memory boot and deliberate kernel-panic injection remain
+		// here until StartVM exposes test configuration through the daemon.
+		{"vm", `^Test(VMLaunchInsufficientMemory|VMPanicRecoveryTimeout|E2EVMPanicRecovery)$`},
 	}
 
 	for _, tier := range tiers {
