@@ -11,7 +11,7 @@ prepare_frame() {
         set -e
         apt-get update
         apt-get install -y curl xz-utils ca-certificates sudo
-        echo 'user ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/thundersnap-user
+        printf '%s\n' 'Defaults:user !log_allowed, !log_denied' '# Thundersnap: allow the user account passwordless sudo' 'user ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/thundersnap-user
         chmod 0440 /etc/sudoers.d/thundersnap-user
         chage -d \"\$(date +%F)\" -m 0 -M 99999 -I -1 -E -1 user
         passwd -d user

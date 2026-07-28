@@ -195,9 +195,13 @@ func EnsureSudoers(rootfs string) error {
 		return err
 	}
 
-	// Create a drop-in file for the user account
+	// Create a drop-in file for the user account. Frames do not have a
+	// host-audit connection, and CAP_AUDIT_WRITE is intentionally dropped
+	// from frame processes. Disable sudo's Linux audit logging so every sudo
+	// invocation does not emit a non-actionable warning. Scope this to the
+	// frame user so other accounts (including root) retain their defaults.
 	dropinPath := filepath.Join(sudoersDir, "thundersnap-user")
-	content := "# Thundersnap: allow the user account passwordless sudo\nuser ALL=(ALL) NOPASSWD: ALL\n"
+	content := "# Thundersnap: do not try to write the unavailable host audit log\nDefaults:user !log_allowed, !log_denied\n# Thundersnap: allow the user account passwordless sudo\nuser ALL=(ALL) NOPASSWD: ALL\n"
 
 	// sudoers files must be mode 0440 and owned by root
 	if err := os.WriteFile(dropinPath, []byte(content), 0440); err != nil {

@@ -431,7 +431,11 @@ func TestEnsureSudoers(t *testing.T) {
 			t.Fatalf("read drop-in: %v", err)
 		}
 
-		if !strings.Contains(string(content), "user ALL=(ALL) NOPASSWD: ALL") {
+		contentString := string(content)
+		if !strings.Contains(contentString, "Defaults:user !log_allowed, !log_denied") {
+			t.Errorf("sudo audit logging was not disabled:\n%s", content)
+		}
+		if !strings.Contains(contentString, "user ALL=(ALL) NOPASSWD: ALL") {
 			t.Errorf("unexpected content:\n%s", content)
 		}
 

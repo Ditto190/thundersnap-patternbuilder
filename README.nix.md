@@ -55,6 +55,9 @@ from-scratch Nix root.
 - You're already inside a thundersnap instance. The frame's `/id` directory
   is owned by the default `user` account (uid 7575), so ordinary `ts ...`
   commands can reach the control socket without `sudo`.
+- Frames disable sudo's system-audit logging because frame processes do not
+  have a host-audit connection (and intentionally do not retain
+  `CAP_AUDIT_WRITE`). Sudo's normal syslog and I/O logging remain enabled.
 - `ts go <frame-or-ref> -c 'cmd'` runs a command inside a frame and exits. **Its
   stdout is clean** (no PTY escape noise) — verified with `cat -A` — so you
   can capture output from it. This is how you run things inside a frame
@@ -252,8 +255,11 @@ Linux also.")
    session via `ts go root@<frame> -c` (or `ssh root@<ref>@thundersnap`
    on an older daemon — SSH sends an explicit username the daemon
    honours), `apk add sudo curl xz bash ca-certificates coreutils`, then
-   write `/etc/sudoers.d/thundersnap-user` (`user ALL=(ALL) NOPASSWD:
-   ALL`, mode 0440) by hand. After this, `user` has passwordless sudo
+   write `/etc/sudoers.d/thundersnap-user` with
+   `Defaults:user !log_allowed, !log_denied` and `user ALL=(ALL)
+   NOPASSWD: ALL` (mode 0440) by hand. The first line avoids warnings from
+   sudo's unavailable host-audit connection; it does not disable sudo's
+   normal syslog or I/O logging. After this, `user` has passwordless sudo
    and the nix installer's `mkdir /nix && chown user /nix` works.
 
 2. **busybox `cp` aborts the installer.** The nix installer runs

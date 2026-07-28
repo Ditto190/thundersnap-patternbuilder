@@ -10,7 +10,7 @@ prepare_frame() {
     run_root "
         set -e
         apk add --no-cache sudo curl xz ca-certificates coreutils
-        echo 'user ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/thundersnap-user
+        printf '%s\n' 'Defaults:user !log_allowed, !log_denied' '# Thundersnap: allow the user account passwordless sudo' 'user ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/thundersnap-user
         chmod 0440 /etc/sudoers.d/thundersnap-user
         mkdir -p $NIX_BOOT_HOME
         chown -R user:user /var/lib/nix
