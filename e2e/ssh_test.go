@@ -1129,6 +1129,7 @@ func testContainerNamespaceSetup(t *testing.T, d *daemonInstance) {
 	// process root is set via chroot() rather than pivot_root(). This is a
 	// security measure to prevent container escapes via user namespaces.
 	installBusyboxAppletInFrame(t, d, "nstest", "unshare")
+	installBusyboxAppletInFrame(t, d, "nstest", "echo")
 	output, exitCode, err = sshExec(t, d, "root@nstest", "/bin/unshare -U echo OK")
 	if err != nil {
 		t.Fatalf("sshExec failed: %v", err)

@@ -204,7 +204,7 @@ func (t *debTarget) Build(b *Build) ([]string, error) {
 	}
 
 	arch := debArch(t.arch())
-	contents, err := files.PrepareForPackager(files.Contents{
+	packageContents := files.Contents{
 		&files.Content{
 			Type:        files.TypeFile,
 			Source:      ts,
@@ -240,7 +240,25 @@ func (t *debTarget) Build(b *Build) ([]string, error) {
 			Source:      filepath.Join(thundersnapdDir, "policy.jsonc"),
 			Destination: "/etc/thundersnap/policy.jsonc",
 		},
-	}, 0, "deb", false, b.Time)
+	}
+	// The checked-in VM runtime is currently x86-64-only. Install it beside
+	// the daemon on amd64 so the package's default vm-dir works without a
+	// source checkout; other architectures still support container mode.
+	if t.arch() == "amd64" {
+		packageContents = append(packageContents,
+			&files.Content{
+				Type:        files.TypeFile,
+				Source:      filepath.Join(b.Repo, "vm/cloud-hypervisor"),
+				Destination: "/usr/sbin/vm/cloud-hypervisor",
+			},
+			&files.Content{
+				Type:        files.TypeFile,
+				Source:      filepath.Join(b.Repo, "vm/vmlinux"),
+				Destination: "/usr/sbin/vm/vmlinux",
+			},
+		)
+	}
+	contents, err := files.PrepareForPackager(packageContents, 0, "deb", false, b.Time)
 	if err != nil {
 		return nil, err
 	}
@@ -257,6 +275,12 @@ func (t *debTarget) Build(b *Build) ([]string, error) {
 		Priority:    "extra",
 		Overridables: nfpm.Overridables{
 			Contents: contents,
+			Depends: []string{
+				"btrfs-progs",
+				"busybox-static",
+				"passt",
+				"virtiofsd",
+			},
 			Scripts: nfpm.Scripts{
 				PostInstall: filepath.Join(b.Repo, "release/deb/debian.postinst.sh"),
 				PreRemove:   filepath.Join(b.Repo, "release/deb/debian.prerm.sh"),
