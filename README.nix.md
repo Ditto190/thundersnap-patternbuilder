@@ -481,11 +481,6 @@ channel.
     <snap>:nil:nil`). Easy to hit in combination with #18, because the
     natural response to a password-expiry hang is to kill the `ts go -c` —
     which then compounds the problem.
-20. **`ts download-docker` appends " (cached)" to the snap ID on stdout
-    when the image is already local.** A repeat pull prints
-    `F3-... (cached)` on stdout (progress goes to stderr), so
-    `DEB=$(ts download-docker debian:latest)` captures
-    `F3-... (cached)` and `"${DEB}:nil:nil"` then fails with "rootfs
-    snapshot ... not found". Take only the first token:
-    `... | awk '{print $1}'`. (First-ever pulls print the bare ID and
-    work without this.)
+20. **`ts download-docker` keeps stdout machine-readable.** It always prints
+    only the snap ID on stdout. Fresh-download progress and the final size/rate
+    go to stderr; a cached result prints a cache notice to stderr instead.

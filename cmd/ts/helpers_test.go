@@ -4,6 +4,7 @@
 package main
 
 import (
+	"bytes"
 	"io"
 	"os"
 	"path/filepath"
@@ -30,6 +31,31 @@ func captureStderr(t *testing.T, fn func()) string {
 		t.Fatal(err)
 	}
 	return string(out)
+}
+
+func TestWriteDownloadDockerResult(t *testing.T) {
+	for _, tt := range []struct {
+		name       string
+		cached     bool
+		wantStderr string
+	}{
+		{name: "downloaded"},
+		{name: "cached", cached: true, wantStderr: "Using cached image snapshot snap-id\n"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			writeDownloadDockerResult(&stdout, &stderr, DownloadDockerStreamEvent{
+				SnapshotID: "snap-id",
+				Cached:     tt.cached,
+			})
+			if got := stdout.String(); got != "snap-id\n" {
+				t.Errorf("stdout = %q, want snap ID only", got)
+			}
+			if got := stderr.String(); got != tt.wantStderr {
+				t.Errorf("stderr = %q, want %q", got, tt.wantStderr)
+			}
+		})
+	}
 }
 
 func TestProgressRendererNonTTY(t *testing.T) {

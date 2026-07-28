@@ -23,7 +23,7 @@ run_root() {
 create_frame() {
     image=$1
     log "Creating frame from $image"
-    snap=$(ts download-docker "$image" | awk 'NR == 1 { print $1 }')
+    snap=$(ts download-docker "$image")
     FRAME=$(ts frame "$snap:nil:nil")
 }
 

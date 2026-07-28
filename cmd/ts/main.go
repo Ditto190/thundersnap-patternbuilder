@@ -15,6 +15,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	neturl "net/url"
 	"os"
@@ -1354,6 +1355,7 @@ func doDownloadDocker(sockPath, imageRef string) error {
 	// Parse NDJSON stream
 	scanner := bufio.NewScanner(resp.Body)
 	var lastEvent DownloadDockerStreamEvent
+	var lastProgressMsg string
 
 	for scanner.Scan() {
 		line := scanner.Bytes()
@@ -1369,6 +1371,7 @@ func doDownloadDocker(sockPath, imageRef string) error {
 		lastEvent = event
 
 		if event.Type == "progress" {
+			lastProgressMsg = event.Message
 			render.progress(event.Message)
 		}
 	}
@@ -1378,18 +1381,23 @@ func doDownloadDocker(sockPath, imageRef string) error {
 	}
 
 	render.finish()
+	if render.tty && lastProgressMsg != "" {
+		fmt.Fprintln(os.Stderr, lastProgressMsg)
+	}
 
 	if lastEvent.Status == "error" {
 		return fmt.Errorf("server error: %s", lastEvent.Message)
 	}
 
-	if lastEvent.Cached {
-		fmt.Printf("%s (cached)\n", lastEvent.SnapshotID)
-	} else {
-		fmt.Printf("%s\n", lastEvent.SnapshotID)
-	}
-
+	writeDownloadDockerResult(os.Stdout, os.Stderr, lastEvent)
 	return nil
+}
+
+func writeDownloadDockerResult(stdout, stderr io.Writer, result DownloadDockerStreamEvent) {
+	if result.Cached {
+		fmt.Fprintf(stderr, "Using cached image snapshot %s\n", result.SnapshotID)
+	}
+	fmt.Fprintln(stdout, result.SnapshotID)
 }
 
 func cmdDownloadSnap(args []string) {

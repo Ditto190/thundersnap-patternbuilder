@@ -153,11 +153,7 @@ func downloadDockerImage(imageRef string, progress io.Writer) (string, bool, err
 		return "", false, fmt.Errorf("parse image reference: %w", err)
 	}
 
-	if progress != nil {
-		fmt.Fprintf(progress, "Resolving %s...\n", ref.Name())
-	}
-
-	// Get image descriptor to get the digest
+	// Get image descriptor to get the digest.
 	desc, err := remote.Get(ref, remote.WithAuthFromKeychain(authn.DefaultKeychain))
 	if err != nil {
 		return "", false, fmt.Errorf("get image descriptor: %w", err)
@@ -167,24 +163,21 @@ func downloadDockerImage(imageRef string, progress io.Writer) (string, bool, err
 	digestRef := ref.Context().Digest(desc.Digest.String())
 	canonicalRef := digestRef.String()
 
-	if progress != nil {
-		fmt.Fprintf(progress, "Resolved to %s\n", canonicalRef)
-	}
-
-	// Check if we already have a snap with this source
+	// Check if we already have a snap with this source before emitting download
+	// progress. Cached pulls get one concise client-side cache message instead.
 	existingID := findSnapByDockerSource(canonicalRef)
 	if existingID != "" {
-		if progress != nil {
-			fmt.Fprintf(progress, "Image already cached as %s\n", existingID)
-		}
 		return existingID, true, nil
 	}
 
 	if progress != nil {
+		fmt.Fprintf(progress, "Resolved %s to %s\n", ref.Name(), canonicalRef)
 		fmt.Fprintf(progress, "Pulling image...\n")
 	}
 
-	// Get the full image
+	// Get the full image. The image is lazy: tarball.Write below performs the
+	// actual layer reads, so time that operation and report the resulting
+	// docker-save archive size as a useful approximation of bytes downloaded.
 	img, err := desc.Image()
 	if err != nil {
 		return "", false, fmt.Errorf("get image: %w", err)
@@ -213,11 +206,7 @@ func downloadDockerImage(imageRef string, progress io.Writer) (string, bool, err
 		btrfsutil.DeleteSubvol(extractPath) // best effort
 	}
 
-	if progress != nil {
-		fmt.Fprintf(progress, "Extracting layers...\n")
-	}
-
-	// Export the image as a tarball and extract it
+	// Export the image as a tarball and extract it.
 	tarPath := filepath.Join(tmpDir, "image.tar")
 	tarFile, err := os.Create(tarPath)
 	if err != nil {
@@ -225,13 +214,25 @@ func downloadDockerImage(imageRef string, progress io.Writer) (string, bool, err
 		return "", false, fmt.Errorf("create tar file: %w", err)
 	}
 
+	pullStarted := time.Now()
 	if err := tarball.Write(ref, img, tarFile); err != nil {
 		tarFile.Close()
 		cleanup()
 		return "", false, fmt.Errorf("write image tarball: %w", err)
 	}
-	tarFile.Close()
+	pullElapsed := time.Since(pullStarted)
+	if err := tarFile.Close(); err != nil {
+		cleanup()
+		return "", false, fmt.Errorf("close image tarball: %w", err)
+	}
+	var downloadedBytes int64
+	if info, err := os.Stat(tarPath); err == nil {
+		downloadedBytes = info.Size()
+	}
 
+	if progress != nil {
+		fmt.Fprintf(progress, "Extracting layers...\n")
+	}
 	// Extract the tarball (it's a Docker save format, needs flattening)
 	if err := flattenDockerTarball(tarPath, extractPath, progress); err != nil {
 		cleanup()
@@ -266,7 +267,19 @@ func downloadDockerImage(imageRef string, progress io.Writer) (string, bool, err
 	cleanup()
 
 	log.Printf("Downloaded Docker image %s as snapshot %s", canonicalRef, snapshotID)
+	if progress != nil {
+		fmt.Fprintln(progress, formatDockerDownloadSummary(downloadedBytes, pullElapsed))
+	}
 	return snapshotID, false, nil
+}
+
+func formatDockerDownloadSummary(bytes int64, elapsed time.Duration) string {
+	mib := float64(bytes) / (1024 * 1024)
+	if elapsed <= 0 {
+		elapsed = time.Nanosecond
+	}
+	mbps := float64(bytes) * 8 / elapsed.Seconds() / 1_000_000
+	return fmt.Sprintf("Downloaded %.3f MiB at %.3f Mbps", mib, mbps)
 }
 
 // findSnapByDockerSource finds a snap with the given docker source ref.
