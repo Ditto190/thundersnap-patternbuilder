@@ -577,7 +577,8 @@ func testSSHContainerBasic(t *testing.T, d *daemonInstance) {
 	// Test ts snap: create a snapshot of the current frame. Use sshExecSplit
 	// so progress output on stderr doesn't get mixed into the snapshot ID we
 	// verify on stdout.
-	snapStdout, snapStderr, exitCode, err := sshExecSplit(t, d, "testframe", "ts snap --wait")
+	// Waiting is the default, so an unadorned `ts snap` must print the ID.
+	snapStdout, snapStderr, exitCode, err := sshExecSplit(t, d, "testframe", "ts snap")
 	if err != nil {
 		t.Fatalf("ts snap failed: %v", err)
 	}
@@ -601,7 +602,8 @@ func testSSHContainerBasic(t *testing.T, d *daemonInstance) {
 
 	// Test snap idempotence: run a second snap immediately without any changes.
 	// The snapshot IDs should be identical because the content hasn't changed.
-	snap2Stdout, snap2Stderr, exitCode, err := sshExecSplit(t, d, "testframe", "ts snap --wait")
+	// --wait remains compatible and overrides --quick when both are supplied.
+	snap2Stdout, snap2Stderr, exitCode, err := sshExecSplit(t, d, "testframe", "ts snap --quick --wait")
 	if err != nil {
 		t.Fatalf("ts snap (2nd) failed: %v", err)
 	}

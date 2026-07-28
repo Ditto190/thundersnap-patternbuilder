@@ -34,13 +34,12 @@ var commands = []cmdInfo{
 		category: "main",
 		short:    "create a snapshot of the current container/VM",
 		long: `Captures a snapshot of the current frame's filesystem, or just a subtree
-of it when a path is given. The snapshot is content-addressed. By default
-capture returns immediately and indexing runs in the background, so the snap
-ID is not yet known; use --wait to block until indexing finishes and print
-the ID. --delete removes an existing snapshot by ID.`,
-		outputs: `default: nothing on stdout; a short notice
-("snap captured; indexing in background") goes to stderr.
---wait: the content-addressable snapshot ID, one line.
+of it when a path is given. The snapshot is content-addressed. By default the
+command waits for indexing and prints the ID. --quick captures immediately and
+returns silently while indexing continues in the background. --wait is retained
+for compatibility and overrides --quick. --delete removes a snapshot by ID.`,
+		outputs: `default/--wait: the content-addressable snapshot ID, one line.
+--quick: nothing on successful capture; indexing continues in the background.
 --delete <id>: "Deleted snapshot <id>".`,
 	},
 	{

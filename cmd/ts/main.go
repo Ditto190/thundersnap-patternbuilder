@@ -303,7 +303,8 @@ type meshPeer struct {
 func cmdSnap(args []string) {
 	opts, helpFlag := newCmdOpts("snap", "[<path>]")
 	deleteFlag := opts.BoolLong("delete", 'd', "delete a snapshot")
-	waitFlag := opts.BoolLong("wait", 'w', "wait for indexing to complete and print the snap ID (default: capture and return at once, indexing in the background)")
+	waitFlag := opts.BoolLong("wait", 'w', "wait for indexing to complete and print the snap ID (default; retained for compatibility and overrides --quick)")
+	quickFlag := opts.BoolLong("quick", 'q', "capture and return quietly while indexing continues in the background")
 	parseCmd(opts, "snap", args)
 
 	if *helpFlag {
@@ -345,23 +346,21 @@ func cmdSnap(args []string) {
 		subdir = resolved
 	}
 
-	snapshotID, err := doSnap(*sockPath, subdir, *waitFlag)
+	// Waiting is the default. --quick selects fire-and-forget mode, while an
+	// explicit --wait wins if both flags are supplied for compatibility with
+	// callers that append -w to a shared option list.
+	wait := !*quickFlag || *waitFlag
+	snapshotID, err := doSnap(*sockPath, subdir, wait)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
 
-	if *waitFlag {
-		// --wait: the content-addressable snap ID is known; print it to
-		// stdout for scripting (the historical default behavior).
+	if wait {
 		fmt.Println(snapshotID)
-		return
 	}
-
-	// Default (fire-and-forget): the snap was captured and indexing runs in
-	// the background. Nothing on stdout (the ID isn't known yet); emit a
-	// short notice on stderr so the user knows it worked.
-	fmt.Fprintln(os.Stderr, "snap captured; indexing in background")
+	// Quick success is deliberately silent on both stdout and stderr. The ID
+	// is not known yet, and Unix commands generally need not announce success.
 }
 
 // resolveSnapSubdir turns a user-supplied path (absolute or relative to the

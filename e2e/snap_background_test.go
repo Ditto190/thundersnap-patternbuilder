@@ -12,7 +12,7 @@ import (
 )
 
 // TestSnapBackgroundIndexing verifies the fire-and-forget ts snap path:
-// `ts snap` (without --wait) captures the frame and returns immediately with
+// `ts snap --quick` captures the frame and returns immediately with
 // no snap ID on stdout, while indexing runs in the background and the snap
 // appears in `ts snaps` once it finishes. See background-indexing.md.
 func testSnapBackgroundIndexing(t *testing.T, d *daemonInstance) {
@@ -31,8 +31,8 @@ func testSnapBackgroundIndexing(t *testing.T, d *daemonInstance) {
 	}
 	beforeCount := strings.Count(before, "\n")
 
-	// Fire-and-forget snap: stdout must be empty (no ID yet), stderr acks.
-	stdout, stderr, exitCode, err := sshExecSplit(t, d, "root@bgtest", "ts snap")
+	// Quick snap: success must be silent on both stdout and stderr.
+	stdout, stderr, exitCode, err := sshExecSplit(t, d, "root@bgtest", "ts snap --quick")
 	if err != nil {
 		t.Fatalf("ts snap failed: %v", err)
 	}
@@ -40,10 +40,10 @@ func testSnapBackgroundIndexing(t *testing.T, d *daemonInstance) {
 		t.Fatalf("ts snap: expected exit 0, got %d (stdout: %q stderr: %q)", exitCode, stdout, stderr)
 	}
 	if strings.TrimSpace(stdout) != "" {
-		t.Errorf("ts snap (no --wait): expected empty stdout, got %q", stdout)
+		t.Errorf("ts snap --quick: expected empty stdout, got %q", stdout)
 	}
-	if !strings.Contains(stderr, "indexing in background") {
-		t.Errorf("ts snap (no --wait): expected stderr to mention background indexing, got %q", stderr)
+	if strings.TrimSpace(stderr) != "" {
+		t.Errorf("ts snap --quick: expected empty stderr, got %q", stderr)
 	}
 
 	// The snap is indexed in the background; poll ts snaps until a new snap
@@ -62,7 +62,7 @@ func testSnapBackgroundIndexing(t *testing.T, d *daemonInstance) {
 		time.Sleep(200 * time.Millisecond)
 	}
 	if after == "" {
-		t.Fatalf("ts snap (no --wait): background snap never appeared in ts snaps within 30s (before=%q)", before)
+		t.Fatalf("ts snap --quick: background snap never appeared in ts snaps within 30s (before=%q)", before)
 	}
 	t.Logf("background snap appeared in ts snaps: %s", after)
 
@@ -78,14 +78,14 @@ func testSnapBackgroundIndexing(t *testing.T, d *daemonInstance) {
 }
 
 // TestSnapBackgroundCapturesAtCallTime verifies the defining property of the
-// background-indexing change: `ts snap` (without --wait) captures the frame's
+// background-indexing change: `ts snap --quick` captures the frame's
 // state at *call* time (the instant btrfs snapshot), and returns before
 // indexing finishes. A file written after `ts snap` returns must NOT appear in
 // the finalized snap — the capture is a COW snapshot of the live subvolume, so
 // later writes to the live frame never reach it. This is the property that
 // makes fire-and-forget snaps safe to use for `ts undo`/history, and it is the
 // behavior the old cmd/thundersnapd/full_e2e_test.go was trying to check but
-// could not (it ran `ts snap` without --wait and then parsed the missing ID,
+// could not (it ran `ts snap --quick` and then parsed the missing ID,
 // and it never started the indexing worker because it called daemon internals
 // directly instead of running the real binary). The real e2e harness runs the
 // actual thundersnapd, so initSnapQueue() runs and the worker is live.
@@ -99,12 +99,12 @@ func testSnapBackgroundCapturesAtCallTime(t *testing.T, d *daemonInstance) {
 	}
 
 	// Fire-and-forget snap: captures "before-snap" and returns at once.
-	stdout, stderr, exitCode, err := sshExecSplit(t, d, "root@captest", "ts snap")
+	stdout, stderr, exitCode, err := sshExecSplit(t, d, "root@captest", "ts snap --quick")
 	if err != nil || exitCode != 0 {
 		t.Fatalf("ts snap: err=%v exit=%d (stdout %q stderr %q)", err, exitCode, stdout, stderr)
 	}
 	if strings.TrimSpace(stdout) != "" {
-		t.Fatalf("ts snap (no --wait): expected empty stdout (no ID yet), got %q", stdout)
+		t.Fatalf("ts snap --quick: expected empty stdout (no ID yet), got %q", stdout)
 	}
 
 	// Mutate the LIVE frame AFTER ts snap returned. The captured snap must not
@@ -176,14 +176,14 @@ func testSnapRapidDoubleBackgroundIndexing(t *testing.T, d *daemonInstance) {
 	}
 	beforeCount := len(nonEmptyLogLines(beforeLog))
 
-	// Snap v1: write a marker, fire-and-forget snap (no --wait).
+	// Snap v1: write a marker, fire-and-forget snap (--quick).
 	if _, exit, err := sshExec(t, d, "root@bgdouble", "echo v1 > /marker"); err != nil || exit != 0 {
 		t.Fatalf("write v1 marker: err=%v exit=%d", err, exit)
 	}
-	if stdout, _, exit, err := sshExecSplit(t, d, "root@bgdouble", "ts snap"); err != nil || exit != 0 {
+	if stdout, _, exit, err := sshExecSplit(t, d, "root@bgdouble", "ts snap --quick"); err != nil || exit != 0 {
 		t.Fatalf("ts snap #1: err=%v exit=%d (stdout: %q)", err, exit, stdout)
 	} else if strings.TrimSpace(stdout) != "" {
-		t.Errorf("ts snap #1 (no --wait): expected empty stdout, got %q", stdout)
+		t.Errorf("ts snap #1 (--quick): expected empty stdout, got %q", stdout)
 	}
 
 	// Snap v2: change the marker to distinct content, fire-and-forget snap.
@@ -192,10 +192,10 @@ func testSnapRapidDoubleBackgroundIndexing(t *testing.T, d *daemonInstance) {
 	if _, exit, err := sshExec(t, d, "root@bgdouble", "echo v2 > /marker"); err != nil || exit != 0 {
 		t.Fatalf("write v2 marker: err=%v exit=%d", err, exit)
 	}
-	if stdout, _, exit, err := sshExecSplit(t, d, "root@bgdouble", "ts snap"); err != nil || exit != 0 {
+	if stdout, _, exit, err := sshExecSplit(t, d, "root@bgdouble", "ts snap --quick"); err != nil || exit != 0 {
 		t.Fatalf("ts snap #2: err=%v exit=%d (stdout: %q)", err, exit, stdout)
 	} else if strings.TrimSpace(stdout) != "" {
-		t.Errorf("ts snap #2 (no --wait): expected empty stdout, got %q", stdout)
+		t.Errorf("ts snap #2 (--quick): expected empty stdout, got %q", stdout)
 	}
 
 	// Poll ts log until BOTH snaps have finalized (>=2 new history entries).

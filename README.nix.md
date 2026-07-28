@@ -177,7 +177,7 @@ Notes on this step:
 ### 3. Snapshot the frame
 
 ```bash
-ts go "$FORK" -c 'ts snap -w' | tee /tmp/nix.triplet
+ts go "$FORK" -c 'ts snap' | tee /tmp/nix.triplet
 ```
 
 This prints the triplet, e.g.:
@@ -187,12 +187,10 @@ TH-doXTy...:Uu982kXp...:OVt2g6gr...
 
 **Footguns on this step:**
 
-- **`-w` (wait) is required to get the triplet on stdout.** Without it,
-  `ts snap` captures and returns immediately with indexing in the
-  background and prints *nothing* on stdout — you can't script the ID.
-  With `-w` it blocks until indexing finishes and prints the triplet.
-  (Progress lines may appear on stderr; `| tail -1` reliably extracts the
-  triplet.)
+- **The default waits and prints the triplet.** `-w` remains accepted for
+  backward compatibility. Use `-q` only when you explicitly want a quick,
+  silent capture whose content-addressable ID will be available later.
+  (Progress lines may appear on stderr; stdout contains only the triplet.)
 - **Don't be alarmed by `du -sh /work` showing ~30G.** The snap is
   *incremental*: it indexes each subvolume against its parent stamp, so a
   fork whose `/work` is byte-identical to its parent's dedupes almost
@@ -423,8 +421,9 @@ channel.
    out. Single-user nix needs no daemon and chowns `/nix` to `user`.
 10. **getopt stops at the first positional.** Put `--ref` (and any other
     flags) before the triplet in `ts frame`.
-11. **`ts snap` without `-w` prints no ID.** Use `ts snap -w` when you
-    need the triplet for scripting (`| tail -1` strips progress lines).
+11. **`ts snap` waits and prints its ID by default.** `-w` is a compatible
+    explicit spelling. `-q` returns after capture, prints nothing on success,
+    and leaves indexing to finish in the background.
 12. **Big `/work` is fine.** Snaps are incremental against the parent
     stamp; an unchanged 32G `/work` dedupes to nearly nothing. With the
     `:nil:nil` construction there's no inherited `/work` to worry about.

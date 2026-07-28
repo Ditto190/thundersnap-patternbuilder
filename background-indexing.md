@@ -1,6 +1,6 @@
 # Background snap indexing
 
-`ts snap` and `ts go ::` no longer block on content-addressable indexing.
+`ts snap --quick` and `ts go ::` do not block on content-addressable indexing.
 
 ## Why
 
@@ -15,15 +15,18 @@ synchronously and index in the background.
 
 ### `ts snap`
 
-- Default (no `--wait`): captures the frame immediately and returns at once.
-  Nothing is printed to stdout; a one-line notice ("snap captured; indexing
-  in background") goes to stderr. The content-addressable ID is not known yet.
-- `ts snap --wait`: behaves as before — streams indexing progress to stderr
-  and prints the `root:home:work` triplet (or single ID for `ts snap <path>`)
-  to stdout once indexing completes.
+- Default: waits for indexing, streams progress to stderr, and prints the
+  `root:home:work` triplet (or single ID for `ts snap <path>`) to stdout.
+- `ts snap --quick` (`-q`): captures the frame immediately and returns at
+  once. Successful capture is silent on both stdout and stderr; the
+  content-addressable ID is not known yet and indexing continues in the
+  background.
+- `ts snap --wait` (`-w`) is retained for backward compatibility and has the
+  same behavior as the default. If both `--quick` and `--wait` are supplied,
+  `--wait` wins.
 
 Callers that need the ID (e.g. `ts undo`, which records the current snap for
-history pruning) use `--wait` internally.
+history pruning) may continue to use `--wait` explicitly.
 
 ### `ts go ::` / `ts frame ::`
 

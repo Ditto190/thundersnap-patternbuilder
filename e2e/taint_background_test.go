@@ -31,7 +31,7 @@ func testTaintSurvivesBackgroundSnap(t *testing.T, d *daemonInstance) {
 		t.Fatalf("ts taint (add): err=%v exit=%d", err, exitCode)
 	}
 
-	if _, _, exitCode, err := sshExecSplit(t, d, "root@tainttest", "ts snap"); err != nil || exitCode != 0 {
+	if _, _, exitCode, err := sshExecSplit(t, d, "root@tainttest", "ts snap --quick"); err != nil || exitCode != 0 {
 		t.Fatalf("ts snap: err=%v exit=%d", err, exitCode)
 	}
 

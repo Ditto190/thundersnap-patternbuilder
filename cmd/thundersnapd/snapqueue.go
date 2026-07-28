@@ -3,8 +3,8 @@
 
 // snapqueue.go implements background, serialized snap indexing.
 //
-// ts snap / ts go :: capture a btrfs snapshot (instant, COW) and return at
-// once; the slow part — walking the tree and hashing every file to derive the
+// ts snap --quick / ts go :: capture a btrfs snapshot (instant, COW) and
+// return at once; the slow part — walking the tree and hashing every file to derive the
 // content-addressable snap ID — happens in a single daemon-wide background
 // worker that drains captured snaps in FIFO order. Serializing indexing gives
 // two properties the old synchronous code lacked:
