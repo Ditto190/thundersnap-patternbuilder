@@ -151,6 +151,9 @@ func main() {
 	case "container-init":
 		// Hidden command - starts a minimal init process for container namespaces
 		cmdContainerInit(cmdArgs)
+	case "autoclean":
+		// Hidden command - ties a foreground subprocess to a lifecycle fd.
+		cmdAutoclean(cmdArgs)
 	case "su":
 		// Switch user (drop privileges and exec a login shell or -c command).
 		// Also reachable via the /bin/su -> ts symlink; this subcommand form is
