@@ -162,20 +162,22 @@ func (d *daemonInstance) waitReady(timeout time.Duration) error {
 	}
 }
 
-// Stop stops the daemon.
-func (d *daemonInstance) Stop() {
+func (d *daemonInstance) killAbruptly() {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-
 	if d.stopped {
 		return
 	}
 	d.stopped = true
-
 	if d.cmd != nil && d.cmd.Process != nil {
-		d.cmd.Process.Kill()
-		d.cmd.Wait()
+		_ = d.cmd.Process.Kill()
+		_ = d.cmd.Wait()
 	}
+}
+
+// Stop stops the daemon using the same abrupt path used for crash cleanup.
+func (d *daemonInstance) Stop() {
+	d.killAbruptly()
 }
 
 // getFreePort finds a free TCP port by briefly binding to :0.

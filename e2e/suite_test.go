@@ -136,6 +136,10 @@ func TestContainer(t *testing.T) {
 		// spins up its own d2 (separate state dir) inside the subtest. Run last
 		// so the extra daemon only lives for the scenario that needs it.
 		{"CrossInstanceSnapDeterminism", testCrossInstanceSnapDeterminism},
+
+		// Destructive by design: this must remain last because it SIGKILLs the
+		// shared daemon while sessions and autorun processes are still alive.
+		{"CrashLifecycle", testContainerCrashLifecycle},
 	}
 
 	for _, sc := range scenarios {
@@ -160,6 +164,10 @@ func TestVM(t *testing.T) {
 		{"VMNamespaceSetup", testVMNamespaceSetup},
 		{"VMDeepWorkflow", testVMDeepWorkflow},
 		{"VMXPtyWinsize", testVMXPtyWinsize},
+
+		// Destructive by design: this must remain last because it SIGKILLs the
+		// shared daemon while a VM session is still alive.
+		{"CrashLifecycle", testVMCrashLifecycle},
 	}
 
 	for _, sc := range scenarios {
