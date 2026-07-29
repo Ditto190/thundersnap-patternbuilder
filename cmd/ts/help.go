@@ -187,10 +187,18 @@ taint per line. With a name: "Added taint: <name>", then "Current taints:
 		long: `Configures a command to run automatically when a ref's frame is
 entered. --ref selects the ref (required). Provide a program and
 arguments to set the autorun, or --stop to clear it.`,
-		outputs: `set: "Set autorun for ref <ref>: <argv>". --stop: "Cleared autorun
-for ref <ref>".`,
+		outputs: `Nothing on success. Errors are written to stderr.`,
 		examples: `  ts autorun --ref web nginx -g 'daemon off;'
   ts autorun --ref web --stop`,
+	},
+	{
+		name:     "autoruns",
+		category: "other",
+		short:    "list configured autorun commands",
+		long: `Lists configured autorun commands. Each command is encoded independently,
+so arbitrary argument contents cannot make the output ambiguous.`,
+		outputs: `One compact JSON argv array per configured autorun, one per line.
+Nothing is printed when no autoruns are configured.`,
 	},
 	{
 		name:     "download-docker",

@@ -403,9 +403,9 @@ channel.
    recommended way to bootstrap a fresh frame as root (install sudo,
    write the NOPASSWD drop-in, clear `user`'s password expiry). The older
    `ssh root@<ref>@thundersnap` path (SSH sends an explicit username the
-   daemon honours) still works but is no longer needed. `ts autorun` also
-   runs as root but restarts on exit with backoff, so it's worse for
-   one-shot bootstrap commands.
+   daemon honours) still works but is no longer needed. `ts autorun` enters
+   like a `user@` session (including `HOME=/home`) and restarts on exit with
+   backoff, so it's worse for one-shot bootstrap commands.
 5. **`ts go -c` stdout is clean** (no PTY escape codes). You can capture
    snap IDs and command output from it directly.
 6. **A bare `ts go` opens an interactive session and hangs.** Always

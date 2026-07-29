@@ -245,25 +245,30 @@ func (m *autorunManager) supervise(ctx context.Context, proc *autorunProcess) {
 		default:
 		}
 
-		// Run the process
-		err := m.runOnce(ctx, proc)
+		// Run one attempt. On failure the in-container autorun-run wrapper holds
+		// this same session open for backoff, visibly as `ts retry-on-fail`.
+		err := m.runOnce(ctx, proc, backoff)
 		if err != nil {
 			if ctx.Err() != nil {
 				// Context cancelled, exit cleanly
 				return
 			}
-			log.Printf("autorun: process %s/%s exited: %v, restarting in %v",
-				proc.key.user, proc.key.refName, err, backoff)
+			log.Printf("autorun: process %s/%s exited: %v, restarting",
+				proc.key.user, proc.key.refName, err)
 		} else {
 			log.Printf("autorun: process %s/%s exited with status 0, restarting in %v",
 				proc.key.user, proc.key.refName, backoff)
 		}
 
-		// Wait before restarting
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(backoff):
+		// Failed attempts already spent the delay inside the container as the
+		// visible retry-on-fail process. Successful commands are also restarted,
+		// but retain the daemon-side delay to avoid a tight loop.
+		if err == nil {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(backoff):
+			}
 		}
 
 		// Increase backoff for next restart (exponential with cap)
@@ -277,8 +282,8 @@ func (m *autorunManager) supervise(ctx context.Context, proc *autorunProcess) {
 // runOnce runs the autorun command once by entering a container session via
 // the host vshd shim — the same path SSH container sessions take
 // (runContainerSession) — and blocks until the command exits or the session is
-// torn down. The command runs as root with proc.argv directly, equivalent to
-// `ssh root@<ref> -- <argv>`.
+// torn down. The command runs through the same unprivileged login path as
+// `ssh user@<ref> -- <argv>`.
 //
 // Going through vshd (rather than spawning `ts drop-caps-and-run` with a bespoke
 // CLONE_NEWPID) shares vshd's namespace anchoring and, critically, the
@@ -288,7 +293,7 @@ func (m *autorunManager) supervise(ctx context.Context, proc *autorunProcess) {
 // `while true; do :; done`) dies instead of being orphaned and spinning forever.
 // The old bespoke CLONE_NEWPID spawn reparented to init on daemon exit and left
 // the child running in its own PID namespace with nothing to kill it.
-func (m *autorunManager) runOnce(ctx context.Context, proc *autorunProcess) error {
+func (m *autorunManager) runOnce(ctx context.Context, proc *autorunProcess, retryDelay time.Duration) error {
 	// Resolve the ref to its current frame rootfs so ref moves are reflected.
 	rootFS, _, err := resolveFrameRootFS(proc.key.user, proc.key.refName)
 	if err != nil {
@@ -329,11 +334,13 @@ func (m *autorunManager) runOnce(ctx context.Context, proc *autorunProcess) erro
 		proc.mu.Unlock()
 	}()
 
-	// Non-PTY session running proc.argv directly as root — the same request
-	// `ssh root@<ref> -- <argv>` sends. No stdin: an immediate EOF is sent,
-	// matching an exec session with no input (and NOT a disconnect, so
-	// servePipe does not SIGHUP the child).
-	writeVshdRequest(conn, framePathHdr, "root", false, proc.argv)
+	// Enter exactly like an `ssh user@<ref> -- ...` exec session. vshd wraps
+	// this in `su - user -c`, setting HOME and the rest of the login identity
+	// before starting the autorun wrapper. No stdin: an immediate EOF is sent.
+	// The wrapper executes proc.argv without an additional shell and only
+	// remains after failure, as the ps-visible retry-on-fail sleeper.
+	argv := append([]string{"/bin/ts", "autorun-run", retryDelay.String()}, proc.argv...)
+	writeVshdRequest(conn, framePathHdr, "user", false, argv)
 
 	exitCode := proxyVshdSessionGeneric(
 		strings.NewReader(""), // stdin: immediate EOF (no input)

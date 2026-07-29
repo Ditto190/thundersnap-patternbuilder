@@ -133,6 +133,8 @@ func main() {
 		cmdLog(cmdArgs)
 	case "autorun":
 		cmdAutorun(cmdArgs)
+	case "autoruns":
+		cmdAutoruns(cmdArgs)
 	case "go":
 		cmdGo(cmdArgs)
 	case "undo":
@@ -164,6 +166,13 @@ func main() {
 		// so the pty it opens lands in the container's devpts; speaks vshdproto
 		// TLV on stdin/stdout, which vshd splices to the client connection.
 		cmdSessionServe(cmdArgs)
+	case "autorun-run":
+		// Hidden command - runs one autorun attempt, retaining a visible process
+		// in its session for the retry delay after a failure.
+		cmdAutorunRun(cmdArgs)
+	case "retry-on-fail":
+		// Hidden diagnostic process used by autorun-run during retry backoff.
+		cmdRetryOnFail(cmdArgs)
 	case "nsenter":
 		// Hidden command - CGO-free in-binary nsenter(1) used by vshd to join a
 		// shared container namespace identically on the host and inside a VM.
@@ -1784,30 +1793,36 @@ type RefListResponse struct {
 	Refs   []RefListEntry `json:"refs"`
 }
 
-func doListRefs(sockPath string) error {
+func getRefs(sockPath string) ([]RefListEntry, error) {
 	client := thunderclient.NewHTTPClient(sockPath)
 
 	resp, err := client.Get("http://localhost/refs")
 	if err != nil {
-		return fmt.Errorf("request failed: %w", err)
+		return nil, fmt.Errorf("request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
 	var result RefListResponse
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return fmt.Errorf("parse response: %w", err)
+		return nil, fmt.Errorf("parse response: %w", err)
 	}
-
 	if result.Status != "ok" {
-		return fmt.Errorf("server error")
+		return nil, fmt.Errorf("server error")
 	}
+	return result.Refs, nil
+}
 
-	if len(result.Refs) == 0 {
+func doListRefs(sockPath string) error {
+	refs, err := getRefs(sockPath)
+	if err != nil {
+		return err
+	}
+	if len(refs) == 0 {
 		fmt.Println("(no refs)")
 		return nil
 	}
 
-	for _, ref := range result.Refs {
+	for _, ref := range refs {
 		if len(ref.Autorun) > 0 {
 			fmt.Printf("%s -> %s [autorun: %s]\n", ref.Name, ref.UUID, strings.Join(ref.Autorun, " "))
 		} else {
@@ -1985,7 +2000,6 @@ func cmdAutorun(args []string) {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 			os.Exit(1)
 		}
-		fmt.Printf("Cleared autorun for ref %s\n", *refName)
 		return
 	}
 
@@ -2000,7 +2014,37 @@ func cmdAutorun(args []string) {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Printf("Set autorun for ref %s: %s\n", *refName, strings.Join(argv, " "))
+}
+
+func cmdAutoruns(args []string) {
+	opts, helpFlag := newCmdOpts("autoruns", "")
+	parseCmd(opts, "autoruns", args)
+	if *helpFlag {
+		printCommandHelp(os.Stdout, "autoruns", opts)
+		return
+	}
+	if opts.NArgs() != 0 {
+		fmt.Fprintln(os.Stderr, "error: autoruns takes no arguments")
+		os.Exit(1)
+	}
+
+	refs, err := getRefs(*sockPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetEscapeHTML(false)
+	for _, ref := range refs {
+		if len(ref.Autorun) > 0 {
+			// One JSON argv array per line makes every argument unambiguous,
+			// including whitespace, quotes, control characters, and newlines.
+			if err := enc.Encode(ref.Autorun); err != nil {
+				fmt.Fprintf(os.Stderr, "error: encode autorun: %v\n", err)
+				os.Exit(1)
+			}
+		}
+	}
 }
 
 // AutorunRequest is the request body for /autorun

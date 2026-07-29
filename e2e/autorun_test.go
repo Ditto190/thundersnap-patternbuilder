@@ -6,7 +6,9 @@
 package e2e
 
 import (
+	"encoding/json"
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -41,7 +43,9 @@ func testAutorunBasic(t *testing.T, d *daemonInstance) {
 	if exitCode != 0 {
 		t.Fatalf("ts autorun returned exit code %d: %s", exitCode, output)
 	}
-	t.Logf("ts autorun output: %s", output)
+	if output != "" {
+		t.Errorf("ts autorun printed output on success: %q", output)
+	}
 
 	// Verify the autorun is listed via ts refs
 	output, exitCode, err = sshExec(t, d, "root@autoref", "ts refs")
@@ -266,16 +270,25 @@ func testAutorunMultiWordCommand(t *testing.T, d *daemonInstance) {
 	}
 	t.Logf("ts autorun output: %s", output)
 
-	// Verify the full command is displayed
-	output, exitCode, err = sshExec(t, d, "root@multiref", "ts refs")
+	// `ts autoruns` emits one unambiguous JSON argv array per line.
+	output, exitCode, err = sshExec(t, d, "root@multiref", "ts autoruns")
 	if err != nil || exitCode != 0 {
-		t.Fatalf("ts refs failed: exit=%d err=%v output=%s", exitCode, err, output)
+		t.Fatalf("ts autoruns failed: exit=%d err=%v output=%s", exitCode, err, output)
 	}
-	// Should contain the shell and its args
-	if !strings.Contains(output, "/bin/sh") {
-		t.Errorf("expected /bin/sh in autorun output, got: %s", output)
+	want := []string{"/bin/sh", "-c", "echo hello world"}
+	found := false
+	for _, line := range strings.Split(strings.TrimSpace(output), "\n") {
+		var got []string
+		if err := json.Unmarshal([]byte(line), &got); err != nil {
+			t.Fatalf("ts autoruns output is not JSON argv arrays: %q: %v", output, err)
+		}
+		if reflect.DeepEqual(got, want) {
+			found = true
+		}
 	}
-	t.Logf("Refs output: %s", output)
+	if !found {
+		t.Errorf("ts autoruns did not contain %#v; output: %q", want, output)
+	}
 }
 
 // TestAutorunProcessStarts tests that setting autorun actually starts the process.
@@ -287,7 +300,7 @@ func testAutorunProcessStarts(t *testing.T, d *daemonInstance) {
 
 	// Use a command that creates a marker file and keeps running.
 	// We use "while true; do :; done" instead of sleep - it's pure shell, no external commands.
-	autorunCmd := "ts autorun --ref procstart /bin/sh -c 'echo started > /tmp/autorun-marker; while true; do :; done'"
+	autorunCmd := "ts autorun --ref procstart /bin/sh -c 'echo $HOME > /tmp/autorun-home; echo started > /tmp/autorun-marker; while true; do :; done'"
 	output, exitCode, err := sshExec(t, d, "root@procstart", autorunCmd)
 	if err != nil {
 		t.Fatalf("ts autorun failed: %v", err)
@@ -313,6 +326,14 @@ func testAutorunProcessStarts(t *testing.T, d *daemonInstance) {
 	}
 	if !strings.Contains(output, "started") {
 		t.Errorf("marker file content = %q, want 'started'", output)
+	}
+
+	output, exitCode, err = sshExec(t, d, "root@procstart", "read -r home < /tmp/autorun-home; echo $home")
+	if err != nil || exitCode != 0 {
+		t.Fatalf("read autorun HOME: err=%v exit=%d output=%q", err, exitCode, output)
+	}
+	if strings.TrimSpace(output) != "/home" {
+		t.Errorf("autorun HOME = %q, want /home (same as user@ session)", strings.TrimSpace(output))
 	}
 }
 

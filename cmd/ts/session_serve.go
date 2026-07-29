@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"strconv"
+	"time"
 
 	"github.com/tailscale/thundersnap/vshdsession"
 )
@@ -60,4 +61,67 @@ func cmdSessionServe(args []string) {
 	// over them. logf is nil (diagnostics, if any, go to our stderr which vshd
 	// surfaces in its own log).
 	vshdsession.Serve(os.Stdout, os.Stdin, cmd, wantPTY, nil, nil)
+}
+
+// cmdAutorunRun runs one attempt and, only after a non-zero exit, leaves a
+// conspicuously named retry process in the same container session. The daemon
+// reconnects after this command exits, so the retry delay is visible in ps axf.
+func cmdAutorunRun(args []string) {
+	if len(args) < 2 {
+		fmt.Fprintln(os.Stderr, "error: autorun-run requires <retry-duration> <program> [args...]")
+		os.Exit(1)
+	}
+	delay, err := time.ParseDuration(args[0])
+	if err != nil || delay < 0 {
+		fmt.Fprintf(os.Stderr, "error: autorun-run: invalid retry duration %q\n", args[0])
+		os.Exit(1)
+	}
+	exe, err := findExecutable(args[1])
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "autorun: %v\n", err)
+		retryOnFail(delay)
+		os.Exit(1)
+	}
+	cmd := exec.Command(exe, args[2:]...)
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+	cmd.Env = os.Environ()
+	if err := cmd.Run(); err != nil {
+		fmt.Fprintf(os.Stderr, "autorun: %v\n", err)
+		retryOnFail(delay)
+		os.Exit(1)
+	}
+}
+
+func cmdRetryOnFail(args []string) {
+	if len(args) != 1 {
+		fmt.Fprintln(os.Stderr, "error: retry-on-fail requires <duration>")
+		os.Exit(1)
+	}
+	delay, err := time.ParseDuration(args[0])
+	if err != nil || delay < 0 {
+		fmt.Fprintf(os.Stderr, "error: retry-on-fail: invalid duration %q\n", args[0])
+		os.Exit(1)
+	}
+	sleepRetry(delay)
+}
+
+func retryOnFail(delay time.Duration) {
+	self, err := os.Executable()
+	if err == nil {
+		cmd := exec.Command(self, "retry-on-fail", delay.String())
+		cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+		cmd.Env = os.Environ()
+		if cmd.Run() == nil {
+			return
+		}
+	}
+	// Keep the retry delay even if re-exec is unavailable; only the diagnostic
+	// process name is lost.
+	sleepRetry(delay)
+}
+
+func sleepRetry(delay time.Duration) {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	<-timer.C
 }
