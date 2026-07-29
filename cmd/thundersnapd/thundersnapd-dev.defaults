@@ -6,4 +6,4 @@
 #
 # The dev daemon's binaries live in /usr/libexec/thundersnap-dev/ and
 # /usr/sbin/thundersnapd-dev, so both packages can coexist without conflicts.
-FLAGS="--data-dir=/var/lib/thundersnap --policy=/etc/thundersnap/policy-dev.jsonc"
+FLAGS="--data-dir=/var/lib/thundersnap --policy=/etc/thundersnap/policy-dev.jsonc --mesh"
