@@ -16,11 +16,10 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
-	"syscall"
+	"sync"
 	"time"
 
 	"github.com/creack/pty"
-	"golang.org/x/sys/unix"
 )
 
 // VMConfig holds configuration for starting a VM session.
@@ -35,6 +34,10 @@ type VMConfig struct {
 	// Hostname is the hostname to set inside the VM via kernel IP autoconfig.
 	// If empty, defaults to "thundersnap".
 	Hostname string
+	// RuntimeDir is a private directory for this VM's Unix sockets.
+	RuntimeDir string
+	// AutocleanPath is the ts binary used to supervise VM subprocesses.
+	AutocleanPath string
 	// InitPrefix is an optional path prefix where the init binaries are located
 	// within the virtiofs mount. For VMX mode, this might be ".vmx-<isolation>"
 	// so that /bin/ts is at /.vmx-<isolation>/bin/ts in the virtiofs.
@@ -59,6 +62,8 @@ type VMSession struct {
 	done           chan struct{}
 	panicked       chan struct{} // closed when guest kernel panic is detected
 	controlHandler http.Handler
+	lifecycleW     []*os.File
+	closeOnce      sync.Once
 }
 
 // SetControlHandler updates the HTTP handler used for vsock control connections.
@@ -72,6 +77,27 @@ func (s *VMSession) SetControlHandler(h http.Handler) {
 // and an error if it never appears. The helper (a process started by us creates
 // the socket asynchronously) is shared by the virtiofsd and passt startup
 // paths, which previously duplicated this loop verbatim.
+// autocleanCommand wraps argv with ts autoclean. passFiles become fds 3..N in
+// both autoclean and the supervised child; the lifecycle pipe follows them.
+// The caller must close lifecycleR immediately after starting cmd and keep
+// lifecycleW open for as long as the subprocess should live.
+func autocleanCommand(tsPath string, passFiles []*os.File, argv ...string) (cmd *exec.Cmd, lifecycleR, lifecycleW *os.File, err error) {
+	lifecycleR, lifecycleW, err = os.Pipe()
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("create lifecycle pipe: %w", err)
+	}
+	lifecycleFD := 3 + len(passFiles)
+	args := []string{"autoclean", fmt.Sprintf("--lifecycle-fd=%d", lifecycleFD)}
+	for i := range passFiles {
+		args = append(args, fmt.Sprintf("--pass-fd=%d", 3+i))
+	}
+	args = append(args, "--")
+	args = append(args, argv...)
+	cmd = exec.Command(tsPath, args...)
+	cmd.ExtraFiles = append(append([]*os.File(nil), passFiles...), lifecycleR)
+	return cmd, lifecycleR, lifecycleW, nil
+}
+
 func waitForSocket(path string, attempts int, delay time.Duration) error {
 	for i := 0; i < attempts; i++ {
 		if _, err := os.Stat(path); err == nil {
@@ -87,15 +113,18 @@ func waitForSocket(path string, attempts int, delay time.Duration) error {
 
 // StartVM starts a new VM session with the given configuration.
 func StartVM(cfg VMConfig) (*VMSession, error) {
-	// Create unique socket paths for this session. The ID is the daemon PID
-	// concatenated with the current time in nanoseconds, which is unique enough
-	// to avoid collisions between concurrent VM sessions in the same process;
-	// it is only ever used to name per-session /tmp sockets, not as a security
-	// or correctness boundary.
-	sessionID := fmt.Sprintf("%d%d", os.Getpid(), time.Now().UnixNano())
-	virtiofsSock := filepath.Join("/tmp", fmt.Sprintf("virtiofs-%s.sock", sessionID))
-	vsockSock := filepath.Join("/tmp", fmt.Sprintf("vsock-%s.sock", sessionID))
-	passtSock := filepath.Join("/tmp", fmt.Sprintf("passt-%s.sock", sessionID))
+	if cfg.RuntimeDir == "" {
+		return nil, fmt.Errorf("RuntimeDir is required")
+	}
+	if cfg.AutocleanPath == "" {
+		return nil, fmt.Errorf("AutocleanPath is required")
+	}
+	if err := os.MkdirAll(cfg.RuntimeDir, 0755); err != nil {
+		return nil, fmt.Errorf("create VM runtime dir: %w", err)
+	}
+	virtiofsSock := filepath.Join(cfg.RuntimeDir, "virtiofs.sock")
+	vsockSock := filepath.Join(cfg.RuntimeDir, "vsock.sock")
+	passtSock := filepath.Join(cfg.RuntimeDir, "passt.sock")
 
 	// Start virtiofsd
 	log.Printf("Starting virtiofsd with shared-dir=%s", cfg.RootFS)
@@ -113,21 +142,23 @@ func StartVM(cfg VMConfig) (*VMSession, error) {
 	// thundersnapd could run in a lower-isolation mode that retains CAP_SETFCAP
 	// in its bounding set, making this flag unnecessary in that mode. That mode
 	// doesn't exist today, so we always pass the flag.
-	virtiofsdCmd := exec.Command("/usr/libexec/virtiofsd",
+	virtiofsdCmd, virtiofsdLifecycleR, virtiofsdLifecycle, err := autocleanCommand(cfg.AutocleanPath, nil,
+		"/usr/libexec/virtiofsd",
 		"--socket-path="+virtiofsSock,
 		"--shared-dir="+cfg.RootFS,
 		"--cache=always",
 		"--modcaps=-setfcap",
 	)
-	// Pdeathsig ensures virtiofsd exits when its parent (thundersnapd/test harness)
-	// dies, preventing orphaned virtiofsd processes.
-	virtiofsdCmd.SysProcAttr = &syscall.SysProcAttr{
-		Pdeathsig: unix.SIGTERM,
+	if err != nil {
+		return nil, err
 	}
 	virtiofsdCmd.Stderr = os.Stderr
 	if err := virtiofsdCmd.Start(); err != nil {
+		virtiofsdLifecycleR.Close()
+		virtiofsdLifecycle.Close()
 		return nil, fmt.Errorf("start virtiofsd: %w", err)
 	}
+	virtiofsdLifecycleR.Close()
 
 	// cleanup tears down everything started so far, in reverse order. Each
 	// startup failure path below appends its just-started resource and calls
@@ -141,8 +172,7 @@ func StartVM(cfg VMConfig) (*VMSession, error) {
 		}
 		virtiofsdCmd.Process.Kill()
 		virtiofsdCmd.Wait()
-		os.Remove(virtiofsSock)
-		os.Remove(passtSock)
+		virtiofsdLifecycle.Close()
 	}
 
 	// Wait for virtiofsd socket to be created
@@ -157,15 +187,20 @@ func StartVM(cfg VMConfig) (*VMSession, error) {
 	// Configure NAT-style addressing (like QEMU user networking) so DHCP clients
 	// get predictable private addresses instead of the host's addresses.
 	log.Printf("Starting passt for user-space networking")
-	passtCmd = exec.Command("passt",
+	passtCmd, passtLifecycleR, passtLifecycle, err := autocleanCommand(cfg.AutocleanPath, nil, "passt",
 		"--socket", passtSock,
-		"--vhost-user",    // vhost-user mode for cloud-hypervisor
-		"--foreground",    // stay in foreground for process management
-		"--quiet",         // reduce log noise
+		"--vhost-user", // vhost-user mode for cloud-hypervisor
+		"--foreground", // stay in foreground for process management
+		"--quiet",      // reduce log noise
+		"--runas", "0", // retain access to the root-owned runtime directory
 		"-a", "10.0.2.15", // guest address (QEMU-style NAT)
 		"-g", "10.0.2.2", // gateway address
 		"-D", "none", // don't intercept DNS
 	)
+	if err != nil {
+		cleanup()
+		return nil, err
+	}
 	// Note: passt creates a user namespace (CLONE_NEWUSER) for sandboxing
 	// regardless of --runas. This fails in containers that don't allow
 	// CLONE_NEWUSER (e.g., some thundersnap container configurations). When
@@ -174,17 +209,15 @@ func StartVM(cfg VMConfig) (*VMSession, error) {
 	// cloud-hypervisor will fail because passt isn't functioning correctly.
 	// This is an environment limitation, not a thundersnap code bug. The fix
 	// is to allow CLONE_NEWUSER in the container (kernel/container config).
-	// Pdeathsig ensures passt exits when its parent (thundersnapd/test harness)
-	// dies, preventing orphaned passt processes.
-	passtCmd.SysProcAttr = &syscall.SysProcAttr{
-		Pdeathsig: unix.SIGTERM,
-	}
 	passtCmd.Stderr = os.Stderr
 	if err := passtCmd.Start(); err != nil {
+		passtLifecycleR.Close()
+		passtLifecycle.Close()
 		passtCmd = nil // not started; don't let cleanup deref a nil Process
 		cleanup()
 		return nil, fmt.Errorf("start passt: %w", err)
 	}
+	passtLifecycleR.Close()
 
 	// Wait for passt socket to be created
 	if err := waitForSocket(passtSock, 50, 100*time.Millisecond); err != nil {
@@ -276,15 +309,13 @@ func StartVM(cfg VMConfig) (*VMSession, error) {
 	if cfg.ControlHandler != nil {
 		chvArgs = append(chvArgs, "--vsock", fmt.Sprintf("cid=3,socket=%s", vsockSock))
 	}
-	chvCmd := exec.Command(chvPath, chvArgs...)
-	// Pass the event write pipe to cloud-hypervisor as fd 3. ExtraFiles[0] maps
-	// to fd 3 in the child (after stdin/stdout/stderr = 0/1/2), which must match
-	// eventMonitorFd above: keep this slice exactly one element long.
-	chvCmd.ExtraFiles = []*os.File{eventWritePipe}
-	// Pdeathsig ensures cloud-hypervisor exits when its parent (thundersnapd/test
-	// harness) dies, preventing orphaned VMs.
-	chvCmd.SysProcAttr = &syscall.SysProcAttr{
-		Pdeathsig: unix.SIGTERM,
+	chvArgv := append([]string{chvPath}, chvArgs...)
+	chvCmd, chvLifecycleR, chvLifecycle, err := autocleanCommand(cfg.AutocleanPath, []*os.File{eventWritePipe}, chvArgv...)
+	if err != nil {
+		eventReadPipe.Close()
+		eventWritePipe.Close()
+		cleanup()
+		return nil, err
 	}
 
 	session := &VMSession{
@@ -296,28 +327,44 @@ func StartVM(cfg VMConfig) (*VMSession, error) {
 		done:           make(chan struct{}),
 		panicked:       make(chan struct{}),
 		controlHandler: cfg.ControlHandler,
+		lifecycleW:     []*os.File{virtiofsdLifecycle, passtLifecycle, chvLifecycle},
 	}
 
 	// Run cloud-hypervisor in headless mode with a PTY (required for --serial tty)
 	// Console output goes to our log system via a goroutine
 	ptmx, err := pty.Start(chvCmd)
 	if err != nil {
+		chvLifecycleR.Close()
+		chvLifecycle.Close()
 		eventReadPipe.Close()
 		eventWritePipe.Close()
 		cleanup()
 		return nil, fmt.Errorf("start cloud-hypervisor with pty: %w", err)
 	}
+	chvLifecycleR.Close()
 	log.Printf("cloud-hypervisor started with PID %d", chvCmd.Process.Pid)
 
 	// Close write end of event pipe in parent - cloud-hypervisor has its own copy
 	eventWritePipe.Close()
 
-	// Monitor cloud-hypervisor in background
+	// Any member exiting tears down the whole VM cohort. There is exactly one
+	// waiter per command, and Done closes only after all three are reaped.
+	exited := make(chan string, 3)
+	for name, cmd := range map[string]*exec.Cmd{"virtiofsd": virtiofsdCmd, "passt": passtCmd, "cloud-hypervisor": chvCmd} {
+		go func(name string, cmd *exec.Cmd) {
+			_ = cmd.Wait()
+			exited <- name
+		}(name, cmd)
+	}
 	go func() {
-		chvCmd.Wait()
+		first := <-exited
+		log.Printf("VM cohort member %s exited; killing cohort", first)
+		session.kill()
+		for i := 1; i < 3; i++ {
+			<-exited
+		}
 		ptmx.Close()
 		eventReadPipe.Close()
-		log.Printf("cloud-hypervisor exited")
 		close(session.done)
 	}()
 
@@ -409,44 +456,20 @@ func (s *VMSession) monitorEvents(r io.Reader) {
 
 // Close terminates the VM session and cleans up resources.
 func (s *VMSession) Close() error {
-	log.Printf("Closing VM session, killing cloud-hypervisor PID %d", s.chvCmd.Process.Pid)
-
-	// Kill cloud-hypervisor
-	if err := s.chvCmd.Process.Kill(); err != nil {
-		log.Printf("Warning: failed to kill cloud-hypervisor: %v", err)
-	}
-
-	// Wait for it to actually exit
+	s.kill()
 	<-s.done
-	log.Printf("cloud-hypervisor has exited")
-
-	// Kill virtiofsd (it may have already exited when cloud-hypervisor disconnected)
-	log.Printf("Killing virtiofsd PID %d", s.virtiofsdCmd.Process.Pid)
-	s.virtiofsdCmd.Process.Kill()
-	s.virtiofsdCmd.Wait()
-	log.Printf("virtiofsd has exited")
-
-	// Kill passt (it may have already exited when cloud-hypervisor disconnected)
-	if s.passtCmd != nil {
-		log.Printf("Killing passt PID %d", s.passtCmd.Process.Pid)
-		s.passtCmd.Process.Kill()
-		s.passtCmd.Wait()
-		log.Printf("passt has exited")
-	}
-
-	// Close vsock listener if we have one
-	if s.vsockListener != nil {
-		s.vsockListener.Close()
-	}
-
-	// Clean up sockets
-	os.Remove(s.virtiofsSock)
-	// Also remove vsock socket and port-specific socket
-	os.Remove(s.vsockSock)
-	os.Remove(fmt.Sprintf("%s_%d", s.vsockSock, VsockPort))
-	log.Printf("Cleaned up sockets")
-
 	return nil
+}
+
+func (s *VMSession) kill() {
+	s.closeOnce.Do(func() {
+		if s.vsockListener != nil {
+			s.vsockListener.Close()
+		}
+		for _, f := range s.lifecycleW {
+			_ = f.Close()
+		}
+	})
 }
 
 // serveVsock accepts connections on the vsock listener and serves the control protocol.

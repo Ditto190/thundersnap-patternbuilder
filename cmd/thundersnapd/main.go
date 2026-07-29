@@ -28,6 +28,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -93,6 +94,11 @@ var (
 	// Set after tsnet.Server.Up() completes. Protected by globalTsnetHostnameMu.
 	globalTsnetHostname   string
 	globalTsnetHostnameMu sync.RWMutex
+
+	// runtimeDir is unique to this daemon incarnation. Runtime artifacts are
+	// deliberately left behind on shutdown and reclaimed by a future startup.
+	runtimeDir string
+	vmSerial   atomic.Uint64
 
 	// fsDirLibexec is the path to $fs-dir/libexec/ where binaries are cached
 	// for btrfs reflink copying into frames. This is on the same filesystem
@@ -262,9 +268,12 @@ func (m *vmxSessionManager) getOrCreateVMX(tailscaleUser, isolationName, userFsD
 	// - VMX rootfs binaries are at /<initPrefix>/bin/ts, /<initPrefix>/sbin/vshd
 	// - Frame rootfs directories are at /<frame>/
 	log.Printf("VMX session %s: starting new VM (userFsDir=%s, initPrefix=%s)", key, userFsDir, initPrefix)
+	vmRuntimeDir := filepath.Join(runtimeDir, fmt.Sprintf("vm-%d", vmSerial.Add(1)))
 	session, err := thundersnap.StartVM(thundersnap.VMConfig{
 		RootFS:         userFsDir,
 		VMDir:          vmDir,
+		RuntimeDir:     vmRuntimeDir,
+		AutocleanPath:  filepath.Join(fsDirLibexec, "ts"),
 		ControlHandler: controlHandler,
 		Hostname:       getTsnetHostname(),
 		InitPrefix:     initPrefix,
@@ -569,6 +578,10 @@ func main() {
 	// is on a different filesystem.
 	if err := setupFsDirLibexec(); err != nil {
 		fatalWithStatus("Failed to set up fs-dir libexec: %v", err)
+	}
+
+	if err := initRuntimeDir(); err != nil {
+		log.Fatalf("initialize runtime directory: %v", err)
 	}
 
 	// Initialize ref and frame stores for the new UUID-based API. These are
