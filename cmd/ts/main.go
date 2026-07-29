@@ -681,7 +681,7 @@ func cmdFrame(args []string) {
 	// filesystem. (ts frame :: is otherwise identical to ts go :: minus the
 	// session entry.)
 	if spec == "::" {
-		uuid, err := doFork(*sockPath)
+		uuid, err := doFork(*sockPath, *refName)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "error forking current frame: %v\n", err)
 			os.Exit(1)
@@ -841,6 +841,11 @@ func doCreate(sockPath, snapshotSpec, isolation, refName string) (string, error)
 	return lastEvent.UUID, nil
 }
 
+// ForkRequest is the request body for /fork.
+type ForkRequest struct {
+	RefName string `json:"ref_name,omitempty"`
+}
+
 // ForkResponse is the response from /fork.
 type ForkResponse struct {
 	Status  string `json:"status"`
@@ -853,8 +858,8 @@ type ForkResponse struct {
 // frame's UUID. This is the fast path for `ts go ::` / `ts frame ::`: it does
 // not block on content-addressable indexing (the current frame's snap is
 // recorded in the background). See background-indexing.md.
-func doFork(sockPath string) (string, error) {
-	result, err := thunderclient.PostJSON[struct{}, ForkResponse](sockPath, "/fork", struct{}{})
+func doFork(sockPath, refName string) (string, error) {
+	result, err := thunderclient.PostJSON[ForkRequest, ForkResponse](sockPath, "/fork", ForkRequest{RefName: refName})
 	if err != nil {
 		return "", fmt.Errorf("request failed: %w", err)
 	}
@@ -1653,7 +1658,6 @@ func cmdRefCreate(args []string) {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Printf("Created ref %s -> %s\n", name, uuid)
 }
 
 func cmdRefMove(args []string) {
@@ -2162,7 +2166,7 @@ func cmdGo(args []string) {
 			// history — which may or may not yet include the fork-point snap,
 			// depending on background-indexing timing — and overwrite the new
 			// frame's history nondeterministically).
-			forkedUUID, err := doFork(*sockPath)
+			forkedUUID, err := doFork(*sockPath, "")
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "error forking current frame: %v\n", err)
 				os.Exit(1)

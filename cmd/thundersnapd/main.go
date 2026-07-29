@@ -2343,6 +2343,11 @@ func handleSnapWait(w http.ResponseWriter, rootFS, subdir string) {
 	})
 }
 
+// ForkRequest is the request body for /fork.
+type ForkRequest struct {
+	RefName string `json:"ref_name,omitempty"`
+}
+
 // ForkResponse is the response from /fork.
 type ForkResponse struct {
 	Status  string `json:"status"`
@@ -2369,6 +2374,26 @@ func makeForkHandler(rootFS string) http.HandlerFunc {
 		if !requireMethod(w, r, http.MethodPost) {
 			return
 		}
+		var req ForkRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			jsonError(w, "invalid request body", http.StatusBadRequest)
+			return
+		}
+		if req.RefName != "" {
+			if err := refs.ValidateName(req.RefName); err != nil {
+				jsonError(w, fmt.Sprintf("invalid ref name: %v", err), http.StatusBadRequest)
+				return
+			}
+			user, err := tailscaleUserFromRootFS(rootFS)
+			if err != nil {
+				jsonError(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			if userRefStore(user).Exists(req.RefName) {
+				jsonError(w, fmt.Sprintf("ref %q already exists", req.RefName), http.StatusConflict)
+				return
+			}
+		}
 		uuid, err := forkFrame(rootFS)
 		if err != nil {
 			log.Printf("fork failed for %s: %v", rootFS, err)
@@ -2377,6 +2402,18 @@ func makeForkHandler(rootFS string) http.HandlerFunc {
 				Message: err.Error(),
 			})
 			return
+		}
+		if req.RefName != "" {
+			user, err := tailscaleUserFromRootFS(rootFS)
+			if err != nil {
+				jsonError(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			if err := userRefStore(user).Create(req.RefName, uuid); err != nil {
+				log.Printf("failed to create ref %s for forked frame %s: %v", req.RefName, uuid, err)
+				jsonError(w, fmt.Sprintf("create ref: %v", err), http.StatusInternalServerError)
+				return
+			}
 		}
 		writeJSON(w, http.StatusOK, ForkResponse{
 			Status: "ok",

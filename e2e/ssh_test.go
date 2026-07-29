@@ -534,7 +534,36 @@ func verifySnaphashOutput(t *testing.T, output string) {
 	}
 }
 
-// TestSSHContainerBasic is a true end-to-end test: start daemon, SSH in,
+// testFrameForkCreatesRef verifies the special `ts frame ::` fork path honors
+// --ref, and that explicit ref creation stays silent on success.
+func testFrameForkCreatesRef(t *testing.T, d *daemonInstance) {
+	output, exitCode, err := sshExec(t, d, "root@", "ts frame --ref frameforkref ::")
+	if err != nil || exitCode != 0 {
+		t.Fatalf("ts frame --ref frameforkref :: failed: err=%v exit=%d output=%q", err, exitCode, output)
+	}
+	frameUUID := strings.TrimSpace(output)
+	if frameUUID == "" || strings.Contains(frameUUID, "\n") {
+		t.Fatalf("ts frame output is not a single frame UUID: %q", output)
+	}
+
+	output, exitCode, err = sshExec(t, d, "root@", "ts frame frameforkref")
+	if err != nil || exitCode != 0 {
+		t.Fatalf("resolve frameforkref: err=%v exit=%d output=%q", err, exitCode, output)
+	}
+	if got := strings.TrimSpace(output); got != frameUUID {
+		t.Fatalf("frameforkref resolves to %q, want newly created frame %q", got, frameUUID)
+	}
+
+	output, exitCode, err = sshExec(t, d, "root@", "ts ref create frameforkalias "+frameUUID)
+	if err != nil || exitCode != 0 {
+		t.Fatalf("ts ref create: err=%v exit=%d output=%q", err, exitCode, output)
+	}
+	if output != "" {
+		t.Fatalf("ts ref create produced output %q, want none", output)
+	}
+}
+
+// testSSHContainerBasic is a true end-to-end test: start daemon, SSH in,
 // create a frame via `ts frame`, then exercise ts snap/snaps/log/frames.
 // No manual frame/ref creation - everything goes through the daemon.
 func testSSHContainerBasic(t *testing.T, d *daemonInstance) {

@@ -236,7 +236,7 @@ nothing on stdout. Exits 1 if any download failed.`,
 		category: "ref",
 		short:    "create a new ref pointing at a frame UUID",
 		long:     `Creates a new ref named <name> that points at the frame UUID <uuid>. The ref name must start with a letter and contain only letters, digits, dashes, and underscores.`,
-		outputs:  `"Created ref <name> -> <uuid>" on success.`,
+		outputs:  `Nothing on success.`,
 	},
 	{
 		name:     "ref move",

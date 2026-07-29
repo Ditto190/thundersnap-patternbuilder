@@ -53,6 +53,7 @@ func TestContainer(t *testing.T) {
 		fn   func(*testing.T, *daemonInstance)
 	}{
 		// Foundational session behavior: if these fail, the rest is moot.
+		{"FrameForkCreatesRef", testFrameForkCreatesRef},
 		{"SSHContainerBasic", testSSHContainerBasic},
 		{"SSHContainerUserRoot", testSSHContainerUserRoot},
 		{"SSHContainerUserNonRoot", testSSHContainerUserNonRoot},
