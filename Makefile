@@ -22,7 +22,7 @@ OUT ?= dist
 # Output directory for local binaries
 BIN ?= ./bin
 
-.PHONY: all test e2e not_e2e binaries ts vsh vshd thundersnapd bupdate tsm fidx slab \
+.PHONY: all test e2e not_e2e binaries ts vshd thundersnapd bupdate fidx slab \
         list build build-deb build-rpm build-tgz clean
 
 all: build
@@ -108,7 +108,7 @@ not_e2e: ts vshd thundersnapd
 	@./test-cleanup.sh $(E2E_TMPDIR)
 
 # Build all binaries for local development
-binaries: ts vsh vshd thundersnapd tsm
+binaries: ts vshd thundersnapd
 
 # Binaries that need CGO_ENABLED=0 (run inside containers/VMs)
 ts:
@@ -120,19 +120,11 @@ vshd:
 	CGO_ENABLED=0 go build -o $(BIN)/$@ ./cmd/$@
 
 # Binaries that can use default CGO setting
-vsh:
-	@mkdir -p $(BIN)
-	go build -o $(BIN)/$@ ./cmd/$@
-
 # thundersnapd: CGO_ENABLED=0 so the nested test (nested_test.go) can run it
 # inside a minimal container rootfs that lacks shared libraries.
 thundersnapd:
 	@mkdir -p $(BIN)
 	CGO_ENABLED=0 go build -o $(BIN)/$@ ./cmd/$@
-
-tsm:
-	@mkdir -p $(BIN)
-	go build -o $(BIN)/$@ ./cmd/$@
 
 # List all available build targets
 list:
