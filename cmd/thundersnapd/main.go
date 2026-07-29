@@ -479,6 +479,8 @@ func main() {
 	flagMesh = getopt.BoolLong("mesh", 0, "Enable mesh discovery: ping other thundersnap nodes and serve /bupdate/")
 	flagNfsd = getopt.BoolLong("nfsd", 0, "Enable NFSv4 server to export the snaps directory")
 	flagNfsPort = getopt.IntLong("nfs-port", 0, 2049, "Port for NFSv4 server")
+	autorun := getopt.BoolLong("autorun", 0, "Run configured autorun commands")
+	*autorun = true
 	testListen := getopt.StringLong("test-listen", 0, "", "Test mode: listen on this local TCP address (e.g. 127.0.0.1:2222) instead of tsnet")
 	testUser := getopt.StringLong("test-user", 0, "", "Test mode: use this identity for all SSH connections (e.g. test@example.com)")
 	testHTTPListen := getopt.StringLong("test-http-listen", 0, "", "Test mode: also serve the HTTP mux (metrics, bupdate, MCP) on this local TCP address (e.g. 127.0.0.1:7575)")
@@ -594,9 +596,14 @@ func main() {
 	// Start the single background snap-indexing worker (see snapqueue.go).
 	initSnapQueue()
 
-	// Initialize the autorun manager and start any autorun processes.
-	initAutorunManager(*flagDataDir)
-	defer shutdownAutorunManager()
+	// Initialize the autorun manager and start any configured processes unless
+	// this daemon is sharing its data directory with the daemon that owns them.
+	if *autorun {
+		initAutorunManager(*flagDataDir)
+		defer shutdownAutorunManager()
+	} else {
+		log.Printf("Autorun process management disabled")
+	}
 
 	// In test mode (--test-listen), skip tsnet and listen on local TCP.
 	// testModeUser will be used for identity instead of WhoIs.

@@ -5,7 +5,7 @@ After=network-pre.target
 
 [Service]
 EnvironmentFile=/etc/default/thundersnapd-dev
-ExecStart=/usr/sbin/thundersnapd-dev --libexec-dir=/usr/libexec/thundersnap-dev --state-dir=/var/lib/thundersnap-dev $FLAGS
+ExecStart=/usr/sbin/thundersnapd-dev --libexec-dir=/usr/libexec/thundersnap-dev --state-dir=/var/lib/thundersnap-dev --autorun=false $FLAGS
 Restart=on-failure
 RuntimeDirectory=thundersnap-dev
 RuntimeDirectoryMode=0755

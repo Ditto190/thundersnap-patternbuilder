@@ -6,4 +6,6 @@
 #
 # The dev daemon's binaries live in /usr/libexec/thundersnap-dev/ and
 # /usr/sbin/thundersnapd-dev, so both packages can coexist without conflicts.
+# Its service disables autorun management to avoid duplicating the main daemon's
+# processes. Add --autorun=true here to make the dev daemon own autoruns instead.
 FLAGS="--data-dir=/var/lib/thundersnap --policy=/etc/thundersnap/policy-dev.jsonc --mesh"
