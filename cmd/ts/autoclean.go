@@ -23,6 +23,7 @@ func cmdAutoclean(args []string) {
 	fs := flag.NewFlagSet("autoclean", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	lifecycleFD := fs.Int("lifecycle-fd", -1, "file descriptor whose EOF kills the subprocess")
+	inheritPgrp := fs.Bool("inherit-pgrp", false, "keep the subprocess in autoclean's process group")
 	var passFDs fdList
 	fs.Var(&passFDs, "pass-fd", "inherited fd to pass to the subprocess (repeatable; assigned from fd 3 in order)")
 	if err := fs.Parse(args); err != nil {
@@ -46,7 +47,7 @@ func cmdAutoclean(args []string) {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Setpgid:   true,
+		Setpgid:   !*inheritPgrp,
 		Pdeathsig: unix.SIGKILL,
 	}
 	for _, fd := range passFDs {
@@ -76,9 +77,14 @@ func cmdAutoclean(args []string) {
 	case err := <-wait:
 		exitLikeChild(err)
 	case <-lifecycleGone:
-		// The child leads a fresh process group. Kill the entire group so a
-		// foreground daemon cannot leak helpers it happened to fork.
-		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		// Normally the child leads a fresh group. A PTY-launched autoclean is
+		// itself the foreground group leader, so its child inherits that group
+		// to avoid SIGTTOU and we kill autoclean's group instead.
+		pgid := cmd.Process.Pid
+		if *inheritPgrp {
+			pgid = syscall.Getpgrp()
+		}
+		_ = syscall.Kill(-pgid, syscall.SIGKILL)
 		err := <-wait
 		exitLikeChild(err)
 	}

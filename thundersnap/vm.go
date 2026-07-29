@@ -81,13 +81,16 @@ func (s *VMSession) SetControlHandler(h http.Handler) {
 // both autoclean and the supervised child; the lifecycle pipe follows them.
 // The caller must close lifecycleR immediately after starting cmd and keep
 // lifecycleW open for as long as the subprocess should live.
-func autocleanCommand(tsPath string, passFiles []*os.File, argv ...string) (cmd *exec.Cmd, lifecycleR, lifecycleW *os.File, err error) {
+func autocleanCommand(tsPath string, passFiles []*os.File, inheritPgrp bool, argv ...string) (cmd *exec.Cmd, lifecycleR, lifecycleW *os.File, err error) {
 	lifecycleR, lifecycleW, err = os.Pipe()
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("create lifecycle pipe: %w", err)
 	}
 	lifecycleFD := 3 + len(passFiles)
 	args := []string{"autoclean", fmt.Sprintf("--lifecycle-fd=%d", lifecycleFD)}
+	if inheritPgrp {
+		args = append(args, "--inherit-pgrp")
+	}
 	for i := range passFiles {
 		args = append(args, fmt.Sprintf("--pass-fd=%d", 3+i))
 	}
@@ -142,7 +145,7 @@ func StartVM(cfg VMConfig) (*VMSession, error) {
 	// thundersnapd could run in a lower-isolation mode that retains CAP_SETFCAP
 	// in its bounding set, making this flag unnecessary in that mode. That mode
 	// doesn't exist today, so we always pass the flag.
-	virtiofsdCmd, virtiofsdLifecycleR, virtiofsdLifecycle, err := autocleanCommand(cfg.AutocleanPath, nil,
+	virtiofsdCmd, virtiofsdLifecycleR, virtiofsdLifecycle, err := autocleanCommand(cfg.AutocleanPath, nil, false,
 		"/usr/libexec/virtiofsd",
 		"--socket-path="+virtiofsSock,
 		"--shared-dir="+cfg.RootFS,
@@ -187,7 +190,7 @@ func StartVM(cfg VMConfig) (*VMSession, error) {
 	// Configure NAT-style addressing (like QEMU user networking) so DHCP clients
 	// get predictable private addresses instead of the host's addresses.
 	log.Printf("Starting passt for user-space networking")
-	passtCmd, passtLifecycleR, passtLifecycle, err := autocleanCommand(cfg.AutocleanPath, nil, "passt",
+	passtCmd, passtLifecycleR, passtLifecycle, err := autocleanCommand(cfg.AutocleanPath, nil, false, "passt",
 		"--socket", passtSock,
 		"--vhost-user", // vhost-user mode for cloud-hypervisor
 		"--foreground", // stay in foreground for process management
@@ -310,7 +313,7 @@ func StartVM(cfg VMConfig) (*VMSession, error) {
 		chvArgs = append(chvArgs, "--vsock", fmt.Sprintf("cid=3,socket=%s", vsockSock))
 	}
 	chvArgv := append([]string{chvPath}, chvArgs...)
-	chvCmd, chvLifecycleR, chvLifecycle, err := autocleanCommand(cfg.AutocleanPath, []*os.File{eventWritePipe}, chvArgv...)
+	chvCmd, chvLifecycleR, chvLifecycle, err := autocleanCommand(cfg.AutocleanPath, []*os.File{eventWritePipe}, true, chvArgv...)
 	if err != nil {
 		eventReadPipe.Close()
 		eventWritePipe.Close()
