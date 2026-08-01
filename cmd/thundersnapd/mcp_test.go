@@ -7,6 +7,9 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -187,9 +190,12 @@ func TestBuildCreateFileCommand(t *testing.T) {
 	}
 }
 
-// TestTruncateUTF8 covers the rune-boundary trim: truncation must not split a
-// multi-byte UTF-8 rune, and must append the marker only when truncating.
-func TestTailLines(t *testing.T) {
+// TestReadTail verifies readTail matches tailLines on small files and does not
+// slurp a whole large file into memory. It exercises the chunk-boundary path
+// by forcing a tiny effective chunk via a temp file that spans multiple
+// chunks of a deliberately reduced ceiling.
+func TestReadTail(t *testing.T) {
+	// Small-file parity: readTail and tailLines must agree.
 	for _, tt := range []struct {
 		name    string
 		content string
@@ -197,7 +203,7 @@ func TestTailLines(t *testing.T) {
 		want    string
 	}{
 		{"empty", "", 3, ""},
-		{"zero", "a\nb\n", 0, ""},
+		{"zero n", "a\nb\n", 0, ""},
 		{"fewer than requested", "a\nb\n", 5, "a\nb\n"},
 		{"final newline", "a\nb\nc\n", 2, "b\nc\n"},
 		{"partial final line", "a\nb\nc", 2, "b\nc"},
@@ -205,10 +211,48 @@ func TestTailLines(t *testing.T) {
 		{"utf8", "α\nβ\nγ", 2, "β\nγ"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := tailLines([]byte(tt.content), tt.n); got != tt.want {
-				t.Errorf("tailLines(%q, %d) = %q, want %q", tt.content, tt.n, got, tt.want)
+			p := filepath.Join(t.TempDir(), "f")
+			if err := os.WriteFile(p, []byte(tt.content), 0600); err != nil {
+				t.Fatal(err)
+			}
+			got, err := readTail(p, tt.n)
+			if err != nil {
+				t.Fatalf("readTail: %v", err)
+			}
+			if got != tt.want {
+				t.Errorf("readTail(%q, %d) = %q, want %q", tt.content, tt.n, got, tt.want)
+			}
+			if want := tailLines([]byte(tt.content), tt.n); got != want {
+				t.Errorf("readTail != tailLines: got %q want %q", got, want)
 			}
 		})
+	}
+
+	// A file larger than one chunk must still return the correct tail. Temporarily
+	// shrink the chunk to keep the test fast and exercise the multi-chunk path.
+	prev := tailReadChunk
+	tailReadChunk = 8 // tiny so a modest file spans several chunks
+	t.Cleanup(func() { tailReadChunk = prev })
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("readTail panicked: %v", r)
+		}
+	}()
+	var lines []string
+	for i := 1; i <= 50; i++ {
+		lines = append(lines, fmt.Sprintf("line-%02d", i))
+	}
+	big := []byte(strings.Join(lines, "\n") + "\n")
+	p := filepath.Join(t.TempDir(), "big")
+	if err := os.WriteFile(p, big, 0600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := readTail(p, 3)
+	if err != nil {
+		t.Fatalf("readTail big: %v", err)
+	}
+	if want := "line-48\nline-49\nline-50\n"; got != want {
+		t.Errorf("readTail big = %q, want %q", got, want)
 	}
 }
 

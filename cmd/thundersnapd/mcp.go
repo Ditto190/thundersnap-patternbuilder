@@ -344,6 +344,79 @@ func tailLines(content []byte, n int) string {
 	return strings.ToValidUTF8(string(content[start:end]), "")
 }
 
+// tailReadChunk is the maximum number of bytes readTail reads from the end of
+// a file into memory at once. It bounds memory for the tail_lines path so a
+// multi-gigabyte job log does not get slurped whole; the model-facing output is
+// further capped by mcpMaxViewOutput. 1 MiB comfortably exceeds a generous
+// line count (e.g. 10k lines of 100 bytes) while staying cheap. It is a var so
+// tests can shrink it to exercise the multi-chunk reverse-read path.
+var tailReadChunk int64 = 1 << 20
+
+// readTail returns the final n lines of the file at hostPath using a bounded
+// reverse read, so the file size (not n) is the memory ceiling. It mirrors
+// tailLines' line semantics (final partial line preserved, trailing newline
+// preserved, raw bytes then ToValidUTF8) but never holds more than roughly
+// tailReadChunk bytes at a time.
+func readTail(hostPath string, n int) (string, error) {
+	if n <= 0 {
+		return "", nil
+	}
+	f, err := os.Open(hostPath)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return "", err
+	}
+	size := fi.Size()
+	if size == 0 {
+		return "", nil
+	}
+	// Read backwards in chunks, counting newlines, until we have n of them or
+	// reach the start of the file. chunks holds data from oldest to newest;
+	// it is joined at the end. The trailing newline of the file is kept in the
+	// output but not counted as a line separator, matching tailLines' searchEnd.
+	var chunks [][]byte
+	haveNewlines := 0
+	done := false
+	pos := size
+	for pos > 0 && !done {
+		read := tailReadChunk
+		if read > pos {
+			read = pos
+		}
+		pos -= read
+		buf := make([]byte, read)
+		if _, err := f.ReadAt(buf, pos); err != nil {
+			return "", err
+		}
+		// The newest chunk (the first one read) may end with a trailing
+		// newline; exclude it from the newline count but keep it in the data.
+		scanEnd := len(buf)
+		if len(chunks) == 0 && buf[scanEnd-1] == '\n' {
+			scanEnd--
+		}
+		for i := scanEnd - 1; i >= 0; i-- {
+			if buf[i] == '\n' {
+				haveNewlines++
+				if haveNewlines == n {
+					// The tail starts right after this newline; buf[i+1:]
+					// is the oldest piece (the rest of this chunk stays whole).
+					chunks = append([][]byte{buf[i+1:]}, chunks...)
+					done = true
+					break
+				}
+			}
+		}
+		if !done {
+			chunks = append([][]byte{buf}, chunks...)
+		}
+	}
+	return strings.ToValidUTF8(string(bytes.Join(chunks, nil)), ""), nil
+}
+
 // truncateUTF8 returns s capped at limit bytes, with marker appended if
 // truncation occurred. Ported from aperture chat/sandbox/tool_view.go.
 func truncateUTF8(s string, limit int, marker string) string {
@@ -443,14 +516,14 @@ func mcpViewToolHandler(ctx context.Context, req *mcp.CallToolRequest) (*mcp.Cal
 		if !isWithinRootFS(hostPath, rootFS) {
 			return textResult(fmt.Sprintf("path %q escapes the frame", params.Path), true)
 		}
-		content, err := os.ReadFile(hostPath)
+		tail, err := readTail(hostPath, params.TailLines)
 		if err != nil {
 			if os.IsNotExist(err) {
 				return textResult(fmt.Sprintf("Error: %s not found", params.Path), true)
 			}
 			return textResult(fmt.Sprintf("read %s: %v", params.Path, err), true)
 		}
-		return textResult(truncateUTF8(tailLines(content, params.TailLines), mcpMaxViewOutput, "\n\n... output truncated ..."), false)
+		return textResult(truncateUTF8(tail, mcpMaxViewOutput, "\n\n... output truncated ..."), false)
 	}
 	cmd, err := buildViewCommand(params.Path, params.ViewRange)
 	if err != nil {
