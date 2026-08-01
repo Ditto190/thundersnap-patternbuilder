@@ -89,6 +89,7 @@ Input:
   "command": "make test",
   "frame": "optional ref or UUID",
   "workdir": "/work",
+  "user": "user",
   "label": "optional model-readable label",
   "hard_timeout": 7200
 }
@@ -97,6 +98,9 @@ Input:
 - `command` is required.
 - `frame` has the existing semantics, including default-frame creation.
 - `workdir` defaults to `/work`.
+- `user` is either `user` or `root` and defaults to `user`. The non-root
+  `user` account is the right choice for most development work; use `root`
+  only when the command genuinely needs administrative privileges.
 - `label` is optional and does not have to be unique.
 - `hard_timeout` is the total job lifetime in seconds, not the duration of a
   later wait. It defaults to 7200 seconds and is clamped to the configured
@@ -165,7 +169,7 @@ Each status contains:
 
 - ID and optional label
 - frame UUID
-- command and workdir
+- command, workdir, and Unix user
 - `starting`, `running`, `exited`, `timed_out`, `killed`, or `lost` state
 - start/end timestamps and elapsed time
 - combined/stdout/stderr log paths and byte counts

@@ -414,8 +414,8 @@ func TestMCPToolsRoundTrip(t *testing.T) {
 			"command": "echo hello-mcp",
 			"frame":   "mcpframe",
 		})
-		if job["state"] != "exited" || job["exit_code"] != float64(0) {
-			t.Fatalf("bash echo job = %+v", job)
+		if job["state"] != "exited" || job["exit_code"] != float64(0) || job["user"] != "user" {
+			t.Fatalf("bash echo job (including default non-root user) = %+v", job)
 		}
 		out, isErr := callTool(t, session, "thundersnap_view", map[string]any{
 			"path":       job["combined_log"],
@@ -432,8 +432,9 @@ func TestMCPToolsRoundTrip(t *testing.T) {
 		job := startAndWaitMCPBash(t, session, map[string]any{
 			"command": "echo to-stderr >&2; exit 3",
 			"frame":   "mcpframe",
+			"user":    "root",
 		})
-		if job["state"] != "exited" || job["exit_code"] != float64(3) {
+		if job["state"] != "exited" || job["exit_code"] != float64(3) || job["user"] != "root" {
 			t.Fatalf("bash exit 3 job = %+v", job)
 		}
 		out, isErr := callTool(t, session, "thundersnap_view", map[string]any{

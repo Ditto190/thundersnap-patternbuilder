@@ -50,6 +50,7 @@ type mcpJob struct {
 	label          string
 	command        string
 	workdir        string
+	unixUser       string
 	frame          string
 	combinedLog    string
 	stdoutLog      string
@@ -137,6 +138,7 @@ type mcpJobStatus struct {
 	Frame         string      `json:"frame"`
 	Command       string      `json:"command"`
 	Workdir       string      `json:"workdir"`
+	User          string      `json:"user"`
 	CombinedLog   string      `json:"combined_log"`
 	StdoutLog     string      `json:"stdout_log"`
 	StderrLog     string      `json:"stderr_log"`
@@ -156,7 +158,7 @@ func jobStatusLocked(j *mcpJob, now time.Time) mcpJobStatus {
 	}
 	s := mcpJobStatus{
 		ID: j.id, Label: j.label, State: j.state, Frame: j.frame,
-		Command: j.command, Workdir: j.workdir,
+		Command: j.command, Workdir: j.workdir, User: j.unixUser,
 		CombinedLog: j.combinedLog, StdoutLog: j.stdoutLog, StderrLog: j.stderrLog,
 		CombinedBytes: j.combinedBytes, StdoutBytes: j.stdoutBytes, StderrBytes: j.stderrBytes,
 		ExitCode: j.exitCode, StartedAt: j.startedAt.UTC().Format(time.RFC3339Nano),
@@ -224,6 +226,7 @@ func mcpBashToolHandler(ctx context.Context, req *mcp.CallToolRequest) (*mcp.Cal
 		Frame       string `json:"frame"`
 		Workdir     string `json:"workdir"`
 		Label       string `json:"label"`
+		User        string `json:"user"`
 		HardTimeout int    `json:"hard_timeout"`
 	}
 	if len(req.Params.Arguments) > 0 {
@@ -236,6 +239,12 @@ func mcpBashToolHandler(ctx context.Context, req *mcp.CallToolRequest) (*mcp.Cal
 	}
 	if params.Workdir == "" {
 		params.Workdir = "/work"
+	}
+	if params.User == "" {
+		params.User = "user"
+	}
+	if params.User != "user" && params.User != "root" {
+		return textResult("user must be either \"user\" (recommended) or \"root\"", true)
 	}
 	hardTimeout := mcpJobDefaultHardTimeout
 	if params.HardTimeout > 0 {
@@ -323,10 +332,10 @@ func mcpBashToolHandler(ctx context.Context, req *mcp.CallToolRequest) (*mcp.Cal
 		return textResult(fmt.Sprintf("abs rootfs: %v", err), true)
 	}
 	wrapped := "cd " + shellQuote(params.Workdir) + " && " + params.Command
-	writeVshdRequest(conn, strings.TrimPrefix(absRootFS, "/"), "root", false, []string{"sh", "-c", wrapped})
+	writeVshdRequest(conn, strings.TrimPrefix(absRootFS, "/"), params.User, false, []string{"sh", "-c", wrapped})
 
 	j := &mcpJob{
-		id: id, label: params.Label, command: params.Command, workdir: params.Workdir,
+		id: id, label: params.Label, command: params.Command, workdir: params.Workdir, unixUser: params.User,
 		frame: uuid.String(), state: mcpJobRunning, startedAt: time.Now(), conn: conn,
 		combinedLog: filepath.Join(logDirInFrame, "combined.log"),
 		stdoutLog:   filepath.Join(logDirInFrame, "stdout.log"),
