@@ -237,6 +237,30 @@ Tiered, simplest-to-hardest. Per `CLAUDE.md`: log to a file, 1–2 min timeout,
   `truncateUTF8` rune-boundary trim, `shellQuote` escaping,
   `errMCPCommandTimeout` sentinel `errors.Is`-matchable.
 
+## Background bash — next implementation phase
+
+Design: `mcp-background-bash.md`. Replace the blocking bash result with
+conversation-scoped supervised jobs so Aperture's sequential tool dispatcher
+can launch concurrent work and observe it through short wait calls.
+
+- [~] Forward Aperture's stable conversation ID in MCP `tools/call` `_meta`
+  under the namespaced key `io.tailscale.aperture/conversation-id`.
+  Thundersnap job tools must reject missing/empty metadata; there is no MCP
+  session-ID fallback because silently combining chats is worse than failing.
+- [ ] Implement conversation-scoped job manager keyed by `(resolved user,
+  Aperture conversation ID)`, with short per-scope job IDs and jobs that may
+  target any frame.
+- [ ] Change `thundersnap_bash` to start a supervised job and return promptly;
+  preserve combined/stdout/stderr logs inside the resolved frame, record exit
+  code/state/counters, and enforce a hard runtime limit.
+- [ ] Add `thundersnap_jobs_wait` with revision-based, race-free `output`,
+  `any_exit`, and `all_exit` predicates plus a non-destructive wait timeout.
+- [ ] Add `thundersnap_jobs_list` and `thundersnap_jobs_kill`; killing must use
+  the existing whole-process-group vshd disconnect cleanup.
+- [ ] Add `tail_lines` to `thundersnap_view` for live and completed job logs.
+- [ ] Add unit and e2e coverage for the edge-case matrix in
+  `mcp-background-bash.md`; use that checklist during code review.
+
 ## Phase 5 — Future (out of scope for MCP-first phase; see design doc §Future work)
 
 - [ ] Drop-in `chatsandbox.Backend` HTTP-client impl + supervisor wiring
@@ -246,6 +270,15 @@ Tiered, simplest-to-hardest. Per `CLAUDE.md`: log to a file, 1–2 min timeout,
   (generalize Aperture outputs handler, or thundersnap-served download URLs).
 - [ ] Stable user-ID frame key (forward/record Aperture immutable `UserID`
   so renames don't orphan frame dirs).
+- [ ] Harden forwarded chat identity as a security boundary: authenticate a
+  stable Aperture user ID and trust/bind the forwarded conversation ID (for
+  example trusted-peer validation or signed metadata). Initial background-job
+  scoping is for correctness and avoids accidental cross-chat mixing, not a
+  claim of strong cross-conversation authorization.
+- [ ] Support additional trusted client chat-scope formats for background jobs,
+  notably Open WebUI's `X-OpenWebUI-Chat-Id` (paired with stable user and
+  deployment identity). Keep explicit chat identity mandatory; do not silently
+  fall back to `Mcp-Session-Id`, whose lifetime differs across clients.
 - [ ] Capability policy (`policy.jsonc` / `ResolveCap`) on MCP tool access
   + frame launch isolation.
 - [ ] Persistent shell per MCP session (carry `cd`/`export` across calls).
