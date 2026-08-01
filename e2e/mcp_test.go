@@ -940,6 +940,20 @@ func TestMCPBackgroundJobWaitSemantics(t *testing.T) {
 	if elapsed := time.Since(satStart); elapsed > 2*time.Second {
 		t.Errorf("already-satisfied all_exit took %v, expected immediate", elapsed)
 	}
+
+	// --- all_exit on a fresh (jobless) conversation returns immediately ---
+	// A different conversation that never started a job: all_exit is vacuously
+	// satisfied and must not block for the full wait timeout.
+	emptyStart := time.Now()
+	out, isErr = callToolForConversation(t, session, "empty-conversation", "thundersnap_jobs_wait", map[string]any{
+		"until": "all_exit", "timeout": 10,
+	})
+	if isErr || !strings.Contains(out, `"reason":"all_exit"`) {
+		t.Fatalf("jobless all_exit: isErr=%v output=%q", isErr, out)
+	}
+	if elapsed := time.Since(emptyStart); elapsed > 2*time.Second {
+		t.Errorf("jobless all_exit took %v, expected immediate", elapsed)
+	}
 }
 
 // TestMCPBackgroundJobInputValidation covers the reject-before-launch checks

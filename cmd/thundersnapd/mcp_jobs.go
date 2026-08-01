@@ -506,7 +506,10 @@ func mcpJobsWaitToolHandler(ctx context.Context, req *mcp.CallToolRequest) (*mcp
 				satisfied = satisfied || j.endRevision > params.AfterRevision
 			}
 		case "all_exit":
-			satisfied = len(jobs) > 0
+			// Vacuously true for an empty selection (every zero jobs are
+			// terminal), so an all_exit on a jobless conversation returns
+			// immediately instead of blocking for the full wait timeout.
+			satisfied = true
 			for _, j := range jobs {
 				satisfied = satisfied && j.terminal()
 			}
