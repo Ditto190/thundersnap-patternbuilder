@@ -37,7 +37,6 @@ type mcpJobScopeKey struct {
 type mcpJobState string
 
 const (
-	mcpJobStarting mcpJobState = "starting"
 	mcpJobRunning  mcpJobState = "running"
 	mcpJobExited   mcpJobState = "exited"
 	mcpJobTimedOut mcpJobState = "timed_out"

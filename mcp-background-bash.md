@@ -170,7 +170,7 @@ Each status contains:
 - ID and optional label
 - frame UUID
 - command, workdir, and Unix user
-- `starting`, `running`, `exited`, `timed_out`, `killed`, or `lost` state
+- `running`, `exited`, `timed_out`, `killed`, or `lost` state
 - start/end timestamps and elapsed time
 - combined/stdout/stderr log paths and byte counts
 - exit code when known

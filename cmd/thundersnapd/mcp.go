@@ -740,15 +740,16 @@ func newMCPServer() *mcp.Server {
 		},
 	}, mcpBashToolHandler)
 
-	jobIDsSchema := map[string]any{"type": "array", "items": map[string]any{"type": "string"}}
 	s.AddTool(&mcp.Tool{
 		Name: "thundersnap_jobs_list",
 		Description: "Return current status for background jobs belonging to this Aperture conversation, across every frame " +
 			"used by the conversation. Use this to recover forgotten job IDs, log paths, revisions, states, and exit codes. " +
 			"Omit job_ids to list all jobs in this conversation; jobs from other conversations are never included. " +
-			"States starting/running are non-terminal; exited, timed_out, killed, and lost are terminal. A non-zero exit_code " +
+			"State running is non-terminal; exited, timed_out, killed, and lost are terminal. A non-zero exit_code " +
 			"means the command failed even though the original thundersnap_bash start succeeded.",
-		InputSchema: map[string]any{"type": "object", "properties": map[string]any{"job_ids": jobIDsSchema}},
+		InputSchema: map[string]any{"type": "object", "properties": map[string]any{
+			"job_ids": map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Optional filter: status for only these job IDs. Omit or pass [] to list every job in this conversation."},
+		}},
 	}, mcpJobsListToolHandler)
 	s.AddTool(&mcp.Tool{
 		Name: "thundersnap_jobs_wait",
@@ -761,8 +762,8 @@ func newMCPServer() *mcp.Server {
 			"returned state and exit_code; wait success does not imply command success.",
 		InputSchema: map[string]any{"type": "object", "properties": map[string]any{
 			"job_ids":        map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Job IDs to observe. Omit or pass [] to select all jobs in this Aperture conversation."},
-			"after_revision": map[string]any{"type": "integer", "description": "Latest revision already observed, from bash/list/wait. Only newer output/exit events satisfy output or any_exit."},
-			"until":          map[string]any{"type": "string", "enum": []string{"output", "any_exit", "all_exit"}, "description": "Wake condition. Use all_exit to wait like a conventional foreground Bash call."},
+			"after_revision": map[string]any{"type": "integer", "description": "Latest revision already observed, from bash/list/wait. Only newer output/exit events satisfy output or any_exit; omit or 0 to match any. Ignored by all_exit, which checks current terminality."},
+			"until":          map[string]any{"type": "string", "enum": []string{"output", "any_exit", "all_exit"}, "description": "Wake condition (defaults to any_exit). output: selected log output grew after after_revision; any_exit: one selected job became terminal after after_revision; all_exit: every selected job is currently terminal (the foreground-style wait)."},
 			"timeout":        map[string]any{"type": "integer", "description": "Wait duration in seconds (default 30, max 60)."},
 		}},
 	}, mcpJobsWaitToolHandler)
@@ -771,7 +772,9 @@ func newMCPServer() *mcp.Server {
 		Description: "Stop selected background jobs, including child and grandchild processes, then wait until teardown is " +
 			"observed before returning. This is conversation-scoped and does not affect unselected sibling jobs. Killing an " +
 			"already-terminal job is harmless. A returned state=killed confirms teardown; use jobs_list afterward if needed.",
-		InputSchema: map[string]any{"type": "object", "properties": map[string]any{"job_ids": jobIDsSchema}, "required": []string{"job_ids"}},
+		InputSchema: map[string]any{"type": "object", "properties": map[string]any{
+			"job_ids": map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Job IDs to stop (required)."},
+		}, "required": []string{"job_ids"}},
 	}, mcpJobsKillToolHandler)
 
 	// view
