@@ -243,23 +243,28 @@ Design: `mcp-background-bash.md`. Replace the blocking bash result with
 conversation-scoped supervised jobs so Aperture's sequential tool dispatcher
 can launch concurrent work and observe it through short wait calls.
 
-- [~] Forward Aperture's stable conversation ID in MCP `tools/call` `_meta`
+- [x] Forward Aperture's stable conversation ID in MCP `tools/call` `_meta`
   under the namespaced key `io.tailscale.aperture/conversation-id`.
-  Thundersnap job tools must reject missing/empty metadata; there is no MCP
+  Thundersnap job tools reject missing/empty metadata; there is no MCP
   session-ID fallback because silently combining chats is worse than failing.
-- [ ] Implement conversation-scoped job manager keyed by `(resolved user,
+- [x] Implement conversation-scoped job manager keyed by `(resolved user,
   Aperture conversation ID)`, with short per-scope job IDs and jobs that may
   target any frame.
-- [ ] Change `thundersnap_bash` to start a supervised job and return promptly;
+- [x] Change `thundersnap_bash` to start a supervised job and return promptly;
   preserve combined/stdout/stderr logs inside the resolved frame, record exit
   code/state/counters, and enforce a hard runtime limit.
-- [ ] Add `thundersnap_jobs_wait` with revision-based, race-free `output`,
+- [x] Add `thundersnap_jobs_wait` with revision-based, race-free `output`,
   `any_exit`, and `all_exit` predicates plus a non-destructive wait timeout.
-- [ ] Add `thundersnap_jobs_list` and `thundersnap_jobs_kill`; killing must use
+- [x] Add `thundersnap_jobs_list` and `thundersnap_jobs_kill`; killing uses
   the existing whole-process-group vshd disconnect cleanup.
-- [ ] Add `tail_lines` to `thundersnap_view` for live and completed job logs.
-- [ ] Add unit and e2e coverage for the edge-case matrix in
-  `mcp-background-bash.md`; use that checklist during code review.
+- [x] Add `tail_lines` to `thundersnap_view` for live and completed job logs.
+- [~] Add unit and e2e coverage for the edge-case matrix in
+  `mcp-background-bash.md`; use that checklist during code review. Current
+  coverage includes required conversation metadata, same-conversation reuse
+  across MCP connections, cross-conversation isolation, short per-chat IDs,
+  concurrent jobs, output waits/live tail reads, normal and non-zero exits,
+  explicit kill, and hard-timeout process-group reap. The remaining matrix
+  items stay intentionally unchecked in the design document.
 
 ## Phase 5 — Future (out of scope for MCP-first phase; see design doc §Future work)
 

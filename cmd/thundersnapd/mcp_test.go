@@ -4,6 +4,7 @@
 package main
 
 import (
+	"context"
 	"encoding/base64"
 	"errors"
 	"strings"
@@ -188,6 +189,60 @@ func TestBuildCreateFileCommand(t *testing.T) {
 
 // TestTruncateUTF8 covers the rune-boundary trim: truncation must not split a
 // multi-byte UTF-8 rune, and must append the marker only when truncating.
+func TestTailLines(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		content string
+		n       int
+		want    string
+	}{
+		{"empty", "", 3, ""},
+		{"zero", "a\nb\n", 0, ""},
+		{"fewer than requested", "a\nb\n", 5, "a\nb\n"},
+		{"final newline", "a\nb\nc\n", 2, "b\nc\n"},
+		{"partial final line", "a\nb\nc", 2, "b\nc"},
+		{"one line", "a\nb\nc\n", 1, "c\n"},
+		{"utf8", "α\nβ\nγ", 2, "β\nγ"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tailLines([]byte(tt.content), tt.n); got != tt.want {
+				t.Errorf("tailLines(%q, %d) = %q, want %q", tt.content, tt.n, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestMCPJobScopeFromRequest(t *testing.T) {
+	ctx := context.WithValue(context.Background(), mcpUserKey{}, "alice")
+	req := &mcp.CallToolRequest{Params: &mcp.CallToolParamsRaw{Meta: mcp.Meta{
+		apertureConversationIDMetaKey: "conv-1",
+	}}}
+	got, err := mcpJobScopeFromRequest(ctx, req)
+	if err != nil {
+		t.Fatalf("mcpJobScopeFromRequest: %v", err)
+	}
+	if got.user != "alice" || got.conversation != "conv-1" {
+		t.Errorf("scope = %+v, want alice/conv-1", got)
+	}
+	for name, req := range map[string]*mcp.CallToolRequest{
+		"nil request": nil,
+		"no params":   {},
+		"no metadata": {Params: &mcp.CallToolParamsRaw{}},
+		"empty": {Params: &mcp.CallToolParamsRaw{Meta: mcp.Meta{
+			apertureConversationIDMetaKey: "",
+		}}},
+		"non-string": {Params: &mcp.CallToolParamsRaw{Meta: mcp.Meta{
+			apertureConversationIDMetaKey: 123,
+		}}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := mcpJobScopeFromRequest(ctx, req); err == nil {
+				t.Fatal("expected missing conversation metadata error")
+			}
+		})
+	}
+}
+
 func TestTruncateUTF8(t *testing.T) {
 	t.Run("under limit unchanged", func(t *testing.T) {
 		if got := truncateUTF8("hello", 100, "..."); got != "hello" {

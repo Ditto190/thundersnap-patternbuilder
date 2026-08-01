@@ -1,9 +1,9 @@
 // Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
-// mcp.go implements the thundersnap MCP server, exposing the six
-// sandbox-equivalent tools (bash, view, create_file, str_replace,
-// list_frames, list_refs) on the daemon's HTTP listener at /v1/mcp.
+// mcp.go implements the thundersnap MCP server, exposing sandbox-equivalent
+// file/frame tools plus conversation-scoped background bash job tools on the
+// daemon's HTTP listener at /v1/mcp.
 //
 // This is a port of Aperture's chat/sandbox tool set (tool_bash.go,
 // tool_view.go, tool_create_file.go, tool_str_replace.go) and the
@@ -319,6 +319,31 @@ else
 fi`, qpath, startLine, endLine), nil
 }
 
+// tailLines returns the final n lines without requiring an in-frame tail
+// binary. It preserves a final partial line and raw UTF-8 bytes; truncateUTF8
+// applies the model-facing byte cap afterward.
+func tailLines(content []byte, n int) string {
+	if n <= 0 || len(content) == 0 {
+		return ""
+	}
+	end := len(content)
+	searchEnd := end
+	if content[end-1] == '\n' {
+		searchEnd--
+	}
+	start := 0
+	for i, seen := searchEnd-1, 0; i >= 0; i-- {
+		if content[i] == '\n' {
+			seen++
+			if seen == n {
+				start = i + 1
+				break
+			}
+		}
+	}
+	return strings.ToValidUTF8(string(content[start:end]), "")
+}
+
 // truncateUTF8 returns s capped at limit bytes, with marker appended if
 // truncation occurred. Ported from aperture chat/sandbox/tool_view.go.
 func truncateUTF8(s string, limit int, marker string) string {
@@ -358,12 +383,10 @@ func buildCreateFileCommand(path, fileText string) string {
 // --- Tool timeout constants (match aperture + design doc) ------------------
 
 const (
-	mcpBashDefaultTimeout = 600 * time.Second  // 10 min default; stated in tool description
-	mcpBashMaxTimeout     = 7200 * time.Second // 120 min hard ceiling; clamp over this
-	mcpViewTimeout        = 30 * time.Second
-	mcpCreateFileTimeout  = 30 * time.Second
-	mcpStrReplaceTimeout  = 30 * time.Second
-	mcpMaxViewOutput      = 16_000
+	mcpViewTimeout       = 30 * time.Second
+	mcpCreateFileTimeout = 30 * time.Second
+	mcpStrReplaceTimeout = 30 * time.Second
+	mcpMaxViewOutput     = 16_000
 )
 
 // --- Tool handlers ---------------------------------------------------------
@@ -388,53 +411,12 @@ func textResult(text string, isError bool) (*mcp.CallToolResult, error) {
 	}, nil
 }
 
-// mcpBashToolHandler is the ToolHandler for thundersnap_bash.
-func mcpBashToolHandler(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	var params struct {
-		Command string `json:"command"`
-		Frame   string `json:"frame"`
-		Workdir string `json:"workdir"`
-		Timeout int    `json:"timeout"`
-	}
-	if req.Params != nil && len(req.Params.Arguments) > 0 {
-		if err := json.Unmarshal(req.Params.Arguments, &params); err != nil {
-			return textResult(fmt.Sprintf("invalid input: %v", err), true)
-		}
-	}
-	if params.Command == "" {
-		return textResult("command is required", true)
-	}
-
-	timeout := mcpBashDefaultTimeout
-	if params.Timeout > 0 {
-		timeout = time.Duration(params.Timeout) * time.Second
-		if timeout > mcpBashMaxTimeout {
-			timeout = mcpBashMaxTimeout
-		}
-	}
-
-	ctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-
-	res, err := runInFrame(ctx, mcpUserFromContext(ctx), params.Frame, params.Workdir, params.Command)
-	if err != nil {
-		if errors.Is(err, errMCPCommandTimeout) && res != nil {
-			// Timeout: runInFrame already appended a marker to res.Output;
-			// surface the partial output as an error result.
-			return textResult(mcpexec.FormatExit(res), true)
-		}
-		return textResult(fmt.Sprintf("exec failed: %v", err), true)
-	}
-	// A non-zero exit is a tool-level failure (the LLM should see the output
-	// and self-correct), not a protocol error.
-	return textResult(mcpexec.FormatExit(res), res.ExitCode != 0)
-}
-
 // mcpViewToolHandler is the ToolHandler for thundersnap_view.
 func mcpViewToolHandler(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	var params struct {
 		Path      string `json:"path"`
 		ViewRange []int  `json:"view_range"`
+		TailLines int    `json:"tail_lines"`
 		Frame     string `json:"frame"`
 	}
 	if req.Params != nil && len(req.Params.Arguments) > 0 {
@@ -444,6 +426,31 @@ func mcpViewToolHandler(ctx context.Context, req *mcp.CallToolRequest) (*mcp.Cal
 	}
 	if params.Path == "" {
 		return textResult("path is required", true)
+	}
+	if params.TailLines < 0 {
+		return textResult("tail_lines must be positive", true)
+	}
+	if params.TailLines > 0 && len(params.ViewRange) > 0 {
+		return textResult("tail_lines and view_range are mutually exclusive", true)
+	}
+	if params.TailLines > 0 {
+		user := mcpUserFromContext(ctx)
+		rootFS, _, err := resolveFrameRootFS(user, params.Frame)
+		if err != nil {
+			return textResult(fmt.Sprintf("resolve frame: %v", err), true)
+		}
+		hostPath := filepath.Join(rootFS, strings.TrimPrefix(filepath.Clean("/"+params.Path), "/"))
+		if !isWithinRootFS(hostPath, rootFS) {
+			return textResult(fmt.Sprintf("path %q escapes the frame", params.Path), true)
+		}
+		content, err := os.ReadFile(hostPath)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return textResult(fmt.Sprintf("Error: %s not found", params.Path), true)
+			}
+			return textResult(fmt.Sprintf("read %s: %v", params.Path, err), true)
+		}
+		return textResult(truncateUTF8(tailLines(content, params.TailLines), mcpMaxViewOutput, "\n\n... output truncated ..."), false)
 	}
 	cmd, err := buildViewCommand(params.Path, params.ViewRange)
 	if err != nil {
@@ -683,7 +690,7 @@ func mcpListRefsToolHandler(ctx context.Context, req *mcp.CallToolRequest) (*mcp
 
 // --- MCP server factory + HTTP mount ---------------------------------------
 
-// newMCPServer builds the MCP server with all six tools registered. It is
+// newMCPServer builds the MCP server with all tools registered. It is
 // called once per handler mount (production main() and test runTestMode each
 // build their own). The server name/version are the thundersnap daemon's.
 func newMCPServer() *mcp.Server {
@@ -698,46 +705,59 @@ func newMCPServer() *mcp.Server {
 			"named frame (defaulting to the user's current frame).",
 	})
 
-	// bash
+	// Background bash starts a supervised job and returns immediately. Aperture
+	// serializes tool calls, so quick starts followed by jobs_wait still permit
+	// the commands themselves to overlap.
 	s.AddTool(&mcp.Tool{
 		Name: "thundersnap_bash",
-		Description: "Run a bash command in a thundersnap frame. The command " +
-			"runs as `sh -c <command>` in /work (override with workdir) inside " +
-			"the named frame, as root. Output (stdout+stderr interleaved) is " +
-			"collected up to 1 MiB; the exit code is reported. Default timeout " +
-			"600s, max 7200s (override with timeout in seconds). A " +
-			"non-zero exit code is returned as an error result, not a protocol " +
-			"error, so you can see the output and self-correct.",
+		Description: "Start a background shell job in a thundersnap frame and return immediately. " +
+			"The job runs as `sh -c <command>` in /work (override with workdir). " +
+			"Use thundersnap_jobs_wait/list to observe it and thundersnap_jobs_kill to stop it. " +
+			"Complete combined/stdout/stderr logs are stored inside the frame. " +
+			"hard_timeout defaults to 7200 seconds and is capped at 7200 seconds.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
-				"command": map[string]any{
-					"type":        "string",
-					"description": "The bash command to run.",
-				},
-				"frame": map[string]any{
-					"type":        "string",
-					"description": "Frame name or UUID to run in. Defaults to the user's current/only frame.",
-				},
-				"workdir": map[string]any{
-					"type":        "string",
-					"description": "Working directory inside the frame (default /work).",
-				},
-				"timeout": map[string]any{
-					"type":        "integer",
-					"description": "Timeout in seconds (default 600, max 7200).",
-				},
+				"command":      map[string]any{"type": "string", "description": "The shell command to run."},
+				"frame":        map[string]any{"type": "string", "description": "Frame name or UUID. Defaults to the user's current/only frame."},
+				"workdir":      map[string]any{"type": "string", "description": "Working directory inside the frame (default /work)."},
+				"label":        map[string]any{"type": "string", "description": "Optional short label for remembering this job."},
+				"hard_timeout": map[string]any{"type": "integer", "description": "Total job lifetime in seconds (default/max 7200)."},
 			},
 			"required": []string{"command"},
 		},
 	}, mcpBashToolHandler)
+
+	jobIDsSchema := map[string]any{"type": "array", "items": map[string]any{"type": "string"}}
+	s.AddTool(&mcp.Tool{
+		Name:        "thundersnap_jobs_list",
+		Description: "List background jobs belonging to this Aperture conversation across all frames. Omit job_ids to list all jobs.",
+		InputSchema: map[string]any{"type": "object", "properties": map[string]any{"job_ids": jobIDsSchema}},
+	}, mcpJobsListToolHandler)
+	s.AddTool(&mcp.Tool{
+		Name: "thundersnap_jobs_wait",
+		Description: "Wait for selected background jobs. until is output, any_exit, or all_exit. " +
+			"after_revision comes from a prior start/list/wait result. A wait timeout returns normal status and never kills jobs.",
+		InputSchema: map[string]any{"type": "object", "properties": map[string]any{
+			"job_ids":        jobIDsSchema,
+			"after_revision": map[string]any{"type": "integer"},
+			"until":          map[string]any{"type": "string", "enum": []string{"output", "any_exit", "all_exit"}},
+			"timeout":        map[string]any{"type": "integer", "description": "Wait duration in seconds (default 30, max 60)."},
+		}},
+	}, mcpJobsWaitToolHandler)
+	s.AddTool(&mcp.Tool{
+		Name:        "thundersnap_jobs_kill",
+		Description: "Kill selected background jobs and their complete process groups. Killing an already-terminal job is harmless.",
+		InputSchema: map[string]any{"type": "object", "properties": map[string]any{"job_ids": jobIDsSchema}, "required": []string{"job_ids"}},
+	}, mcpJobsKillToolHandler)
 
 	// view
 	s.AddTool(&mcp.Tool{
 		Name: "thundersnap_view",
 		Description: "View a file or directory listing in a thundersnap frame. " +
 			"For a file, prints lines with line numbers (use view_range " +
-			"[start, end] to limit; end=-1 means to EOF). For a directory, " +
+			"[start, end] to limit; end=-1 means to EOF), or use tail_lines " +
+			"to read the currently available final lines of a live job log. For a directory, " +
 			"lists up to 200 entries (maxdepth 2). Output is truncated to " +
 			"16K bytes. A non-zero exit (e.g. file not found) is an error result.",
 		InputSchema: map[string]any{
@@ -751,6 +771,10 @@ func newMCPServer() *mcp.Server {
 					"type":        "array",
 					"items":       map[string]any{"type": "integer"},
 					"description": "Optional [start_line, end_line] to limit file output. end_line=-1 means EOF.",
+				},
+				"tail_lines": map[string]any{
+					"type":        "integer",
+					"description": "Optional number of final lines to read; mutually exclusive with view_range.",
 				},
 				"frame": map[string]any{
 					"type":        "string",
