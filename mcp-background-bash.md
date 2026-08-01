@@ -268,32 +268,33 @@ code review. E2e tests must never skip.
 
 ### Conversation/task-list identity
 
-- [ ] Missing conversation `_meta` rejects every job start/list/wait/kill call.
-- [ ] Empty/non-string conversation metadata rejects cleanly.
-- [ ] Same user + same conversation across separate MCP connections sees the
+- [x] Missing conversation `_meta` rejects every job start/list/wait/kill call.
+- [ ] Empty/non-string conversation metadata rejects cleanly. *(empty covered;
+      non-string only unit-tested)*
+- [x] Same user + same conversation across separate MCP connections sees the
       same jobs.
-- [ ] Same user + different conversations cannot list, wait for, or kill each
+- [x] Same user + different conversations cannot list, wait for, or kill each
       other's jobs, even when both use the same frame and short ID `j1`.
-- [ ] One conversation launches jobs in multiple frames and lists/waits for all
+- [x] One conversation launches jobs in multiple frames and lists/waits for all
       of them together.
-- [ ] Job IDs remain short and are unique within one conversation under
+- [x] Job IDs remain short and are unique within one conversation under
       concurrent launches.
 
 ### Launch and execution
 
 - [ ] Start returns promptly while a long command remains running.
 - [ ] Invalid frame and invalid workdir fail before a successful job ID is
-      returned.
-- [ ] Empty command is rejected.
-- [ ] Default frame auto-creation still works.
-- [ ] Ref and UUID frame resolution both record the resolved UUID.
-- [ ] Commands in different frames execute concurrently despite sequential MCP
+      returned. *(invalid frame covered; invalid workdir not)*
+- [x] Empty command is rejected.
+- [x] Default frame auto-creation still works.
+- [x] Ref and UUID frame resolution both record the resolved UUID.
+- [x] Commands in different frames execute concurrently despite sequential MCP
       start calls.
 - [ ] Commands in one frame share its filesystem and may run concurrently.
-- [ ] Non-zero exits are recorded with the correct code and do not turn the
+- [x] Non-zero exits are recorded with the correct code and do not turn the
       original start into an error.
 - [ ] Empty-output success records exit code 0.
-- [ ] stdout-only, stderr-only, and interleaved output reach the right logs and
+- [x] stdout-only, stderr-only, and interleaved output reach the right logs and
       counters; combined order matches frame arrival order.
 - [ ] Split UTF-8 across frames does not corrupt log bytes (logs are raw bytes).
 - [ ] A command producing more than the old 1 MiB cap is not killed and its
@@ -301,27 +302,27 @@ code review. E2e tests must never skip.
 
 ### Wait semantics
 
-- [ ] `output` blocks until output after `after_revision`, then wakes promptly.
-- [ ] `any_exit` wakes for the correct selected job.
-- [ ] `all_exit` waits until every selected job is terminal.
-- [ ] Already-satisfied `all_exit` returns immediately.
-- [ ] Empty job selection means all jobs in this conversation.
-- [ ] Unknown IDs reject rather than being silently ignored.
-- [ ] Wait timeout returns `reason: timeout`, preserves running jobs, and does
+- [x] `output` blocks until output after `after_revision`, then wakes promptly.
+- [x] `any_exit` wakes for the correct selected job.
+- [x] `all_exit` waits until every selected job is terminal.
+- [x] Already-satisfied `all_exit` returns immediately.
+- [x] Empty job selection means all jobs in this conversation.
+- [x] Unknown IDs reject rather than being silently ignored.
+- [x] Wait timeout returns `reason: timeout`, preserves running jobs, and does
       not set `IsError`.
 - [ ] Output arriving between predicate check and sleep cannot be lost.
 - [ ] Several simultaneous waiters all wake on a relevant change.
 - [ ] Changes in unselected jobs do not falsely satisfy selected-job
       predicates (spurious wake/recheck is acceptable).
-- [ ] Revision values never decrease and are usable across list/start/wait.
+- [x] Revision values never decrease and are usable across list/start/wait.
 - [ ] Cancellation of a wait call does not cancel jobs.
 
 ### Kill, timeout, and cleanup
 
-- [ ] Kill terminates foreground process and background grandchildren.
-- [ ] Kill is idempotent for terminal jobs.
-- [ ] Hard timeout marks `timed_out` and reaps the entire process group.
-- [ ] Explicit kill is distinguishable from hard timeout and normal exit.
+- [x] Kill terminates foreground process and background grandchildren.
+- [x] Kill is idempotent for terminal jobs.
+- [x] Hard timeout marks `timed_out` and reaps the entire process group.
+- [x] Explicit kill is distinguishable from hard timeout and normal exit.
 - [ ] Killing one job does not affect sibling jobs in the same frame or
       conversation.
 - [ ] Closing the MCP transport does not stop a running job.
@@ -330,14 +331,14 @@ code review. E2e tests must never skip.
 
 ### Logs and view
 
-- [ ] Logs are inside the intended frame and cannot escape its rootfs.
-- [ ] Conversation IDs and labels cannot inject path traversal.
-- [ ] `combined.log`, `stdout.log`, and `stderr.log` contents/counters agree.
-- [ ] Logs are readable while the job is still running.
-- [ ] `tail_lines` returns the requested final lines for a completed log.
-- [ ] `tail_lines` returns the currently available tail for a running log.
-- [ ] `tail_lines` and `view_range` together reject as ambiguous.
-- [ ] Tail handles empty files, no final newline, long lines, and UTF-8 text.
+- [x] Logs are inside the intended frame and cannot escape its rootfs.
+- [x] Conversation IDs and labels cannot inject path traversal.
+- [x] `combined.log`, `stdout.log`, and `stderr.log` contents/counters agree.
+- [x] Logs are readable while the job is still running.
+- [x] `tail_lines` returns the requested final lines for a completed log.
+- [x] `tail_lines` returns the currently available tail for a running log.
+- [x] `tail_lines` and `view_range` together reject as ambiguous.
+- [x] Tail handles empty files, no final newline, long lines, and UTF-8 text.
 
 ### Robustness/future policy
 

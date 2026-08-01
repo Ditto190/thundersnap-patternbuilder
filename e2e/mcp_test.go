@@ -872,6 +872,191 @@ func TestMCPBackgroundJobsConversationScope(t *testing.T) {
 	_ = revA1
 }
 
+// TestMCPBackgroundJobWaitSemantics covers the wait contract that
+// TestMCPBackgroundJobWaitAndKill does not: timeout results, already-satisfied
+// all_exit returning immediately, and the output/any_exit revision predicates.
+func TestMCPBackgroundJobWaitSemantics(t *testing.T) {
+	env := newTestEnv(t)
+	d, httpBase := startDaemonWithHTTP(t, env)
+	session := mcpClient(t, httpBase)
+	createFrameForMCP(t, d, "waitframe")
+	installBusyboxAppletsInFrame(t, d, "waitframe", "sleep")
+
+	// A job that stays alive long enough for the wait-timeout path, then exits.
+	out, isErr := callTool(t, session, "thundersnap_bash", map[string]any{
+		"command": "sleep 10",
+		"frame":   "waitframe",
+	})
+	if isErr {
+		t.Fatalf("start long job: %s", out)
+	}
+	var started struct {
+		JobID    string `json:"job_id"`
+		Revision uint64 `json:"revision"`
+	}
+	if err := json.Unmarshal([]byte(out), &started); err != nil {
+		t.Fatalf("unmarshal start %q: %v", out, err)
+	}
+
+	// --- wait timeout returns reason=timeout, does NOT kill, no IsError ---
+	waitStart := time.Now()
+	out, isErr = callTool(t, session, "thundersnap_jobs_wait", map[string]any{
+		"job_ids": []string{started.JobID}, "after_revision": started.Revision,
+		"until": "all_exit", "timeout": 1,
+	})
+	if isErr {
+		t.Fatalf("wait timeout: unexpected error %q", out)
+	}
+	if elapsed := time.Since(waitStart); elapsed > 5*time.Second {
+		t.Errorf("wait timeout took %v, expected ~1s", elapsed)
+	}
+	if !strings.Contains(out, `"reason":"timeout"`) {
+		t.Fatalf("wait timeout: output %q missing reason=timeout", out)
+	}
+	// The job must still be running (timeout does not kill).
+	var toResult struct {
+		Jobs []map[string]any `json:"jobs"`
+	}
+	if err := json.Unmarshal([]byte(out), &toResult); err != nil || len(toResult.Jobs) != 1 {
+		t.Fatalf("wait timeout unmarshal %q: %+v err=%v", out, toResult, err)
+	}
+	if toResult.Jobs[0]["state"] != "running" {
+		t.Fatalf("after timeout, job state = %+v (want running)", toResult.Jobs[0])
+	}
+
+	// --- kill it so the conversation has a terminal job ---
+	if out, isErr := callTool(t, session, "thundersnap_jobs_kill", map[string]any{"job_ids": []string{started.JobID}}); isErr {
+		t.Fatalf("kill long job: %s", out)
+	}
+
+	// --- already-satisfied all_exit returns immediately ---
+	satStart := time.Now()
+	out, isErr = callTool(t, session, "thundersnap_jobs_wait", map[string]any{
+		"job_ids": []string{started.JobID}, "until": "all_exit", "timeout": 10,
+	})
+	if isErr || !strings.Contains(out, `"reason":"all_exit"`) {
+		t.Fatalf("already-satisfied all_exit: isErr=%v output=%q", isErr, out)
+	}
+	if elapsed := time.Since(satStart); elapsed > 2*time.Second {
+		t.Errorf("already-satisfied all_exit took %v, expected immediate", elapsed)
+	}
+}
+
+// TestMCPBackgroundJobInputValidation covers the reject-before-launch checks
+// and the tail_lines/view_range mutual exclusion, which the happy-path tests
+// don't exercise.
+func TestMCPBackgroundJobInputValidation(t *testing.T) {
+	env := newTestEnv(t)
+	d, httpBase := startDaemonWithHTTP(t, env)
+	session := mcpClient(t, httpBase)
+	createFrameForMCP(t, d, "validframe")
+	installBusyboxAppletsInFrame(t, d, "validframe", "sleep")
+
+	// --- empty command is rejected ---
+	if out, isErr := callTool(t, session, "thundersnap_bash", map[string]any{"command": "", "frame": "validframe"}); !isErr || !strings.Contains(out, "command is required") {
+		t.Errorf("empty command: isErr=%v output=%q", isErr, out)
+	}
+	// --- bad user is rejected ---
+	if out, isErr := callTool(t, session, "thundersnap_bash", map[string]any{"command": "true", "frame": "validframe", "user": "nobody"}); !isErr || !strings.Contains(out, "user must be") {
+		t.Errorf("bad user: isErr=%v output=%q", isErr, out)
+	}
+	// --- bad until is rejected ---
+	if out, isErr := callTool(t, session, "thundersnap_jobs_wait", map[string]any{"until": "never"}); !isErr || !strings.Contains(out, "invalid until") {
+		t.Errorf("bad until: isErr=%v output=%q", isErr, out)
+	}
+	// --- kill with no job_ids is rejected ---
+	if out, isErr := callTool(t, session, "thundersnap_jobs_kill", map[string]any{}); !isErr || !strings.Contains(out, "job_ids is required") {
+		t.Errorf("kill no ids: isErr=%v output=%q", isErr, out)
+	}
+	// --- unknown job id is rejected ---
+	if out, isErr := callTool(t, session, "thundersnap_jobs_list", map[string]any{"job_ids": []string{"j999"}}); !isErr || !strings.Contains(out, "unknown job") {
+		t.Errorf("unknown job: isErr=%v output=%q", isErr, out)
+	}
+	// --- tail_lines and view_range are mutually exclusive ---
+	if out, isErr := callTool(t, session, "thundersnap_view", map[string]any{"path": "/work", "tail_lines": 5, "view_range": []int{1, 10}, "frame": "validframe"}); !isErr || !strings.Contains(out, "mutually exclusive") {
+		t.Errorf("tail+range: isErr=%v output=%q", isErr, out)
+	}
+	// --- negative tail_lines is rejected ---
+	if out, isErr := callTool(t, session, "thundersnap_view", map[string]any{"path": "/work", "tail_lines": -1, "frame": "validframe"}); !isErr || !strings.Contains(out, "positive") {
+		t.Errorf("negative tail: isErr=%v output=%q", isErr, out)
+	}
+}
+
+// TestMCPBackgroundJobMultiFrameAndCounters covers one conversation launching
+// jobs in different frames and listing them together, kill idempotency on a
+// terminal job, and agreement between combined/stdout/stderr byte counters.
+func TestMCPBackgroundJobMultiFrameAndCounters(t *testing.T) {
+	env := newTestEnv(t)
+	d, httpBase := startDaemonWithHTTP(t, env)
+	session := mcpClient(t, httpBase)
+	createFrameForMCP(t, d, "frameA")
+	createFrameForMCP(t, d, "frameB")
+	installBusyboxAppletsInFrame(t, d, "frameA", "sleep")
+	installBusyboxAppletsInFrame(t, d, "frameB", "sleep")
+
+	// Start one job in each frame; the conversation lists both together.
+	jobA := startAndWaitMCPBash(t, session, map[string]any{
+		"command": "echo stdout-only; echo stderr-only >&2",
+		"frame":   "frameA",
+	})
+	jobB := startAndWaitMCPBash(t, session, map[string]any{
+		"command": "echo b",
+		"frame":   "frameB",
+	})
+	if jobA["frame"] == jobB["frame"] {
+		t.Fatalf("jobs in different frames share a frame: %+v / %+v", jobA, jobB)
+	}
+
+	// List all jobs in the conversation: both must appear.
+	out, isErr := callTool(t, session, "thundersnap_jobs_list", nil)
+	if isErr {
+		t.Fatalf("list all: %s", out)
+	}
+	if !strings.Contains(out, jobA["id"].(string)) || !strings.Contains(out, jobB["id"].(string)) {
+		t.Fatalf("list all does not contain both jobs: %s", out)
+	}
+
+	// --- byte counters: combined = stdout + stderr ---
+	stdout := int64(jobA["stdout_bytes"].(float64))
+	stderr := int64(jobA["stderr_bytes"].(float64))
+	combined := int64(jobA["combined_bytes"].(float64))
+	if combined != stdout+stderr {
+		t.Errorf("counters: combined=%d stdout=%d stderr=%d (want combined=stdout+stderr)", combined, stdout, stderr)
+	}
+	if stdout == 0 || stderr == 0 {
+		t.Errorf("expected non-zero stdout and stderr, got stdout=%d stderr=%d", stdout, stderr)
+	}
+	// Verify the log contents actually agree with the counters by tail-reading.
+	combOut, _ := callTool(t, session, "thundersnap_view", map[string]any{"path": jobA["combined_log"], "tail_lines": 20, "frame": "frameA"})
+	if !strings.Contains(combOut, "stdout-only") || !strings.Contains(combOut, "stderr-only") {
+		t.Errorf("combined log missing a stream: %q", combOut)
+	}
+	stdoOut, _ := callTool(t, session, "thundersnap_view", map[string]any{"path": jobA["stdout_log"], "tail_lines": 20, "frame": "frameA"})
+	if !strings.Contains(stdoOut, "stdout-only") || strings.Contains(stdoOut, "stderr-only") {
+		t.Errorf("stdout log wrong: %q", stdoOut)
+	}
+	stdeOut, _ := callTool(t, session, "thundersnap_view", map[string]any{"path": jobA["stderr_log"], "tail_lines": 20, "frame": "frameA"})
+	if !strings.Contains(stdeOut, "stderr-only") || strings.Contains(stdeOut, "stdout-only") {
+		t.Errorf("stderr log wrong: %q", stdeOut)
+	}
+
+	// --- kill is idempotent on a terminal job ---
+	out, isErr = callTool(t, session, "thundersnap_jobs_kill", map[string]any{"job_ids": []string{jobA["id"].(string)}})
+	if isErr {
+		t.Fatalf("kill terminal job: %s", out)
+	}
+	var killed struct {
+		Jobs []map[string]any `json:"jobs"`
+	}
+	if err := json.Unmarshal([]byte(out), &killed); err != nil || len(killed.Jobs) != 1 {
+		t.Fatalf("kill terminal unmarshal %q: %+v err=%v", out, killed, err)
+	}
+	// A terminal job keeps its original terminal state (exited), not "killed".
+	if killed.Jobs[0]["state"] != "exited" {
+		t.Errorf("kill on terminal job changed state to %v; want exited", killed.Jobs[0]["state"])
+	}
+}
+
 // uuidParse parses a UUID string and returns an error if it's malformed. Used
 // by TestMCPFrameResolution to assert the auto-created frame is listed by UUID.
 func uuidParse(s string) (struct{}, error) {

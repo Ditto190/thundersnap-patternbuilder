@@ -263,8 +263,13 @@ can launch concurrent work and observe it through short wait calls.
   coverage includes required conversation metadata, same-conversation reuse
   across MCP connections, cross-conversation isolation, short per-chat IDs,
   concurrent jobs, output waits/live tail reads, normal and non-zero exits,
-  explicit kill, and hard-timeout process-group reap. The remaining matrix
-  items stay intentionally unchecked in the design document.
+  explicit kill, hard-timeout process-group reap, wait timeout with reason=
+  timeout and no kill, already-satisfied all_exit returning immediately,
+  input validation (empty command, bad user/until, unknown job, kill without
+  ids, tail_lines/view_range mutual exclusion, negative tail_lines), one
+  conversation spanning multiple frames, kill idempotency on a terminal job,
+  and combined/stdout/stderr counter agreement. The remaining matrix items
+  stay intentionally unchecked in the design document.
 
 ## Phase 5 — Future (out of scope for MCP-first phase; see design doc §Future work)
 
