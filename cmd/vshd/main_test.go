@@ -66,6 +66,31 @@ func TestQuoteArgsForSh(t *testing.T) {
 	}
 }
 
+func TestExportPrefix(t *testing.T) {
+	tests := []struct {
+		name string
+		env  []string
+		want string
+	}{
+		{name: "empty", env: nil, want: ""},
+		{name: "one", env: []string{"THUNDERSNAP_FRAME=dev"}, want: "export 'THUNDERSNAP_FRAME'='dev'; "},
+		{name: "two", env: []string{"THUNDERSNAP_HOST=h.ts.net", "THUNDERSNAP_FRAME=dev"},
+			want: "export 'THUNDERSNAP_HOST'='h.ts.net'; export 'THUNDERSNAP_FRAME'='dev'; "},
+		{name: "value with comma", env: []string{"THUNDERSNAP_FRAME=a,b"}, want: "export 'THUNDERSNAP_FRAME'='a,b'; "},
+		{name: "value with dollar untouched", env: []string{"X=$HOME"}, want: "export 'X'='$HOME'; "},
+		{name: "value with single quote is escaped", env: []string{"X=it's"}, want: "export 'X'='it'\\''s'; "},
+		{name: "no equals skipped", env: []string{"BADNOEQ"}, want: ""},
+		{name: "empty key skipped", env: []string{"=val"}, want: ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := exportPrefix(tt.env); got != tt.want {
+				t.Errorf("exportPrefix(%v) = %q, want %q", tt.env, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestSelectUserExplicit(t *testing.T) {
 	// A caller-specified user is returned verbatim regardless of filesystem.
 	if got := selectUser("", "alice"); got != "alice" {

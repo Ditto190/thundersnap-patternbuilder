@@ -116,6 +116,34 @@ func resolveFrameForUser(tailscaleUser, name string) (uuid frameid.ID, framePath
 	return frameid.Nil, "", false, fmt.Errorf("no such frame %q", name)
 }
 
+// frameDescriptor returns a human-readable label for the frame identified by
+// uuid, for use in THUNDERSNAP_FRAME: the comma-separated names of all refs
+// that point at uuid, or uuid itself when no ref points at it (an unattached
+// frame, like git's detached HEAD). This mirrors the "find refs pointing to
+// this frame" logic in handleReflog so a PS1 can show the ref(s) the user
+// logged into, falling back to the frame UUID for an unattached frame.
+func frameDescriptor(tailscaleUser string, uuid frameid.ID) string {
+	store := userRefStore(tailscaleUser)
+	names, err := store.List()
+	if err != nil {
+		return uuid.String()
+	}
+	var matching []string
+	for _, name := range names {
+		ref, err := store.Get(name)
+		if err != nil {
+			continue
+		}
+		if ref.UUID == uuid {
+			matching = append(matching, name)
+		}
+	}
+	if len(matching) == 0 {
+		return uuid.String()
+	}
+	return strings.Join(matching, ",")
+}
+
 // RefRequest is the request body for ref operations.
 type RefRequest struct {
 	Name  string `json:"name"`

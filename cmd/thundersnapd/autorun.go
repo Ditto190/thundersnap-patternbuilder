@@ -340,7 +340,7 @@ func (m *autorunManager) runOnce(ctx context.Context, proc *autorunProcess, retr
 	// The wrapper executes proc.argv without an additional shell and only
 	// remains after failure, as the ps-visible retry-on-fail sleeper.
 	argv := append([]string{"/bin/ts", "autorun-run", retryDelay.String()}, proc.argv...)
-	writeVshdRequest(conn, framePathHdr, "user", false, argv)
+	writeVshdRequest(conn, framePathHdr, "user", false, argv, thundersnapSessionEnv(proc.key.user, proc.frameUUID))
 
 	exitCode := proxyVshdSessionGeneric(
 		strings.NewReader(""), // stdin: immediate EOF (no input)

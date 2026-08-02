@@ -40,6 +40,25 @@ func resolveFrameRootFS(tailscaleUser, frameName string) (rootFS string, uuid fr
 	return framePath, uuid, nil
 }
 
+// thundersnapSessionEnv returns environment variables (as KEY=VAL strings) that
+// describe the current session for use in the user's shell (e.g. PS1):
+//   - THUNDERSNAP_HOST: the tsnet hostname (FQDN) of this daemon, when known.
+//   - THUNDERSNAP_FRAME: a label for the current frame — the comma-separated
+//     names of all refs pointing at it, or the frame UUID when unattached
+//     (like git's detached HEAD).
+//
+// Only non-empty values are included, so a shell can test
+// [ -n "$THUNDERSNAP_HOST" ] to detect availability. THUNDERSNAP_FRAME is
+// always set (a frame UUID is always available for a resolved frame).
+func thundersnapSessionEnv(tailscaleUser string, uuid frameid.ID) []string {
+	var env []string
+	if h := getTsnetHostname(); h != "" {
+		env = append(env, "THUNDERSNAP_HOST="+h)
+	}
+	env = append(env, "THUNDERSNAP_FRAME="+frameDescriptor(tailscaleUser, uuid))
+	return env
+}
+
 // runContainerSession handles a container-based SSH session on the host.
 // targetUser specifies the Unix user to run as. If empty, auto-detect from
 // [ubuntu, user] based on which /home/<user> exists, or fall back to root.
@@ -52,7 +71,7 @@ func resolveFrameRootFS(tailscaleUser, frameName string) (rootFS string, uuid fr
 func runContainerSession(s ssh.Session, tailscaleUser, frameName, targetUser string, logErr func(string, ...any)) error {
 	// Resolve the frame name to its canonical fs/<user>/<uuid> path via the
 	// user's ref store, then prepare its rootfs.
-	rootFS, _, err := resolveFrameRootFS(tailscaleUser, frameName)
+	rootFS, uuid, err := resolveFrameRootFS(tailscaleUser, frameName)
 	if err != nil {
 		return err
 	}
@@ -88,7 +107,7 @@ func runContainerSession(s ssh.Session, tailscaleUser, frameName, targetUser str
 	defer conn.Close()
 
 	ptyReq, winCh, isPty := s.Pty()
-	writeVshdRequest(conn, framePathHdr, targetUser, isPty, sessionCommand(s))
+	writeVshdRequest(conn, framePathHdr, targetUser, isPty, sessionCommand(s), thundersnapSessionEnv(tailscaleUser, uuid))
 
 	return proxyVshdSession(s, conn, isPty, ptyReq, winCh, nil, nil)
 }
@@ -331,7 +350,7 @@ func runVMXSession(s ssh.Session, tailscaleUser, isolationName, frameName, targe
 	// framePath is the frame's UUID, relative to the virtiofs root (userFsDir,
 	// i.e. fs/<user>): the frame lives at fs/<user>/<uuid> on the host.
 	ptyReq, winCh, isPty := s.Pty()
-	writeVshdRequest(conn, uuid.String(), targetUser, isPty, sessionCommand(s))
+	writeVshdRequest(conn, uuid.String(), targetUser, isPty, sessionCommand(s), thundersnapSessionEnv(tailscaleUser, uuid))
 
 	// Proxy SSH I/O over the vshdproto TLV stream.
 	return proxyVshdSession(s, conn, isPty, ptyReq, winCh, ms.done, ms.panicked)
@@ -372,7 +391,7 @@ func runVMXOuterShell(s ssh.Session, tailscaleUser, isolationName, targetUser st
 
 	// Send original vshd protocol header (no VMX prefix) - shell directly in VM
 	ptyReq, winCh, isPty := s.Pty()
-	writeVshdRequest(conn, "", targetUser, isPty, sessionCommand(s))
+	writeVshdRequest(conn, "", targetUser, isPty, sessionCommand(s), nil)
 
 	// Proxy SSH I/O over the vshdproto TLV stream.
 	return proxyVshdSession(s, conn, isPty, ptyReq, winCh, ms.done, ms.panicked)
@@ -409,7 +428,12 @@ func sessionCommand(s ssh.Session) []string {
 // ("user\0pty\0argc\0args...") for a shell directly in the VM. pty signals
 // whether the client requested a terminal. After this header the connection
 // carries vshdproto TLV frames in both directions.
-func writeVshdRequest(conn net.Conn, framePath, targetUser string, pty bool, cmdArgs []string) {
+//
+// env is a list of KEY=VAL strings injected into the session's environment
+// (e.g. THUNDERSNAP_HOST, THUNDERSNAP_FRAME); vshd merges it into the command's
+// Env, which flows through nsenter -> session-serve -> the final shell because
+// every exec in that chain uses os.Environ().
+func writeVshdRequest(conn net.Conn, framePath, targetUser string, pty bool, cmdArgs []string, env []string) {
 	if framePath != "" {
 		fmt.Fprintf(conn, "VMX\x00%s\x00", framePath)
 	}
@@ -420,6 +444,13 @@ func writeVshdRequest(conn net.Conn, framePath, targetUser string, pty bool, cmd
 	fmt.Fprintf(conn, "%s\x00%s\x00%d\x00", targetUser, ptyFlag, len(cmdArgs))
 	for _, arg := range cmdArgs {
 		fmt.Fprintf(conn, "%s\x00", arg)
+	}
+	// Env block: a null-delimited count followed by KEY=VAL entries, appended
+	// after the args so vshd can read it before the connection switches to
+	// vshdproto TLV framing.
+	fmt.Fprintf(conn, "%d\x00", len(env))
+	for _, e := range env {
+		fmt.Fprintf(conn, "%s\x00", e)
 	}
 }
 

@@ -145,6 +145,33 @@ func parsePasswdHome(passwd, username string) string {
 	return ""
 }
 
+// exportPrefix returns a shell snippet that exports each KEY=VAL entry from
+// env, e.g. "export 'KEY'='VALUE'; ". It is prepended to the command given to
+// `su - user -c <cmd>` so the vars are set AFTER su clears the environment
+// (a real su - resets env; ts's built-in su preserves THUNDERSNAP_* via
+// identityEnv, so the prefix is redundant there but harmless). Returns "" when
+// env is empty so callers can skip mangling the command entirely and preserve
+// the original argv. Both key and value are single-quoted with '\” escaping so
+// no metacharacter in a value (hostname, ref name, comma) can break out.
+func exportPrefix(env []string) string {
+	if len(env) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	for _, e := range env {
+		k, v, ok := strings.Cut(e, "=")
+		if !ok || k == "" {
+			continue
+		}
+		b.WriteString("export '")
+		b.WriteString(k)
+		b.WriteString("'='")
+		b.WriteString(strings.ReplaceAll(v, "'", "'\\''"))
+		b.WriteString("'; ")
+	}
+	return b.String()
+}
+
 // quoteArgsForSh single-quotes each argument for safe interpolation into a
 // `su - <user> -c '<cmd>'` string, escaping embedded single quotes via the
 // standard '\” idiom, and joins them with spaces.
@@ -284,6 +311,19 @@ func handleConnection(conn io.ReadWriteCloser) {
 		return
 	}
 
+	// Env block (appended after args by writeVshdRequest): a null-delimited
+	// count of KEY=VAL entries to inject into the session's environment (e.g.
+	// THUNDERSNAP_HOST, THUNDERSNAP_FRAME). The daemon — the only place that
+	// knows the tsnet hostname and the user's refs — computes these; vshd
+	// treats them as opaque strings and propagates them via the command's Env,
+	// which flows through nsenter -> session-serve -> the final shell because
+	// every exec in that chain uses os.Environ().
+	sessionEnvs, err := readEnv(reader)
+	if err != nil {
+		log.Printf("[conn %d] failed to read env: %v", id, err)
+		return
+	}
+
 	// Validate a caller-specified user before it reaches `su`. A name starting
 	// with '-' (e.g. "-c") would be parsed as a su flag and run the supplied
 	// command as root; see validateTargetUser. Auto-detection (targetUser == "")
@@ -299,10 +339,10 @@ func handleConnection(conn io.ReadWriteCloser) {
 	}
 
 	runAsUser := selectUser(rootPrefix, targetUser)
-	log.Printf("[conn %d] running as user %q (requested: %q, rootPrefix: %q, pty: %v, args: %v)",
-		id, runAsUser, targetUser, rootPrefix, wantPTY, cmdArgs)
+	log.Printf("[conn %d] running as user %q (requested: %q, rootPrefix: %q, pty: %v, args: %v, env: %v)",
+		id, runAsUser, targetUser, rootPrefix, wantPTY, cmdArgs, sessionEnvs)
 
-	cmd, release, err := buildSessionCmd(rootPrefix, runAsUser, cmdArgs, wantPTY)
+	cmd, release, err := buildSessionCmd(rootPrefix, runAsUser, cmdArgs, wantPTY, sessionEnvs)
 	if err != nil {
 		log.Printf("[conn %d] failed to build session command: %v", id, err)
 		vshdproto.WriteFrame(conn, vshdproto.FrameStderr, []byte(fmt.Sprintf("vshd: %v\n", err)))
@@ -419,7 +459,7 @@ func (w *logWriter) Write(p []byte) (int, error) {
 // `ts join-and-run --chroot --keep-dev-caps`. This is byte-identical to the daemon's host per-session
 // form, so host and VM sessions sharing a container rootfs see each other's
 // PIDs.
-func buildSessionCmd(rootPrefix, runAsUser string, cmdArgs []string, wantPTY bool) (*exec.Cmd, func(), error) {
+func buildSessionCmd(rootPrefix, runAsUser string, cmdArgs []string, wantPTY bool, env []string) (*exec.Cmd, func(), error) {
 	// argv is what we ultimately exec (before any container wrapper).
 	var argv []string
 	switch {
@@ -428,20 +468,34 @@ func buildSessionCmd(rootPrefix, runAsUser string, cmdArgs []string, wantPTY boo
 		argv = []string{"/bin/sh", "-l"}
 	case len(cmdArgs) == 0:
 		// Interactive login shell for a non-root user.
-		argv = []string{"su", "-", runAsUser}
+		if prefix := exportPrefix(env); prefix != "" {
+			// `su -` resets the environment for a real su (busybox/util-linux),
+			// dropping any session vars set on the su process. Inject them
+			// INSIDE the -c command — after su has cleared env — then exec an
+			// interactive login shell that inherits them. ts's built-in su
+			// also preserves THUNDERSNAP_* via identityEnv, so this is a
+			// harmless extra layer for minimal frames and the load-bearing
+			// trick for frames that ship a real su.
+			argv = []string{"su", "-", runAsUser, "-c", prefix + "exec /bin/sh -l"}
+		} else {
+			argv = []string{"su", "-", runAsUser}
+		}
 	case runAsUser == "root":
 		// Run the command directly as root.
 		argv = cmdArgs
 	default:
-		// Run the command via a login shell for the target user.
-		argv = []string{"su", "-", runAsUser, "-c", quoteArgsForSh(cmdArgs)}
+		// Run the command via a login shell for the target user. Inject session
+		// vars as exports inside the -c command so they survive `su -`'s env
+		// reset (see the interactive case above for the full rationale).
+		prefix := exportPrefix(env)
+		argv = []string{"su", "-", runAsUser, "-c", prefix + quoteArgsForSh(cmdArgs)}
 	}
 
 	if rootPrefix == "" {
 		// Direct shell/command in this filesystem (outer VM or host, no
 		// container).
 		cmd := exec.Command(argv[0], argv[1:]...)
-		cmd.Env = sessionEnv(wantPTY)
+		cmd.Env = sessionEnv(wantPTY, env)
 		return cmd, nil, nil
 	}
 
@@ -496,18 +550,43 @@ func buildSessionCmd(rootPrefix, runAsUser string, cmdArgs []string, wantPTY boo
 	}, dropCapsArgs...)
 
 	cmd := exec.Command(tsBinaryPath, nsenterArgs...)
-	cmd.Env = sessionEnv(wantPTY)
+	cmd.Env = sessionEnv(wantPTY, env)
 	return cmd, release, nil
 }
 
 // sessionEnv returns the environment for a session command, adding TERM for PTY
-// sessions.
-func sessionEnv(wantPTY bool) []string {
-	env := os.Environ()
+// sessions and merging in any daemon-supplied KEY=VAL entries (which take
+// precedence over the inherited environment). The merged env propagates to
+// the final shell because every exec in the nsenter -> session-serve chain
+// uses os.Environ().
+func sessionEnv(wantPTY bool, env []string) []string {
+	out := os.Environ()
 	if wantPTY {
-		env = append(env, "TERM=xterm-256color")
+		out = append(out, "TERM=xterm-256color")
 	}
-	return env
+	return mergeEnv(out, env)
+}
+
+// mergeEnv returns base with each KEY=VAL from extra overriding any existing
+// entry with the same key (extra takes precedence), preserving base order for
+// surviving base entries and appending extras in order. This keeps a stale
+// value inherited from vshd's own environment from shadowing a fresh value
+// supplied by the daemon for this session.
+func mergeEnv(base, extra []string) []string {
+	extraKeys := make(map[string]bool, len(extra))
+	for _, e := range extra {
+		if i := strings.IndexByte(e, '='); i >= 0 {
+			extraKeys[e[:i]] = true
+		}
+	}
+	merged := make([]string, 0, len(base)+len(extra))
+	for _, e := range base {
+		if i := strings.IndexByte(e, '='); i >= 0 && extraKeys[e[:i]] {
+			continue // overridden by extra
+		}
+		merged = append(merged, e)
+	}
+	return append(merged, extra...)
 }
 
 // readBool reads a null-terminated field expected to be "1" or "0".
@@ -544,6 +623,35 @@ func readArgs(reader *bufio.Reader) ([]string, error) {
 		cmdArgs = append(cmdArgs, arg)
 	}
 	return cmdArgs, nil
+}
+
+// readEnv reads a null-delimited "envCount\0KEY=VAL\0...\0" block appended
+// after the args by writeVshdRequest. The entries are opaque KEY=VAL strings
+// the daemon injects into the session's environment (e.g. THUNDERSNAP_HOST,
+// THUNDERSNAP_FRAME). A non-numeric or negative count is rejected up front so
+// a malformed request fails fast instead of blocking on a never-arriving
+// field.
+func readEnv(reader *bufio.Reader) ([]string, error) {
+	countStr, err := readField(reader)
+	if err != nil {
+		return nil, fmt.Errorf("read env count: %w", err)
+	}
+	envCount, err := strconv.Atoi(countStr)
+	if err != nil {
+		return nil, fmt.Errorf("invalid env count %q: %w", countStr, err)
+	}
+	if envCount < 0 {
+		return nil, fmt.Errorf("negative env count %d", envCount)
+	}
+	env := make([]string, 0, envCount)
+	for i := 0; i < envCount; i++ {
+		entry, err := readField(reader)
+		if err != nil {
+			return nil, fmt.Errorf("read env %d: %w", i, err)
+		}
+		env = append(env, entry)
+	}
+	return env, nil
 }
 
 func main() {

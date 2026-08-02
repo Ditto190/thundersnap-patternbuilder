@@ -362,20 +362,27 @@ func createFrameViaDaemon(t *testing.T, d *daemonInstance, refName string) strin
 		t.Fatalf("createFrameViaDaemon: ts frame returned exit code %d: %s", exitCode, output)
 	}
 
-	// Parse the UUID from output. ts frame outputs just the UUID on stdout,
-	// but stderr may contain progress messages like "Creating frame...".
-	// Look for the last line that looks like a UUID (contains dashes, 36 chars).
+	uuid := parseFrameUUID(t, output)
+	t.Logf("Created frame %s with ref %s", uuid, refName)
+	return uuid
+}
+
+// parseFrameUUID extracts a frame UUID from ts frame output, which prints just
+// the UUID on stdout but may carry progress messages (e.g. "Creating
+// frame...") on stderr; with combined output the two are interleaved. It
+// returns the last line that looks like a UUID (36 chars, 4 dashes).
+func parseFrameUUID(t *testing.T, output string) string {
+	t.Helper()
 	output = strings.TrimSpace(output)
 	lines := strings.Split(output, "\n")
 	for i := len(lines) - 1; i >= 0; i-- {
 		line := strings.TrimSpace(lines[i])
 		// UUID format: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx (36 chars with dashes)
 		if len(line) == 36 && strings.Count(line, "-") == 4 {
-			t.Logf("Created frame %s with ref %s", line, refName)
 			return line
 		}
 	}
-	t.Fatalf("createFrameViaDaemon: could not parse UUID from output: %q", output)
+	t.Fatalf("could not parse UUID from output: %q", output)
 	return ""
 }
 
@@ -560,6 +567,77 @@ func testFrameForkCreatesRef(t *testing.T, d *daemonInstance) {
 	}
 	if output != "" {
 		t.Fatalf("ts ref create produced output %q, want none", output)
+	}
+}
+
+// testSessionEnvVars verifies that the daemon injects THUNDERSNAP_FRAME into
+// the session's environment (so a shell can use it in PS1). For a frame bound
+// to one ref it must be the ref name; with two refs pointing at the same frame
+// it must list both, comma-separated; and for an unattached frame (no refs) it
+// must be the frame UUID. THUNDERSNAP_HOST is not asserted here because the
+// test daemon runs without tsnet (no hostname is known).
+func testSessionEnvVars(t *testing.T, d *daemonInstance) {
+	// Create a frame bound to ref "envvarref"; ts frame prints the new UUID on
+	// stdout (with progress noise on stderr, which createFrameViaDaemon parses).
+	frameUUID := createFrameViaDaemon(t, d, "envvarref")
+
+	// SSH into the ref: THUNDERSNAP_FRAME must be the ref name.
+	output, exitCode, err := sshExec(t, d, "envvarref", `printf '%s' "$THUNDERSNAP_FRAME"`)
+	if err != nil || exitCode != 0 {
+		t.Fatalf("envvarref echo: err=%v exit=%d output=%q", err, exitCode, output)
+	}
+	if got := strings.TrimSpace(output); got != "envvarref" {
+		t.Fatalf("THUNDERSNAP_FRAME for single ref: got %q, want %q", got, "envvarref")
+	}
+
+	// Add a second ref pointing at the same frame: THUNDERSNAP_FRAME must now
+	// list both ref names (comma-separated, like git showing multiple branches).
+	output, exitCode, err = sshExec(t, d, "root@", "ts ref create envvarref2 "+frameUUID)
+	if err != nil || exitCode != 0 {
+		t.Fatalf("ts ref create envvarref2: err=%v exit=%d output=%q", err, exitCode, output)
+	}
+	output, exitCode, err = sshExec(t, d, "envvarref", `printf '%s' "$THUNDERSNAP_FRAME"`)
+	if err != nil || exitCode != 0 {
+		t.Fatalf("envvarref multi echo: err=%v exit=%d output=%q", err, exitCode, output)
+	}
+	got := strings.TrimSpace(output)
+	for _, want := range []string{"envvarref", "envvarref2", ","} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("THUNDERSNAP_FRAME multi-ref: got %q, want it to contain %q", got, want)
+		}
+	}
+
+	// An unattached frame (no refs pointing at it) must fall back to the UUID.
+	// Forking with `ts frame ::` (no --ref) creates a fresh frame with no ref;
+	// its UUID is on stdout (separate from stderr progress noise).
+	stdout, _, _, err := sshExecSplit(t, d, "root@", "ts frame ::")
+	if err != nil {
+		t.Fatalf("ts frame :: (unattached): %v", err)
+	}
+	unattachedUUID := parseFrameUUID(t, stdout)
+	stdout, _, _, err = sshExecSplit(t, d, unattachedUUID, `printf '%s' "$THUNDERSNAP_FRAME"`)
+	if err != nil {
+		t.Fatalf("unattached frame echo: %v", err)
+	}
+	if got := strings.TrimSpace(stdout); got != unattachedUUID {
+		t.Fatalf("THUNDERSNAP_FRAME for unattached frame: got %q, want UUID %q", got, unattachedUUID)
+	}
+
+	// A frame that ships a REAL su (busybox/util-linux) is the hard case: a
+	// real `su -` clears the environment, so the vars set on the su process by
+	// vshd would be dropped. vshd works around this by exporting them INSIDE
+	// the `su - user -c <cmd>` string (after su has reset env). Install a real
+	// busybox su into a fresh frame (overriding the /bin/su -> ts symlink) and
+	// confirm the var still reaches the command. This is the test that proves
+	// the workaround works against a non-ts su.
+	createFrameViaDaemon(t, d, "envvarrealsu")
+	installBusyboxAppletInFrame(t, d, "envvarrealsu", "su")
+	output, exitCode, err = sshExec(t, d, "envvarrealsu", `printf '%s' "$THUNDERSNAP_FRAME"`)
+	if err != nil || exitCode != 0 {
+		t.Fatalf("envvarrealsu echo (real su): err=%v exit=%d output=%q", err, exitCode, output)
+	}
+	if got := strings.TrimSpace(output); got != "envvarrealsu" {
+		t.Fatalf("THUNDERSNAP_FRAME with real busybox su: got %q, want %q (su - cleared the env; the -c export prefix should restore it)", got, "envvarrealsu")
 	}
 }
 

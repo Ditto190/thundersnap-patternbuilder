@@ -1845,6 +1845,26 @@ func (c *controlServer) serveHTTP(conn net.Conn, reader *bufio.Reader) {
 	}
 }
 
+// enterSessionEnv returns THUNDERSNAP_HOST/THUNDERSNAP_FRAME env vars for the
+// /enter session protocol, given the control server's rootFS (to derive the
+// owning tailscale user) and the frame UUID string sent by the client. It is
+// best-effort: any failure to derive the user or parse the UUID yields nil so a
+// session is never failed just because its descriptive env could not be built.
+func enterSessionEnv(rootFS, uuidStr string) []string {
+	if uuidStr == "" {
+		return nil
+	}
+	id, err := frameid.Parse(uuidStr)
+	if err != nil {
+		return nil
+	}
+	user, err := tailscaleUserFromRootFS(rootFS)
+	if err != nil {
+		return nil
+	}
+	return thundersnapSessionEnv(user, id)
+}
+
 // handleEnter handles the /enter session protocol on port 5224. It performs the
 // full frame setup sequence (same as runContainerSession for SSH) before proxying.
 //
@@ -1947,7 +1967,7 @@ func (c *controlServer) handleEnter(clientConn net.Conn, clientReader *bufio.Rea
 		return
 	}
 	framePathHdr := strings.TrimPrefix(absRootFS, "/")
-	writeVshdRequest(vshdConn, framePathHdr, targetUser, isPty, cmdArgs)
+	writeVshdRequest(vshdConn, framePathHdr, targetUser, isPty, cmdArgs, enterSessionEnv(c.rootFS, uuid))
 
 	// 6. Proxy the session bidirectionally
 	// The client speaks vshdproto TLV directly, so we just relay bytes between

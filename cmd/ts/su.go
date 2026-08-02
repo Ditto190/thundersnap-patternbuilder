@@ -170,7 +170,8 @@ func runAsSu(args []string) {
 
 // identityEnv returns a minimal environment for a switched-to user: HOME, USER,
 // LOGNAME, SHELL, and PATH. It carries TERM (so a PTY shell renders correctly)
-// from the current environment but otherwise starts clean so a login shell
+// and any THUNDERSNAP_* session-descriptor vars the daemon injected upstream
+// (THUNDERSNAP_HOST, THUNDERSNAP_FRAME) so a PS1 can show them from the current environment but otherwise starts clean so a login shell
 // re-reads its profile rather than inheriting the caller's session vars.
 func identityEnv(user, home, shell string) []string {
 	path := os.Getenv("PATH")
@@ -186,6 +187,11 @@ func identityEnv(user, home, shell string) []string {
 	}
 	if term := os.Getenv("TERM"); term != "" {
 		env = append(env, "TERM="+term)
+	}
+	for _, e := range os.Environ() {
+		if strings.HasPrefix(e, "THUNDERSNAP_") {
+			env = append(env, e)
+		}
 	}
 	return env
 }

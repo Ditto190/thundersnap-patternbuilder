@@ -331,7 +331,7 @@ func mcpBashToolHandler(ctx context.Context, req *mcp.CallToolRequest) (*mcp.Cal
 		return textResult(fmt.Sprintf("abs rootfs: %v", err), true)
 	}
 	wrapped := "cd " + shellQuote(params.Workdir) + " && " + params.Command
-	writeVshdRequest(conn, strings.TrimPrefix(absRootFS, "/"), params.User, false, []string{"sh", "-c", wrapped})
+	writeVshdRequest(conn, strings.TrimPrefix(absRootFS, "/"), params.User, false, []string{"sh", "-c", wrapped}, thundersnapSessionEnv(key.user, uuid))
 
 	j := &mcpJob{
 		id: id, label: params.Label, command: params.Command, workdir: params.Workdir, unixUser: params.User,

@@ -56,6 +56,12 @@ func writeVshdHeader(conn net.Conn, framePath, user string, pty bool, args []str
 			return err
 		}
 	}
+	// Env block (must mirror writeVshdRequest): a null-delimited count of
+	// KEY=VAL entries. The test harness injects none; the count is still sent
+	// so vshd's readEnv completes before the stream switches to TLV framing.
+	if _, err := fmt.Fprintf(conn, "%d\x00", 0); err != nil {
+		return err
+	}
 	return nil
 }
 

@@ -55,6 +55,7 @@ func TestContainer(t *testing.T) {
 		// Foundational session behavior: if these fail, the rest is moot.
 		{"FrameForkCreatesRef", testFrameForkCreatesRef},
 		{"SSHContainerBasic", testSSHContainerBasic},
+		{"SessionEnvVars", testSessionEnvVars},
 		{"SSHContainerUserRoot", testSSHContainerUserRoot},
 		{"SSHContainerUserNonRoot", testSSHContainerUserNonRoot},
 		{"SSHContainerWorkingDir", testSSHContainerWorkingDir},

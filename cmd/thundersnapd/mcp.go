@@ -175,7 +175,7 @@ func runInFrame(ctx context.Context, user, frame, workdir, command string) (*mcp
 		workdir = "/work"
 	}
 
-	rootFS, _, err := resolveFrameRootFS(user, frame)
+	rootFS, uuid, err := resolveFrameRootFS(user, frame)
 	if err != nil {
 		return nil, fmt.Errorf("resolve frame: %w", err)
 	}
@@ -214,7 +214,7 @@ func runInFrame(ctx context.Context, user, frame, workdir, command string) (*mcp
 	// Aperture's local backend setting cmd.Dir = workdir: if the dir doesn't
 	// exist, cd fails and && short-circuits so the command doesn't run.
 	wrapped := "cd " + shellQuote(workdir) + " && " + command
-	writeVshdRequest(conn, framePathHdr, "root", false, []string{"sh", "-c", wrapped})
+	writeVshdRequest(conn, framePathHdr, "root", false, []string{"sh", "-c", wrapped}, thundersnapSessionEnv(user, uuid))
 
 	// Collect frames in a goroutine; on ctx cancel (timeout), close the conn to
 	// unblock the collector's ReadFrame and tear down vshd's process group.
