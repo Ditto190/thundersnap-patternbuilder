@@ -131,23 +131,25 @@ func mcpJobScopeDir(key mcpJobScopeKey) string {
 }
 
 type mcpJobStatus struct {
-	ID            string      `json:"id"`
-	Label         string      `json:"label,omitempty"`
-	State         mcpJobState `json:"state"`
-	Frame         string      `json:"frame"`
-	Command       string      `json:"command"`
-	Workdir       string      `json:"workdir"`
-	User          string      `json:"user"`
-	CombinedLog   string      `json:"combined_log"`
-	StdoutLog     string      `json:"stdout_log"`
-	StderrLog     string      `json:"stderr_log"`
-	CombinedBytes int64       `json:"combined_bytes"`
-	StdoutBytes   int64       `json:"stdout_bytes"`
-	StderrBytes   int64       `json:"stderr_bytes"`
-	ExitCode      *int        `json:"exit_code,omitempty"`
-	StartedAt     string      `json:"started_at"`
-	EndedAt       string      `json:"ended_at,omitempty"`
-	ElapsedMS     int64       `json:"elapsed_ms"`
+	ID              string      `json:"id"`
+	Label           string      `json:"label,omitempty"`
+	State           mcpJobState `json:"state"`
+	Frame           string      `json:"frame"`
+	Command         string      `json:"command"`
+	Workdir         string      `json:"workdir"`
+	User            string      `json:"user"`
+	CombinedLog     string      `json:"combined_log"`
+	StdoutLog       string      `json:"stdout_log"`
+	StderrLog       string      `json:"stderr_log"`
+	CombinedBytes   int64       `json:"combined_bytes"`
+	StdoutBytes     int64       `json:"stdout_bytes"`
+	StderrBytes     int64       `json:"stderr_bytes"`
+	ExitCode        *int        `json:"exit_code,omitempty"`
+	StartedAt       string      `json:"started_at"`
+	EndedAt         string      `json:"ended_at,omitempty"`
+	ElapsedMS       int64       `json:"elapsed_ms"`
+	Output          *string     `json:"output,omitempty"`
+	OutputTruncated *bool       `json:"output_truncated,omitempty"`
 }
 
 func jobStatusLocked(j *mcpJob, now time.Time) mcpJobStatus {
@@ -207,6 +209,41 @@ func statusesLocked(jobs []*mcpJob) []mcpJobStatus {
 	return out
 }
 
+func includeJobOutput(key mcpJobScopeKey, statuses []mcpJobStatus) error {
+	for i := range statuses {
+		rootFS, _, err := resolveFrameRootFS(key.user, statuses[i].Frame)
+		if err != nil {
+			return fmt.Errorf("resolve frame for job %s output: %w", statuses[i].ID, err)
+		}
+		hostPath := filepath.Join(rootFS, strings.TrimPrefix(statuses[i].CombinedLog, "/"))
+		if !isWithinRootFS(hostPath, rootFS) {
+			return fmt.Errorf("job %s log path escaped frame", statuses[i].ID)
+		}
+		f, err := os.Open(hostPath)
+		if err != nil {
+			return fmt.Errorf("read job %s output: %w", statuses[i].ID, err)
+		}
+		start := statuses[i].CombinedBytes - mcpMaxViewOutput
+		if start < 0 {
+			start = 0
+		}
+		if _, err := f.Seek(start, io.SeekStart); err != nil {
+			f.Close()
+			return fmt.Errorf("seek job %s output: %w", statuses[i].ID, err)
+		}
+		data, err := io.ReadAll(io.LimitReader(f, mcpMaxViewOutput))
+		f.Close()
+		if err != nil {
+			return fmt.Errorf("read job %s output: %w", statuses[i].ID, err)
+		}
+		output := strings.ToValidUTF8(string(data), "")
+		truncated := start > 0
+		statuses[i].Output = &output
+		statuses[i].OutputTruncated = &truncated
+	}
+	return nil
+}
+
 func jsonToolResult(v any, isError bool) (*mcp.CallToolResult, error) {
 	b, err := json.Marshal(v)
 	if err != nil {
@@ -215,6 +252,97 @@ func jsonToolResult(v any, isError bool) (*mcp.CallToolResult, error) {
 	return textResult(string(b), isError)
 }
 
+func callToolResultText(result *mcp.CallToolResult) string {
+	if result == nil || len(result.Content) == 0 {
+		return ""
+	}
+	if text, ok := result.Content[0].(*mcp.TextContent); ok {
+		return text.Text
+	}
+	return ""
+}
+
+// mcpJobsToolHandler is the public command-execution API. It composes the
+// internal launch and wait handlers so all launches are submitted in array
+// order before waiting. This avoids relying on an MCP client's sibling-tool
+// call scheduling while still allowing the launched commands to run in
+// parallel.
+func mcpJobsToolHandler(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	key, err := mcpJobScopeFromRequest(ctx, req)
+	if err != nil {
+		return textResult(err.Error(), true)
+	}
+	var params struct {
+		Launch []json.RawMessage `json:"launch"`
+		Wait   *struct {
+			JobIDs        []string `json:"job_ids"`
+			AfterRevision uint64   `json:"after_revision"`
+			Until         string   `json:"until"`
+			Timeout       int      `json:"timeout"`
+			IncludeOutput bool     `json:"include_output"`
+		} `json:"wait"`
+	}
+	if len(req.Params.Arguments) > 0 {
+		if err := json.Unmarshal(req.Params.Arguments, &params); err != nil {
+			return textResult(fmt.Sprintf("invalid input: %v", err), true)
+		}
+	}
+	if len(params.Launch) == 0 && params.Wait == nil {
+		return textResult("at least one of launch or wait is required", true)
+	}
+	if len(params.Launch) > 0 && params.Wait != nil && len(params.Wait.JobIDs) > 0 {
+		return textResult("wait.job_ids must be omitted when launch is present; the wait automatically selects jobs launched by this call", true)
+	}
+
+	launchedIDs := make([]string, 0, len(params.Launch))
+	for i, launch := range params.Launch {
+		launchReq := &mcp.CallToolRequest{Params: &mcp.CallToolParamsRaw{
+			Meta: req.Params.Meta, Arguments: launch,
+		}}
+		result, err := mcpBashToolHandler(ctx, launchReq)
+		if err != nil {
+			return nil, err
+		}
+		if result.IsError {
+			return textResult(fmt.Sprintf("launch[%d] failed after starting jobs %v: %s", i, launchedIDs, callToolResultText(result)), true)
+		}
+		var started struct {
+			JobID string `json:"job_id"`
+		}
+		if err := json.Unmarshal([]byte(callToolResultText(result)), &started); err != nil || started.JobID == "" {
+			return textResult(fmt.Sprintf("launch[%d] returned an invalid result after starting jobs %v", i, launchedIDs), true)
+		}
+		launchedIDs = append(launchedIDs, started.JobID)
+	}
+
+	if params.Wait != nil {
+		waitArgs := *params.Wait
+		if len(launchedIDs) > 0 {
+			waitArgs.JobIDs = launchedIDs
+		}
+		arguments, err := json.Marshal(waitArgs)
+		if err != nil {
+			return textResult(fmt.Sprintf("marshal wait request: %v", err), true)
+		}
+		return mcpJobsWaitToolHandler(ctx, &mcp.CallToolRequest{Params: &mcp.CallToolParamsRaw{
+			Meta: req.Params.Meta, Arguments: arguments,
+		}})
+	}
+
+	l := mcpJobs.list(key)
+	l.mu.Lock()
+	jobs, err := selectJobsLocked(l, launchedIDs)
+	if err != nil {
+		l.mu.Unlock()
+		return textResult(err.Error(), true)
+	}
+	result := map[string]any{"reason": "started", "revision": l.revision, "jobs": statusesLocked(jobs)}
+	l.mu.Unlock()
+	return jsonToolResult(result, false)
+}
+
+// mcpBashToolHandler is an internal single-job launch primitive used by
+// mcpJobsToolHandler. It is deliberately not registered as an MCP tool.
 func mcpBashToolHandler(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	key, err := mcpJobScopeFromRequest(ctx, req)
 	if err != nil {
@@ -466,6 +594,7 @@ func mcpJobsWaitToolHandler(ctx context.Context, req *mcp.CallToolRequest) (*mcp
 		AfterRevision uint64   `json:"after_revision"`
 		Until         string   `json:"until"`
 		Timeout       int      `json:"timeout"`
+		IncludeOutput bool     `json:"include_output"`
 	}
 	if len(req.Params.Arguments) > 0 {
 		if err := json.Unmarshal(req.Params.Arguments, &params); err != nil {
@@ -515,9 +644,15 @@ func mcpJobsWaitToolHandler(ctx context.Context, req *mcp.CallToolRequest) (*mcp
 			}
 		}
 		if satisfied {
-			result := map[string]any{"reason": params.Until, "revision": l.revision, "jobs": statusesLocked(jobs)}
+			revision := l.revision
+			statuses := statusesLocked(jobs)
 			l.mu.Unlock()
-			return jsonToolResult(result, false)
+			if params.IncludeOutput {
+				if err := includeJobOutput(key, statuses); err != nil {
+					return textResult(err.Error(), true)
+				}
+			}
+			return jsonToolResult(map[string]any{"reason": params.Until, "revision": revision, "jobs": statuses}, false)
 		}
 		changed := l.changed
 		l.mu.Unlock()
@@ -531,9 +666,15 @@ func mcpJobsWaitToolHandler(ctx context.Context, req *mcp.CallToolRequest) (*mcp
 				l.mu.Unlock()
 				return textResult(err.Error(), true)
 			}
-			result := map[string]any{"reason": "timeout", "revision": l.revision, "jobs": statusesLocked(jobs)}
+			revision := l.revision
+			statuses := statusesLocked(jobs)
 			l.mu.Unlock()
-			return jsonToolResult(result, false)
+			if params.IncludeOutput {
+				if err := includeJobOutput(key, statuses); err != nil {
+					return textResult(err.Error(), true)
+				}
+			}
+			return jsonToolResult(map[string]any{"reason": "timeout", "revision": revision, "jobs": statuses}, false)
 		}
 	}
 }

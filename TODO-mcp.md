@@ -250,14 +250,18 @@ can launch concurrent work and observe it through short wait calls.
 - [x] Implement conversation-scoped job manager keyed by `(resolved user,
   Aperture conversation ID)`, with short per-scope job IDs and jobs that may
   target any frame.
-- [x] Change `thundersnap_bash` to start a supervised job and return promptly;
-  preserve combined/stdout/stderr logs inside the resolved frame, record exit
-  code/state/counters, and enforce a hard runtime limit.
-- [x] Add `thundersnap_jobs_wait` with revision-based, race-free `output`,
-  `any_exit`, and `all_exit` predicates plus a non-destructive wait timeout.
+- [x] Add `thundersnap_jobs`, the single public execution tool: it launches a
+  batch of supervised jobs before optionally waiting for exactly that batch,
+  preserving combined/stdout/stderr logs, exit state/counters, hard runtime
+  limits, and revision-based race-free `output`, `any_exit`, and `all_exit`
+  waits. `include_output` returns a bounded combined-log tail. The earlier
+  separate `thundersnap_bash` and `thundersnap_jobs_wait` tools were removed
+  before release to keep the consumer API unambiguous.
 - [x] Add `thundersnap_jobs_list` and `thundersnap_jobs_kill`; killing uses
   the existing whole-process-group vshd disconnect cleanup.
-- [x] Add `tail_lines` to `thundersnap_view` for live and completed job logs.
+- [x] Add `tail_lines` to `thundersnap_view` for live and completed job logs;
+  `job_id` plus optional combined/stdout/stderr stream selection infers the
+  frame and log path.
 - [~] Add unit and e2e coverage for the edge-case matrix in
   `mcp-background-bash.md`; use that checklist during code review. Current
   coverage includes required conversation metadata, same-conversation reuse

@@ -488,6 +488,8 @@ func textResult(text string, isError bool) (*mcp.CallToolResult, error) {
 func mcpViewToolHandler(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	var params struct {
 		Path      string `json:"path"`
+		JobID     string `json:"job_id"`
+		Stream    string `json:"stream"`
 		ViewRange []int  `json:"view_range"`
 		TailLines int    `json:"tail_lines"`
 		Frame     string `json:"frame"`
@@ -497,8 +499,44 @@ func mcpViewToolHandler(ctx context.Context, req *mcp.CallToolRequest) (*mcp.Cal
 			return textResult(fmt.Sprintf("invalid input: %v", err), true)
 		}
 	}
-	if params.Path == "" {
-		return textResult("path is required", true)
+	if (params.Path == "") == (params.JobID == "") {
+		return textResult("exactly one of path or job_id is required", true)
+	}
+	if params.JobID != "" {
+		if params.Frame != "" {
+			return textResult("frame must be omitted with job_id; the job's frame is used", true)
+		}
+		if params.Stream == "" {
+			params.Stream = "combined"
+		}
+		key, err := mcpJobScopeFromRequest(ctx, req)
+		if err != nil {
+			return textResult(err.Error(), true)
+		}
+		l := mcpJobs.list(key)
+		l.mu.Lock()
+		jobs, err := selectJobsLocked(l, []string{params.JobID})
+		if err != nil {
+			l.mu.Unlock()
+			return textResult(err.Error(), true)
+		}
+		job := jobs[0]
+		params.Frame = job.frame
+		switch params.Stream {
+		case "combined":
+			params.Path = job.combinedLog
+		case "stdout":
+			params.Path = job.stdoutLog
+		case "stderr":
+			params.Path = job.stderrLog
+		default:
+			l.mu.Unlock()
+			return textResult("stream must be combined, stdout, or stderr", true)
+		}
+		l.mu.Unlock()
+	}
+	if params.Stream != "" && params.JobID == "" {
+		return textResult("stream is only valid with job_id", true)
 	}
 	if params.TailLines < 0 {
 		return textResult("tail_lines must be positive", true)
@@ -772,46 +810,54 @@ func newMCPServer() *mcp.Server {
 		Title:   "Thundersnap Sandbox",
 		Version: mcpDaemonVersion,
 	}, &mcp.ServerOptions{
-		Instructions: "Thundersnap differs from a conventional foreground bash harness: " +
-			"thundersnap_bash only STARTS a supervised background job and returns a short job ID immediately; " +
-			"it never waits for command output or exit. Start any independent jobs first, then call " +
-			"thundersnap_jobs_wait (usually until=all_exit for foreground-like behavior), inspect status with " +
-			"thundersnap_jobs_list, read live/completed logs with thundersnap_view tail_lines, and stop jobs with " +
-			"thundersnap_jobs_kill. Jobs belong to this Aperture conversation but may target different frames. " +
-			"Each job is a fresh non-PTY sh -c process: filesystem changes persist in the frame, but cd/export/shell " +
-			"state does not carry to another job. Run as user=\"user\" by default for normal work; use user=\"root\" " +
-			"only when administrative privileges are needed.",
+		Instructions: "Use thundersnap_jobs for all shell command execution. Put every independent command in one " +
+			"launch array and include wait={until:\"all_exit\",include_output:true} to launch them all concurrently " +
+			"and receive their results in this single tool call. Omit wait to leave long-running jobs in the background; " +
+			"a later thundersnap_jobs call with wait can monitor them. Use thundersnap_jobs_list to recover status, " +
+			"thundersnap_view with job_id to inspect logs, and thundersnap_jobs_kill to stop jobs. Jobs belong to this " +
+			"Aperture conversation but may target different frames. Each job is a fresh non-PTY sh -c process: filesystem " +
+			"changes persist in the frame, but cd/export/shell state does not carry to another job. Run as user=\"user\" " +
+			"by default; use user=\"root\" only when administrative privileges are needed.",
 	})
 
-	// Background bash starts a supervised job and returns immediately. Aperture
-	// serializes tool calls, so quick starts followed by jobs_wait still permit
-	// the commands themselves to overlap.
+	launchSchema := map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"command":      map[string]any{"type": "string", "description": "The shell command to run."},
+			"frame":        map[string]any{"type": "string", "description": "Frame name or UUID. Defaults to the user's current/only frame."},
+			"workdir":      map[string]any{"type": "string", "description": "Initial working directory inside the frame (default /work); applies only to this job."},
+			"label":        map[string]any{"type": "string", "description": "Optional. Use mainly to distinguish several or long-running jobs; omit for quick commands."},
+			"user":         map[string]any{"type": "string", "enum": []string{"user", "root"}, "description": "Unix account inside the frame. Defaults to user; use root only for administrative operations."},
+			"hard_timeout": map[string]any{"type": "integer", "description": "Total job lifetime in seconds (default/max 7200)."},
+		},
+		"required": []string{"command"},
+	}
+	waitSchema := map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"job_ids":        map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Existing jobs to observe for a wait-only call. Omit when launch is present; newly launched jobs are selected automatically."},
+			"after_revision": map[string]any{"type": "integer", "description": "Latest revision already observed. Only newer events satisfy output or any_exit; ignored by all_exit."},
+			"until":          map[string]any{"type": "string", "enum": []string{"output", "any_exit", "all_exit"}, "description": "Wake condition (default any_exit). Use all_exit for foreground-style execution."},
+			"timeout":        map[string]any{"type": "integer", "description": "Wait duration in seconds (default 30, max 60). A timeout does not stop jobs."},
+			"include_output": map[string]any{"type": "boolean", "description": "Include up to the final 16KB of each selected job's combined output. Full output remains available through view(job_id)."},
+		},
+	}
 	s.AddTool(&mcp.Tool{
-		Name: "thundersnap_bash",
-		Description: "START a supervised BACKGROUND shell job and return its job ID immediately; unlike Bash tools in " +
-			"many harnesses, this call NEVER waits for output or exit, and a successful start does not mean the command " +
-			"succeeded. To emulate foreground execution, call this tool and then thundersnap_jobs_wait with the returned " +
-			"revision and until=all_exit; inspect exit_code in the resulting job status. Start several jobs before waiting " +
-			"to run them concurrently, including jobs in different frames. The job is scoped to this Aperture conversation " +
-			"and runs as a fresh non-PTY `sh -c <command>` in /work (override with workdir), so frame filesystem changes " +
-			"persist but cd/export/shell state does not carry to later jobs. user defaults to `user`, the non-root account " +
-			"recommended for most work; choose `root` only for administrative operations. Complete combined/stdout/stderr " +
-			"logs are stored inside the target frame and can be read while running with thundersnap_view tail_lines. Use " +
-			"thundersnap_jobs_list to recover IDs/status, thundersnap_jobs_wait to monitor, and thundersnap_jobs_kill to stop. " +
-			"hard_timeout is total job lifetime, defaults to 7200 seconds, and is capped at 7200 seconds.",
+		Name: "thundersnap_jobs",
+		Description: "Launch shell jobs and optionally wait, all in one serialized request. For normal command execution, " +
+			"put every independent command in launch and set wait={until:\"all_exit\",include_output:true}; all jobs are " +
+			"started before waiting, so they run concurrently even if the MCP client schedules tool calls in parallel. " +
+			"Use launch without wait for background services. Use wait without launch to monitor existing job_ids. When " +
+			"launch and wait are both present, wait.job_ids must be omitted and exactly the newly launched jobs are selected. " +
+			"At least one of launch or wait is required. A wait timeout is a successful snapshot and never kills jobs.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
-				"command":      map[string]any{"type": "string", "description": "The shell command to run."},
-				"frame":        map[string]any{"type": "string", "description": "Frame name or UUID. Defaults to the user's current/only frame."},
-				"workdir":      map[string]any{"type": "string", "description": "Initial working directory inside the frame (default /work); it applies only to this job."},
-				"label":        map[string]any{"type": "string", "description": "Optional short human-readable label for remembering this job; job_id remains authoritative."},
-				"user":         map[string]any{"type": "string", "enum": []string{"user", "root"}, "description": "Unix account inside the frame. Defaults to `user` (non-root, recommended for most work); use `root` only when administrative privileges are required."},
-				"hard_timeout": map[string]any{"type": "integer", "description": "Total job lifetime in seconds (default/max 7200)."},
+				"launch": map[string]any{"type": "array", "items": launchSchema, "description": "Jobs to start in array order. Commands run concurrently after they are started."},
+				"wait":   waitSchema,
 			},
-			"required": []string{"command"},
 		},
-	}, mcpBashToolHandler)
+	}, mcpJobsToolHandler)
 
 	s.AddTool(&mcp.Tool{
 		Name: "thundersnap_jobs_list",
@@ -819,27 +865,11 @@ func newMCPServer() *mcp.Server {
 			"used by the conversation. Use this to recover forgotten job IDs, log paths, revisions, states, and exit codes. " +
 			"Omit job_ids to list all jobs in this conversation; jobs from other conversations are never included. " +
 			"State running is non-terminal; exited, timed_out, killed, and lost are terminal. A non-zero exit_code " +
-			"means the command failed even though the original thundersnap_bash start succeeded.",
+			"means the command failed even though its launch succeeded.",
 		InputSchema: map[string]any{"type": "object", "properties": map[string]any{
 			"job_ids": map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Optional filter: status for only these job IDs. Omit or pass [] to list every job in this conversation."},
 		}},
 	}, mcpJobsListToolHandler)
-	s.AddTool(&mcp.Tool{
-		Name: "thundersnap_jobs_wait",
-		Description: "Block this tool call until selected background-job state changes; the jobs continue independently. " +
-			"Use after_revision from the latest bash/list/wait result to avoid immediately rediscovering old events. " +
-			"until=output returns when selected log output is newer than that revision; until=any_exit returns when one " +
-			"selected job newly becomes terminal; until=all_exit returns when every selected job is currently terminal " +
-			"and is the normal foreground-style wait. Omit job_ids to select every job in this conversation. A reason=timeout " +
-			"response is normal, does NOT kill jobs, and means call wait again if work is still running. Always inspect each " +
-			"returned state and exit_code; wait success does not imply command success.",
-		InputSchema: map[string]any{"type": "object", "properties": map[string]any{
-			"job_ids":        map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Job IDs to observe. Omit or pass [] to select all jobs in this Aperture conversation."},
-			"after_revision": map[string]any{"type": "integer", "description": "Latest revision already observed, from bash/list/wait. Only newer output/exit events satisfy output or any_exit; omit or 0 to match any. Ignored by all_exit, which checks current terminality."},
-			"until":          map[string]any{"type": "string", "enum": []string{"output", "any_exit", "all_exit"}, "description": "Wake condition (defaults to any_exit). output: selected log output grew after after_revision; any_exit: one selected job became terminal after after_revision; all_exit: every selected job is currently terminal (the foreground-style wait)."},
-			"timeout":        map[string]any{"type": "integer", "description": "Wait duration in seconds (default 30, max 60)."},
-		}},
-	}, mcpJobsWaitToolHandler)
 	s.AddTool(&mcp.Tool{
 		Name: "thundersnap_jobs_kill",
 		Description: "Stop selected background jobs, including child and grandchild processes, then wait until teardown is " +
@@ -853,18 +883,26 @@ func newMCPServer() *mcp.Server {
 	// view
 	s.AddTool(&mcp.Tool{
 		Name: "thundersnap_view",
-		Description: "Synchronously view a file or directory listing in a thundersnap frame; unlike thundersnap_bash, " +
-			"this tool returns the requested content directly. For a file, prints lines with line numbers (use view_range " +
-			"[start, end] to limit; end=-1 means to EOF), or use tail_lines to inspect the currently available final lines " +
-			"of a running or completed job log without starting another job. For a directory, " +
-			"lists up to 200 entries (maxdepth 2). Output is truncated to " +
-			"16K bytes. A non-zero exit (e.g. file not found) is an error result.",
+		Description: "Synchronously view either a path or a job log. Pass exactly one of path or job_id. With job_id, " +
+			"the job's frame and log path are inferred; stream may be combined (default), stdout, or stderr. For a file, " +
+			"prints lines with line numbers (use view_range [start, end], end=-1 for EOF), or use tail_lines for final " +
+			"lines of a running/completed log. For a directory, lists up to 200 entries (maxdepth 2). Output is truncated " +
+			"to 16K bytes. A non-zero exit such as file-not-found is an error result.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
 				"path": map[string]any{
 					"type":        "string",
-					"description": "Absolute path inside the frame to view.",
+					"description": "Absolute path inside the frame to view. Mutually exclusive with job_id.",
+				},
+				"job_id": map[string]any{
+					"type":        "string",
+					"description": "Conversation job ID whose log to view. Mutually exclusive with path; frame is inferred.",
+				},
+				"stream": map[string]any{
+					"type":        "string",
+					"enum":        []string{"combined", "stdout", "stderr"},
+					"description": "Log stream for job_id (default combined). Invalid with path.",
 				},
 				"view_range": map[string]any{
 					"type":        "array",
@@ -880,7 +918,6 @@ func newMCPServer() *mcp.Server {
 					"description": "Frame name or UUID. Defaults to the user's current/only frame.",
 				},
 			},
-			"required": []string{"path"},
 		},
 	}, mcpViewToolHandler)
 

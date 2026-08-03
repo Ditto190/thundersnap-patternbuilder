@@ -2,11 +2,11 @@
 
 ## Status
 
-Design and implementation plan for replacing the blocking `thundersnap_bash`
-tool with supervised background jobs. The primary client is Aperture chat,
-whose tool loop executes sibling calls sequentially and only exposes terminal
-tool results. Short `start` calls followed by `wait` calls let commands execute
-concurrently without requiring partial MCP tool results.
+Design and implementation notes for supervised background jobs. The public
+`thundersnap_jobs` tool batches launches and an optional wait into one request,
+so all commands are started before waiting regardless of how the MCP client
+schedules sibling tool calls. This also works with Aperture chat, which only
+exposes terminal tool results.
 
 ## Goals
 
@@ -78,82 +78,45 @@ mixing independent chats.
 
 ## MCP tools
 
-### `thundersnap_bash`
+### `thundersnap_jobs`
 
-Starts a supervised non-PTY job and returns immediately.
-
-Input:
-
-```json
-{
-  "command": "make test",
-  "frame": "optional ref or UUID",
-  "workdir": "/work",
-  "user": "user",
-  "label": "optional model-readable label",
-  "hard_timeout": 7200
-}
-```
-
-- `command` is required.
-- `frame` has the existing semantics, including default-frame creation.
-- `workdir` defaults to `/work`.
-- `user` is either `user` or `root` and defaults to `user`. The non-root
-  `user` account is the right choice for most development work; use `root`
-  only when the command genuinely needs administrative privileges.
-- `label` is optional and does not have to be unique.
-- `hard_timeout` is the total job lifetime in seconds, not the duration of a
-  later wait. It defaults to 7200 seconds and is clamped to the configured
-  maximum.
-
-Output is structured JSON containing at least:
+This is the single public command-execution tool. It launches zero or more
+supervised non-PTY jobs and can then wait for them in the same serialized MCP
+request:
 
 ```json
 {
-  "job_id": "j1",
-  "label": "unit tests",
-  "state": "running",
-  "revision": 1,
-  "frame": "resolved-frame-uuid",
-  "combined_log": "/.thundersnap/jobs/<scope>/<job>/combined.log",
-  "stdout_log": "/.thundersnap/jobs/<scope>/<job>/stdout.log",
-  "stderr_log": "/.thundersnap/jobs/<scope>/<job>/stderr.log"
+  "launch": [
+    {"command":"make test", "label":"tests", "frame":"dev"},
+    {"command":"make lint", "frame":"dev"}
+  ],
+  "wait": {"until":"all_exit", "timeout":60, "include_output":true}
 }
 ```
 
-The short ID is unique within the conversation task list. The real server-side
-key includes the user and conversation ID.
+Every launch is submitted in array order before waiting, so commands run
+concurrently without relying on the MCP client to serialize sibling tool
+calls. `label` is optional; it is mainly useful for distinguishing several or
+long-running jobs and should be omitted for quick commands. Launch entries
+also accept `workdir` (default `/work`), `user` (`user` by default or `root`),
+and `hard_timeout` (default/maximum 7200 seconds).
 
-### `thundersnap_jobs_wait`
+The tool accepts at least one of `launch` or `wait`:
 
-Waits until a selected condition becomes true or a short wait deadline expires.
-It never changes the jobs' hard deadlines.
+- `launch` only starts jobs and returns `reason:"started"` immediately.
+- `wait` only monitors existing `wait.job_ids`; omitted IDs mean every job in
+  the conversation.
+- `launch` plus `wait` starts every job first, then selects exactly those new
+  jobs. `wait.job_ids` is rejected in this form to avoid ambiguity.
 
-Input:
+Wait conditions are `output`, `any_exit`, and `all_exit`. `after_revision`
+provides the existing race-free event cursor. A wait timeout is a successful
+snapshot and never kills jobs. With `include_output:true`, each returned job
+includes the final 16 KiB of its combined log plus `output_truncated`; the
+complete combined/stdout/stderr logs remain in the frame.
 
-```json
-{
-  "job_ids": ["j1", "j2"],
-  "after_revision": 7,
-  "until": "output",
-  "timeout": 30
-}
-```
-
-- Empty/omitted `job_ids` means all jobs in this conversation task list.
-- `after_revision` is the revision returned by a prior start/list/wait call.
-- `until` is one of:
-  - `output`: selected output changed after `after_revision`.
-  - `any_exit`: at least one selected job became terminal after
-    `after_revision`.
-  - `all_exit`: every selected job is currently terminal.
-- `timeout` is the wait-call timeout in seconds, default 30, with a short hard
-  ceiling. A timeout is a successful result with `reason: "timeout"`; it does
-  not kill anything.
-
-The response includes the new task-list revision, the reason that woke the
-wait, and a compact status record for every selected job. The model uses the
-returned log paths and byte/line counts to read new or tail output.
+The short job ID is unique within the conversation task list. The real
+server-side key includes the user and conversation ID.
 
 The implementation uses a revision plus a replace-on-change notification
 channel (condition-variable pattern). Predicate check and subscription happen

@@ -172,12 +172,17 @@ func mcpClient(t *testing.T, baseURL string) *mcp.ClientSession {
 		got[tool.Name] = true
 	}
 	for _, want := range []string{
-		"thundersnap_bash", "thundersnap_jobs_list", "thundersnap_jobs_wait", "thundersnap_jobs_kill",
+		"thundersnap_jobs", "thundersnap_jobs_list", "thundersnap_jobs_kill",
 		"thundersnap_view", "thundersnap_create_file", "thundersnap_str_replace",
 		"thundersnap_list_frames", "thundersnap_list_refs",
 	} {
 		if !got[want] {
 			t.Fatalf("MCP server missing tool %q; got %d tools", want, len(tools.Tools))
+		}
+	}
+	for _, removed := range []string{"thundersnap_bash", "thundersnap_jobs_wait"} {
+		if got[removed] {
+			t.Fatalf("MCP server still advertises removed tool %q", removed)
 		}
 	}
 	t.Logf("MCP server advertises %d tools (all expected tools present)", len(tools.Tools))
@@ -197,6 +202,19 @@ func callTool(t *testing.T, session *mcp.ClientSession, name string, args map[st
 func callToolForConversation(t *testing.T, session *mcp.ClientSession, conversation, name string, args map[string]any) (text string, isError bool) {
 	t.Helper()
 
+	// Most background-job tests predate the combined jobs API. Translate their
+	// single-launch/wait helper calls at the test boundary while still invoking
+	// only the public thundersnap_jobs tool. Dedicated tests below exercise the
+	// native batched shape directly.
+	legacyLaunch := name == "thundersnap_bash"
+	if legacyLaunch {
+		name = "thundersnap_jobs"
+		args = map[string]any{"launch": []any{args}}
+	} else if name == "thundersnap_jobs_wait" {
+		name = "thundersnap_jobs"
+		args = map[string]any{"wait": args}
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 	meta := mcp.Meta{}
@@ -215,6 +233,17 @@ func callToolForConversation(t *testing.T, session *mcp.ClientSession, conversat
 		return "", res.IsError
 	}
 	if tc, ok := res.Content[0].(*mcp.TextContent); ok {
+		if legacyLaunch && !res.IsError {
+			var batch struct {
+				Revision uint64           `json:"revision"`
+				Jobs     []map[string]any `json:"jobs"`
+			}
+			if err := json.Unmarshal([]byte(tc.Text), &batch); err != nil || len(batch.Jobs) != 1 {
+				t.Fatalf("decode jobs launch result %q: %+v err=%v", tc.Text, batch, err)
+			}
+			compat, _ := json.Marshal(map[string]any{"job_id": batch.Jobs[0]["id"], "revision": batch.Revision, "job": batch.Jobs[0]})
+			return string(compat), false
+		}
 		return tc.Text, res.IsError
 	}
 	// Fall back to a JSON dump for non-text content.
@@ -747,6 +776,51 @@ func TestMCPFrameResolution(t *testing.T) {
 	}
 	if !strings.Contains(badOut, "resolve frame") && !strings.Contains(badOut, "no such frame") && !strings.Contains(badOut, "not found") {
 		t.Errorf("bash frame=<bad>: output %q missing resolve/not-found error", badOut)
+	}
+}
+
+// TestMCPJobsBatch launches two jobs and waits for exactly that batch in one
+// tool call. It pins the primary public API, concurrent execution, inline
+// output, and job-ID log lookup without copying a frame or path.
+func TestMCPJobsBatch(t *testing.T) {
+	env := newTestEnv(t)
+	d, httpBase := startDaemonWithHTTP(t, env)
+	session := mcpClient(t, httpBase)
+	createFrameForMCP(t, d, "batchframe")
+	installBusyboxAppletsInFrame(t, d, "batchframe", "sleep")
+
+	start := time.Now()
+	out, isErr := callTool(t, session, "thundersnap_jobs", map[string]any{
+		"launch": []any{
+			map[string]any{"command": "sleep 2; echo first", "frame": "batchframe", "label": "first"},
+			map[string]any{"command": "sleep 2; echo second", "frame": "batchframe"},
+		},
+		"wait": map[string]any{"until": "all_exit", "timeout": 10, "include_output": true},
+	})
+	if isErr {
+		t.Fatalf("batched jobs: %s", out)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Errorf("two 2s jobs took %v; expected concurrent execution", elapsed)
+	}
+	var result struct {
+		Reason string           `json:"reason"`
+		Jobs   []map[string]any `json:"jobs"`
+	}
+	if err := json.Unmarshal([]byte(out), &result); err != nil || result.Reason != "all_exit" || len(result.Jobs) != 2 {
+		t.Fatalf("batched jobs result %q: %+v err=%v", out, result, err)
+	}
+	for i, want := range []string{"first", "second"} {
+		if result.Jobs[i]["state"] != "exited" || result.Jobs[i]["exit_code"] != float64(0) || !strings.Contains(result.Jobs[i]["output"].(string), want) {
+			t.Errorf("job %d = %+v; want exited output containing %q", i, result.Jobs[i], want)
+		}
+	}
+
+	view, viewErr := callTool(t, session, "thundersnap_view", map[string]any{
+		"job_id": result.Jobs[1]["id"], "stream": "combined", "tail_lines": 5,
+	})
+	if viewErr || !strings.Contains(view, "second") {
+		t.Fatalf("view by job ID: isErr=%v output=%q", viewErr, view)
 	}
 }
 
