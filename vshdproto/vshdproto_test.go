@@ -22,6 +22,7 @@ func TestFrameRoundTrip(t *testing.T) {
 		{FrameStderr, []byte("err")},
 		{FrameWinsize, EncodeWinsize(Winsize{Rows: 40, Cols: 100})},
 		{FrameExit, EncodeExit(7)},
+		{FrameSignal, EncodeSignal(15)},
 		{FrameStdout, nil}, // zero-length frame
 	}
 	for _, c := range cases {
@@ -64,6 +65,18 @@ func TestWinsizeCodec(t *testing.T) {
 
 // TestExitCodec round-trips an exit code (including negative) and rejects a
 // wrong-length payload.
+func TestSignalCodec(t *testing.T) {
+	for _, sig := range []int32{1, 2, 15, 19} {
+		got, err := DecodeSignal(EncodeSignal(sig))
+		if err != nil || got != sig {
+			t.Fatalf("signal round-trip %d = %d, %v", sig, got, err)
+		}
+	}
+	if _, err := DecodeSignal([]byte{1}); err == nil {
+		t.Fatal("DecodeSignal accepted malformed payload")
+	}
+}
+
 func TestExitCodec(t *testing.T) {
 	for _, code := range []int32{0, 1, 130, -1} {
 		got, err := DecodeExit(EncodeExit(code))

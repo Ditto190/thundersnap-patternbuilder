@@ -10,8 +10,8 @@
 //
 //	frame = type:uint8 | length:uint32 (big-endian) | payload[length]
 //
-// Host -> guest frames carry terminal input (FrameStdin) and window-size changes
-// (FrameWinsize). Guest -> host frames carry program output (FrameStdout,
+// Host -> guest frames carry terminal input (FrameStdin), window-size changes
+// (FrameWinsize), and process-group signals (FrameSignal). Guest -> host frames carry program output (FrameStdout,
 // FrameStderr) and the final exit status (FrameExit). A PTY session is signalled
 // by the host sending a leading FrameWinsize before any FrameStdin; the guest
 // then allocates a pty sized to that winsize and applies later FrameWinsize
@@ -31,6 +31,7 @@ const (
 	FrameStderr  uint8 = 3 // guest->host: program stderr
 	FrameWinsize uint8 = 4 // host->guest: Winsize (8 bytes)
 	FrameExit    uint8 = 5 // guest->host: int32 exit code (4 bytes)
+	FrameSignal  uint8 = 6 // host->guest: int32 Unix signal number (4 bytes)
 )
 
 // maxFrameLen bounds an individual frame payload to guard against a corrupt or
@@ -128,6 +129,17 @@ func EncodeExit(code int32) []byte {
 func DecodeExit(payload []byte) (int32, error) {
 	if len(payload) != 4 {
 		return 0, fmt.Errorf("vshdproto: exit payload is %d bytes, want 4", len(payload))
+	}
+	return int32(binary.BigEndian.Uint32(payload)), nil
+}
+
+// EncodeSignal serialises a Unix signal number into a FrameSignal payload.
+func EncodeSignal(sig int32) []byte { return EncodeExit(sig) }
+
+// DecodeSignal parses a FrameSignal payload.
+func DecodeSignal(payload []byte) (int32, error) {
+	if len(payload) != 4 {
+		return 0, fmt.Errorf("vshdproto: signal payload is %d bytes, want 4", len(payload))
 	}
 	return int32(binary.BigEndian.Uint32(payload)), nil
 }

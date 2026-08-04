@@ -16,6 +16,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -52,18 +53,15 @@ type mcpJob struct {
 	unixUser       string
 	frame          string
 	combinedLog    string
-	stdoutLog      string
-	stderrLog      string
 	state          mcpJobState
 	startedAt      time.Time
 	endedAt        time.Time
 	exitCode       *int
 	combinedBytes  int64
-	stdoutBytes    int64
-	stderrBytes    int64
 	outputRevision uint64
 	endRevision    uint64
 	conn           net.Conn
+	writeMu        sync.Mutex
 	stopReason     mcpJobState
 	timer          *time.Timer
 }
@@ -135,15 +133,10 @@ type mcpJobStatus struct {
 	Label           string      `json:"label,omitempty"`
 	State           mcpJobState `json:"state"`
 	Frame           string      `json:"frame"`
-	Command         string      `json:"command"`
 	Workdir         string      `json:"workdir"`
 	User            string      `json:"user"`
-	CombinedLog     string      `json:"combined_log"`
-	StdoutLog       string      `json:"stdout_log"`
-	StderrLog       string      `json:"stderr_log"`
-	CombinedBytes   int64       `json:"combined_bytes"`
-	StdoutBytes     int64       `json:"stdout_bytes"`
-	StderrBytes     int64       `json:"stderr_bytes"`
+	Log             string      `json:"log"`
+	Bytes           int64       `json:"bytes"`
 	ExitCode        *int        `json:"exit_code,omitempty"`
 	StartedAt       string      `json:"started_at"`
 	EndedAt         string      `json:"ended_at,omitempty"`
@@ -159,9 +152,7 @@ func jobStatusLocked(j *mcpJob, now time.Time) mcpJobStatus {
 	}
 	s := mcpJobStatus{
 		ID: j.id, Label: j.label, State: j.state, Frame: j.frame,
-		Command: j.command, Workdir: j.workdir, User: j.unixUser,
-		CombinedLog: j.combinedLog, StdoutLog: j.stdoutLog, StderrLog: j.stderrLog,
-		CombinedBytes: j.combinedBytes, StdoutBytes: j.stdoutBytes, StderrBytes: j.stderrBytes,
+		Workdir: j.workdir, User: j.unixUser, Log: j.combinedLog, Bytes: j.combinedBytes,
 		ExitCode: j.exitCode, StartedAt: j.startedAt.UTC().Format(time.RFC3339Nano),
 		ElapsedMS: end.Sub(j.startedAt).Milliseconds(),
 	}
@@ -209,39 +200,60 @@ func statusesLocked(jobs []*mcpJob) []mcpJobStatus {
 	return out
 }
 
-func includeJobOutput(key mcpJobScopeKey, statuses []mcpJobStatus) error {
-	for i := range statuses {
-		rootFS, _, err := resolveFrameRootFS(key.user, statuses[i].Frame)
+type mcpWaitJob struct {
+	ID     string `json:"id"`
+	Offset int64  `json:"offset"`
+}
+
+type mcpWaitStatus struct {
+	ID         string      `json:"id"`
+	State      mcpJobState `json:"state"`
+	ExitCode   *int        `json:"exit_code,omitempty"`
+	Output     string      `json:"output,omitempty"`
+	NextOffset int64       `json:"next_offset"`
+}
+
+// waitStatuses returns only output ending in CR/LF while a job is running. At
+// exit it also returns the final partial line. Offsets are raw combined-log byte
+// positions, so callers do not need a server-side revision cursor.
+func waitStatuses(key mcpJobScopeKey, jobs []*mcpJob, requested []mcpWaitJob) ([]mcpWaitStatus, error) {
+	offsets := map[string]int64{}
+	for _, r := range requested {
+		offsets[r.ID] = r.Offset
+	}
+	out := make([]mcpWaitStatus, 0, len(jobs))
+	for _, j := range jobs {
+		offset := offsets[j.id]
+		if offset < 0 || offset > j.combinedBytes {
+			return nil, fmt.Errorf("offset %d for job %s is outside log size %d", offset, j.id, j.combinedBytes)
+		}
+		rootFS, _, err := resolveFrameRootFS(key.user, j.frame)
 		if err != nil {
-			return fmt.Errorf("resolve frame for job %s output: %w", statuses[i].ID, err)
+			return nil, err
 		}
-		hostPath := filepath.Join(rootFS, strings.TrimPrefix(statuses[i].CombinedLog, "/"))
-		if !isWithinRootFS(hostPath, rootFS) {
-			return fmt.Errorf("job %s log path escaped frame", statuses[i].ID)
-		}
+		hostPath := filepath.Join(rootFS, strings.TrimPrefix(j.combinedLog, "/"))
 		f, err := os.Open(hostPath)
 		if err != nil {
-			return fmt.Errorf("read job %s output: %w", statuses[i].ID, err)
+			return nil, err
 		}
-		start := statuses[i].CombinedBytes - mcpMaxViewOutput
-		if start < 0 {
-			start = 0
-		}
-		if _, err := f.Seek(start, io.SeekStart); err != nil {
-			f.Close()
-			return fmt.Errorf("seek job %s output: %w", statuses[i].ID, err)
-		}
-		data, err := io.ReadAll(io.LimitReader(f, mcpMaxViewOutput))
+		data, err := io.ReadAll(io.LimitReader(io.NewSectionReader(f, offset, j.combinedBytes-offset), mcpMaxViewOutput))
 		f.Close()
 		if err != nil {
-			return fmt.Errorf("read job %s output: %w", statuses[i].ID, err)
+			return nil, err
 		}
-		output := strings.ToValidUTF8(string(data), "")
-		truncated := start > 0
-		statuses[i].Output = &output
-		statuses[i].OutputTruncated = &truncated
+		end := len(data)
+		if !j.terminal() {
+			end = 0
+			for i, b := range data {
+				if b == '\n' || b == '\r' {
+					end = i + 1
+				}
+			}
+		}
+		text := strings.ToValidUTF8(string(data[:end]), "")
+		out = append(out, mcpWaitStatus{ID: j.id, State: j.state, ExitCode: j.exitCode, Output: text, NextOffset: offset + int64(end)})
 	}
-	return nil
+	return out, nil
 }
 
 func jsonToolResult(v any, isError bool) (*mcp.CallToolResult, error) {
@@ -275,11 +287,10 @@ func mcpJobsToolHandler(ctx context.Context, req *mcp.CallToolRequest) (*mcp.Cal
 	var params struct {
 		Launch []json.RawMessage `json:"launch"`
 		Wait   *struct {
-			JobIDs        []string `json:"job_ids"`
-			AfterRevision uint64   `json:"after_revision"`
-			Until         string   `json:"until"`
-			Timeout       int      `json:"timeout"`
-			IncludeOutput bool     `json:"include_output"`
+			Jobs    []mcpWaitJob `json:"jobs"`
+			Until   string       `json:"until"`
+			Timeout int          `json:"timeout"`
+			Signal  string       `json:"signal"`
 		} `json:"wait"`
 	}
 	if len(req.Params.Arguments) > 0 {
@@ -290,8 +301,8 @@ func mcpJobsToolHandler(ctx context.Context, req *mcp.CallToolRequest) (*mcp.Cal
 	if len(params.Launch) == 0 && params.Wait == nil {
 		return textResult("at least one of launch or wait is required", true)
 	}
-	if len(params.Launch) > 0 && params.Wait != nil && len(params.Wait.JobIDs) > 0 {
-		return textResult("wait.job_ids must be omitted when launch is present; the wait automatically selects jobs launched by this call", true)
+	if len(params.Launch) > 0 && params.Wait != nil && len(params.Wait.Jobs) > 0 {
+		return textResult("wait.jobs must be omitted when launch is present; the wait automatically selects jobs launched by this call", true)
 	}
 
 	launchedIDs := make([]string, 0, len(params.Launch))
@@ -318,7 +329,10 @@ func mcpJobsToolHandler(ctx context.Context, req *mcp.CallToolRequest) (*mcp.Cal
 	if params.Wait != nil {
 		waitArgs := *params.Wait
 		if len(launchedIDs) > 0 {
-			waitArgs.JobIDs = launchedIDs
+			waitArgs.Jobs = make([]mcpWaitJob, len(launchedIDs))
+			for i, id := range launchedIDs {
+				waitArgs.Jobs[i] = mcpWaitJob{ID: id, Offset: 0}
+			}
 		}
 		arguments, err := json.Marshal(waitArgs)
 		if err != nil {
@@ -367,11 +381,8 @@ func mcpBashToolHandler(ctx context.Context, req *mcp.CallToolRequest) (*mcp.Cal
 	if params.Workdir == "" {
 		params.Workdir = "/work"
 	}
-	if params.User == "" {
-		params.User = "user"
-	}
 	if params.User != "user" && params.User != "root" {
-		return textResult("user must be either \"user\" (recommended) or \"root\"", true)
+		return textResult("user is required and must be either \"user\" or \"root\"", true)
 	}
 	hardTimeout := mcpJobDefaultHardTimeout
 	if params.HardTimeout > 0 {
@@ -429,18 +440,7 @@ func mcpBashToolHandler(ctx context.Context, req *mcp.CallToolRequest) (*mcp.Cal
 	if err != nil {
 		return textResult(fmt.Sprintf("create combined log: %v", err), true)
 	}
-	stdout, err := openLog("stdout.log")
-	if err != nil {
-		combined.Close()
-		return textResult(fmt.Sprintf("create stdout log: %v", err), true)
-	}
-	stderr, err := openLog("stderr.log")
-	if err != nil {
-		combined.Close()
-		stdout.Close()
-		return textResult(fmt.Sprintf("create stderr log: %v", err), true)
-	}
-	closeLogs := func() { combined.Close(); stdout.Close(); stderr.Close() }
+	closeLogs := func() { combined.Close() }
 
 	sockPath, err := hostVshd.ensure()
 	if err != nil {
@@ -465,8 +465,6 @@ func mcpBashToolHandler(ctx context.Context, req *mcp.CallToolRequest) (*mcp.Cal
 		id: id, label: params.Label, command: params.Command, workdir: params.Workdir, unixUser: params.User,
 		frame: uuid.String(), state: mcpJobRunning, startedAt: time.Now(), conn: conn,
 		combinedLog: filepath.Join(logDirInFrame, "combined.log"),
-		stdoutLog:   filepath.Join(logDirInFrame, "stdout.log"),
-		stderrLog:   filepath.Join(logDirInFrame, "stderr.log"),
 	}
 	l.mu.Lock()
 	l.jobs[id] = j
@@ -476,7 +474,7 @@ func mcpBashToolHandler(ctx context.Context, req *mcp.CallToolRequest) (*mcp.Cal
 
 	j.timer = time.AfterFunc(hardTimeout, func() { requestMCPJobStop(l, j, mcpJobTimedOut) })
 	releaseControl = false
-	go collectMCPJob(l, j, conn, combined, stdout, stderr, func() { controlServers.releaseControlServer(rootFS) })
+	go collectMCPJob(l, j, conn, combined, func() { controlServers.releaseControlServer(rootFS) })
 
 	return jsonToolResult(map[string]any{"job_id": id, "revision": revision, "job": status}, false)
 }
@@ -496,12 +494,10 @@ func requestMCPJobStop(l *mcpJobList, j *mcpJob, reason mcpJobState) {
 	}
 }
 
-func collectMCPJob(l *mcpJobList, j *mcpJob, conn net.Conn, combined, stdout, stderr *os.File, release func()) {
+func collectMCPJob(l *mcpJobList, j *mcpJob, conn net.Conn, combined *os.File, release func()) {
 	defer release()
 	defer conn.Close()
 	defer combined.Close()
-	defer stdout.Close()
-	defer stderr.Close()
 	gotExit := false
 	for {
 		typ, payload, err := vshdproto.ReadFrame(conn)
@@ -514,18 +510,8 @@ func collectMCPJob(l *mcpJobList, j *mcpJob, conn net.Conn, combined, stdout, st
 		switch typ {
 		case vshdproto.FrameStdout, vshdproto.FrameStderr:
 			_, _ = combined.Write(payload)
-			if typ == vshdproto.FrameStdout {
-				_, _ = stdout.Write(payload)
-			} else {
-				_, _ = stderr.Write(payload)
-			}
 			l.mu.Lock()
 			j.combinedBytes += int64(len(payload))
-			if typ == vshdproto.FrameStdout {
-				j.stdoutBytes += int64(len(payload))
-			} else {
-				j.stderrBytes += int64(len(payload))
-			}
 			j.outputRevision = l.notifyLocked()
 			l.mu.Unlock()
 		case vshdproto.FrameExit:
@@ -584,17 +570,27 @@ func mcpJobsListToolHandler(ctx context.Context, req *mcp.CallToolRequest) (*mcp
 	return jsonToolResult(result, false)
 }
 
+func parseJobSignal(name string) (syscall.Signal, error) {
+	signals := map[string]syscall.Signal{"HUP": syscall.SIGHUP, "INT": syscall.SIGINT, "TERM": syscall.SIGTERM, "USR1": syscall.SIGUSR1, "USR2": syscall.SIGUSR2, "STOP": syscall.SIGSTOP, "CONT": syscall.SIGCONT}
+	if name == "" {
+		return 0, nil
+	}
+	if sig, ok := signals[strings.TrimPrefix(strings.ToUpper(name), "SIG")]; ok {
+		return sig, nil
+	}
+	return 0, fmt.Errorf("invalid signal %q (want HUP, INT, TERM, USR1, USR2, STOP, or CONT)", name)
+}
+
 func mcpJobsWaitToolHandler(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	key, err := mcpJobScopeFromRequest(ctx, req)
 	if err != nil {
 		return textResult(err.Error(), true)
 	}
 	var params struct {
-		JobIDs        []string `json:"job_ids"`
-		AfterRevision uint64   `json:"after_revision"`
-		Until         string   `json:"until"`
-		Timeout       int      `json:"timeout"`
-		IncludeOutput bool     `json:"include_output"`
+		Jobs    []mcpWaitJob `json:"jobs"`
+		Until   string       `json:"until"`
+		Timeout int          `json:"timeout"`
+		Signal  string       `json:"signal"`
 	}
 	if len(req.Params.Arguments) > 0 {
 		if err := json.Unmarshal(req.Params.Arguments, &params); err != nil {
@@ -607,19 +603,44 @@ func mcpJobsWaitToolHandler(ctx context.Context, req *mcp.CallToolRequest) (*mcp
 	if params.Until != "output" && params.Until != "any_exit" && params.Until != "all_exit" {
 		return textResult(fmt.Sprintf("invalid until %q (want output, any_exit, or all_exit)", params.Until), true)
 	}
+	sig, err := parseJobSignal(params.Signal)
+	if err != nil {
+		return textResult(err.Error(), true)
+	}
 	waitTimeout := mcpJobWaitDefaultTimeout
 	if params.Timeout > 0 {
-		waitTimeout = time.Duration(params.Timeout) * time.Second
-		if waitTimeout > mcpJobWaitMaxTimeout {
-			waitTimeout = mcpJobWaitMaxTimeout
-		}
+		waitTimeout = min(time.Duration(params.Timeout)*time.Second, mcpJobWaitMaxTimeout)
 	}
 	waitCtx, cancel := context.WithTimeout(ctx, waitTimeout)
 	defer cancel()
+	ids := make([]string, len(params.Jobs))
+	for i, job := range params.Jobs {
+		ids[i] = job.ID
+	}
 	l := mcpJobs.list(key)
+	signalSent := false
 	for {
 		l.mu.Lock()
-		jobs, err := selectJobsLocked(l, params.JobIDs)
+		jobs, err := selectJobsLocked(l, ids)
+		if err != nil {
+			l.mu.Unlock()
+			return textResult(err.Error(), true)
+		}
+		if sig != 0 && !signalSent {
+			for _, j := range jobs {
+				if !j.terminal() {
+					j.writeMu.Lock()
+					err = vshdproto.WriteFrame(j.conn, vshdproto.FrameSignal, vshdproto.EncodeSignal(int32(sig)))
+					j.writeMu.Unlock()
+					if err != nil {
+						l.mu.Unlock()
+						return textResult(fmt.Sprintf("signal job %s: %v", j.id, err), true)
+					}
+				}
+			}
+			signalSent = true
+		}
+		statuses, err := waitStatuses(key, jobs, params.Jobs)
 		if err != nil {
 			l.mu.Unlock()
 			return textResult(err.Error(), true)
@@ -627,54 +648,40 @@ func mcpJobsWaitToolHandler(ctx context.Context, req *mcp.CallToolRequest) (*mcp
 		satisfied := false
 		switch params.Until {
 		case "output":
-			for _, j := range jobs {
-				satisfied = satisfied || j.outputRevision > params.AfterRevision
+			for _, s := range statuses {
+				satisfied = satisfied || s.Output != "" || s.State != mcpJobRunning
 			}
 		case "any_exit":
 			for _, j := range jobs {
-				satisfied = satisfied || j.endRevision > params.AfterRevision
+				satisfied = satisfied || j.terminal()
 			}
 		case "all_exit":
-			// Vacuously true for an empty selection (every zero jobs are
-			// terminal), so an all_exit on a jobless conversation returns
-			// immediately instead of blocking for the full wait timeout.
 			satisfied = true
 			for _, j := range jobs {
 				satisfied = satisfied && j.terminal()
 			}
 		}
 		if satisfied {
-			revision := l.revision
-			statuses := statusesLocked(jobs)
 			l.mu.Unlock()
-			if params.IncludeOutput {
-				if err := includeJobOutput(key, statuses); err != nil {
-					return textResult(err.Error(), true)
-				}
-			}
-			return jsonToolResult(map[string]any{"reason": params.Until, "revision": revision, "jobs": statuses}, false)
+			return jsonToolResult(map[string]any{"reason": params.Until, "jobs": statuses}, false)
 		}
 		changed := l.changed
 		l.mu.Unlock()
 		select {
 		case <-changed:
-			continue
 		case <-waitCtx.Done():
 			l.mu.Lock()
-			jobs, err := selectJobsLocked(l, params.JobIDs)
+			jobs, err := selectJobsLocked(l, ids)
 			if err != nil {
 				l.mu.Unlock()
 				return textResult(err.Error(), true)
 			}
-			revision := l.revision
-			statuses := statusesLocked(jobs)
+			statuses, err := waitStatuses(key, jobs, params.Jobs)
 			l.mu.Unlock()
-			if params.IncludeOutput {
-				if err := includeJobOutput(key, statuses); err != nil {
-					return textResult(err.Error(), true)
-				}
+			if err != nil {
+				return textResult(err.Error(), true)
 			}
-			return jsonToolResult(map[string]any{"reason": "timeout", "revision": revision, "jobs": statuses}, false)
+			return jsonToolResult(map[string]any{"reason": "timeout", "jobs": statuses}, false)
 		}
 	}
 }

@@ -31,6 +31,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -167,12 +168,15 @@ var errMCPCommandTimeout = errors.New("command timed out")
 //
 // TODO: persistent shell per MCP session — v1 runs a fresh sh -c per call,
 // matching Aperture; a persistent shell would carry cd/export across calls.
-func runInFrame(ctx context.Context, user, frame, workdir, command string) (*mcpexec.ExecResult, error) {
+func runInFrame(ctx context.Context, user, frame, workdir, command, unixUser string) (*mcpexec.ExecResult, error) {
 	if user == "" {
 		return nil, fmt.Errorf("no MCP user resolved for request")
 	}
 	if workdir == "" {
 		workdir = "/work"
+	}
+	if unixUser != "user" && unixUser != "root" {
+		return nil, fmt.Errorf("user must be either \"user\" or \"root\"")
 	}
 
 	rootFS, uuid, err := resolveFrameRootFS(user, frame)
@@ -214,7 +218,7 @@ func runInFrame(ctx context.Context, user, frame, workdir, command string) (*mcp
 	// Aperture's local backend setting cmd.Dir = workdir: if the dir doesn't
 	// exist, cd fails and && short-circuits so the command doesn't run.
 	wrapped := "cd " + shellQuote(workdir) + " && " + command
-	writeVshdRequest(conn, framePathHdr, "root", false, []string{"sh", "-c", wrapped}, thundersnapSessionEnv(user, uuid))
+	writeVshdRequest(conn, framePathHdr, unixUser, false, []string{"sh", "-c", wrapped}, thundersnapSessionEnv(user, uuid))
 
 	// Collect frames in a goroutine; on ctx cancel (timeout), close the conn to
 	// unblock the collector's ReadFrame and tear down vshd's process group.
@@ -442,8 +446,8 @@ func buildCreateFileCommand(path, fileText string) string {
 	b64 := base64.StdEncoding.EncodeToString([]byte(fileText))
 	qpath := shellQuote(path)
 	return fmt.Sprintf(
-		"mkdir -p \"$(dirname %s)\" && base64 -d > %s <<'B64EOF'\n%s\nB64EOF\n",
-		qpath, qpath, b64,
+		"mkdir -p \"$(dirname %s)\" && if [ -L %s ]; then echo 'Error: refusing to overwrite symlink' >&2; exit 1; fi && base64 -d > %s <<'B64EOF'\n%s\nB64EOF\n",
+		qpath, qpath, qpath, b64,
 	)
 }
 
@@ -484,59 +488,25 @@ func textResult(text string, isError bool) (*mcp.CallToolResult, error) {
 	}, nil
 }
 
-// mcpViewToolHandler is the ToolHandler for thundersnap_view.
+// mcpViewToolHandler is the ToolHandler for view.
 func mcpViewToolHandler(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	var params struct {
 		Path      string `json:"path"`
-		JobID     string `json:"job_id"`
-		Stream    string `json:"stream"`
 		ViewRange []int  `json:"view_range"`
 		TailLines int    `json:"tail_lines"`
 		Frame     string `json:"frame"`
+		User      string `json:"user"`
 	}
 	if req.Params != nil && len(req.Params.Arguments) > 0 {
 		if err := json.Unmarshal(req.Params.Arguments, &params); err != nil {
 			return textResult(fmt.Sprintf("invalid input: %v", err), true)
 		}
 	}
-	if (params.Path == "") == (params.JobID == "") {
-		return textResult("exactly one of path or job_id is required", true)
+	if params.Path == "" {
+		return textResult("path is required", true)
 	}
-	if params.JobID != "" {
-		if params.Frame != "" {
-			return textResult("frame must be omitted with job_id; the job's frame is used", true)
-		}
-		if params.Stream == "" {
-			params.Stream = "combined"
-		}
-		key, err := mcpJobScopeFromRequest(ctx, req)
-		if err != nil {
-			return textResult(err.Error(), true)
-		}
-		l := mcpJobs.list(key)
-		l.mu.Lock()
-		jobs, err := selectJobsLocked(l, []string{params.JobID})
-		if err != nil {
-			l.mu.Unlock()
-			return textResult(err.Error(), true)
-		}
-		job := jobs[0]
-		params.Frame = job.frame
-		switch params.Stream {
-		case "combined":
-			params.Path = job.combinedLog
-		case "stdout":
-			params.Path = job.stdoutLog
-		case "stderr":
-			params.Path = job.stderrLog
-		default:
-			l.mu.Unlock()
-			return textResult("stream must be combined, stdout, or stderr", true)
-		}
-		l.mu.Unlock()
-	}
-	if params.Stream != "" && params.JobID == "" {
-		return textResult("stream is only valid with job_id", true)
+	if params.User != "user" && params.User != "root" {
+		return textResult("user is required and must be either \"user\" or \"root\"", true)
 	}
 	if params.TailLines < 0 {
 		return textResult("tail_lines must be positive", true)
@@ -544,26 +514,17 @@ func mcpViewToolHandler(ctx context.Context, req *mcp.CallToolRequest) (*mcp.Cal
 	if params.TailLines > 0 && len(params.ViewRange) > 0 {
 		return textResult("tail_lines and view_range are mutually exclusive", true)
 	}
+	var cmd string
+	var err error
 	if params.TailLines > 0 {
-		user := mcpUserFromContext(ctx)
-		rootFS, _, err := resolveFrameRootFS(user, params.Frame)
-		if err != nil {
-			return textResult(fmt.Sprintf("resolve frame: %v", err), true)
-		}
-		hostPath := filepath.Join(rootFS, strings.TrimPrefix(filepath.Clean("/"+params.Path), "/"))
-		if !isWithinRootFS(hostPath, rootFS) {
-			return textResult(fmt.Sprintf("path %q escapes the frame", params.Path), true)
-		}
-		tail, err := readTail(hostPath, params.TailLines)
-		if err != nil {
-			if os.IsNotExist(err) {
-				return textResult(fmt.Sprintf("Error: %s not found", params.Path), true)
-			}
-			return textResult(fmt.Sprintf("read %s: %v", params.Path, err), true)
-		}
-		return textResult(truncateUTF8(tail, mcpMaxViewOutput, "\n\n... output truncated ..."), false)
+		// Run under the requested Unix identity rather than reading the rootfs
+		// host-side as the daemon. The ring-buffer awk avoids requiring tail.
+		cmd = fmt.Sprintf(`path=%s
+if [ ! -f "$path" ]; then echo "Error: $path not found" >&2; exit 1; fi
+awk -v n=%d '{ lines[NR %% n] = $0 } END { start=NR-n+1; if (start < 1) start=1; for (i=start; i<=NR; i++) print lines[i %% n] }' "$path"`, shellQuote(params.Path), params.TailLines)
+	} else {
+		cmd, err = buildViewCommand(params.Path, params.ViewRange)
 	}
-	cmd, err := buildViewCommand(params.Path, params.ViewRange)
 	if err != nil {
 		return textResult(err.Error(), true)
 	}
@@ -571,7 +532,7 @@ func mcpViewToolHandler(ctx context.Context, req *mcp.CallToolRequest) (*mcp.Cal
 	ctx, cancel := context.WithTimeout(ctx, mcpViewTimeout)
 	defer cancel()
 
-	res, err := runInFrame(ctx, mcpUserFromContext(ctx), params.Frame, "", cmd)
+	res, err := runInFrame(ctx, mcpUserFromContext(ctx), params.Frame, "", cmd, params.User)
 	if err != nil {
 		if errors.Is(err, errMCPCommandTimeout) && res != nil {
 			return textResult(truncateUTF8(res.Output, mcpMaxViewOutput, "\n\n... output truncated ..."), true)
@@ -584,12 +545,13 @@ func mcpViewToolHandler(ctx context.Context, req *mcp.CallToolRequest) (*mcp.Cal
 	return textResult(truncateUTF8(res.Output, mcpMaxViewOutput, "\n\n... output truncated ..."), res.ExitCode != 0)
 }
 
-// mcpCreateFileToolHandler is the ToolHandler for thundersnap_create_file.
+// mcpCreateFileToolHandler is the ToolHandler for create_file.
 func mcpCreateFileToolHandler(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	var params struct {
 		Path     string `json:"path"`
 		FileText string `json:"file_text"`
 		Frame    string `json:"frame"`
+		User     string `json:"user"`
 	}
 	if req.Params != nil && len(req.Params.Arguments) > 0 {
 		if err := json.Unmarshal(req.Params.Arguments, &params); err != nil {
@@ -599,12 +561,15 @@ func mcpCreateFileToolHandler(ctx context.Context, req *mcp.CallToolRequest) (*m
 	if params.Path == "" {
 		return textResult("path is required", true)
 	}
+	if params.User != "user" && params.User != "root" {
+		return textResult("user is required and must be either \"user\" or \"root\"", true)
+	}
 	cmd := buildCreateFileCommand(params.Path, params.FileText)
 
 	ctx, cancel := context.WithTimeout(ctx, mcpCreateFileTimeout)
 	defer cancel()
 
-	res, err := runInFrame(ctx, mcpUserFromContext(ctx), params.Frame, "", cmd)
+	res, err := runInFrame(ctx, mcpUserFromContext(ctx), params.Frame, "", cmd, params.User)
 	if err != nil {
 		if errors.Is(err, errMCPCommandTimeout) && res != nil {
 			return textResult(res.Output, true)
@@ -617,7 +582,7 @@ func mcpCreateFileToolHandler(ctx context.Context, req *mcp.CallToolRequest) (*m
 	return textResult(fmt.Sprintf("Created %s (%d bytes)", params.Path, len(params.FileText)), false)
 }
 
-// mcpStrReplaceToolHandler is the ToolHandler for thundersnap_str_replace.
+// mcpStrReplaceToolHandler is the ToolHandler for str_replace.
 //
 // Unlike the other tools, str_replace does NOT run a command in the frame.
 // Aperture's tool_str_replace.go pipes an embedded Python program over a
@@ -697,9 +662,12 @@ func mcpStrReplaceToolHandler(ctx context.Context, req *mcp.CallToolRequest) (*m
 	// Preserve the existing file mode; os.WriteFile truncates the existing
 	// inode (no chown, no mode change for an existing file) so owner/perm
 	// survive. Stat first to surface a directory/pipe/etc. as a clean error.
-	info, err := os.Stat(hostPath)
+	info, err := os.Lstat(hostPath)
 	if err != nil {
 		return textResult(fmt.Sprintf("stat %s: %v", params.Path, err), true)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return textResult(fmt.Sprintf("Error: refusing to replace symlink %s", params.Path), true)
 	}
 	if err := os.WriteFile(hostPath, newContent, info.Mode()); err != nil {
 		return textResult(fmt.Sprintf("write %s: %v", params.Path, err), true)
@@ -711,7 +679,7 @@ func mcpStrReplaceToolHandler(ctx context.Context, req *mcp.CallToolRequest) (*m
 	return textResult(fmt.Sprintf("Replaced in %s", params.Path), false)
 }
 
-// mcpListFramesToolHandler is the ToolHandler for thundersnap_list_frames. It
+// mcpListFramesToolHandler is the ToolHandler for list_frames. It
 // does NOT launch a container: it reads the user's frame + ref stores directly,
 // so the LLM can pick an existing frame for its first bash call without
 // auto-creating a throwaway. Mirrors handleListFrames' logic.
@@ -728,31 +696,33 @@ func mcpListFramesToolHandler(ctx context.Context, req *mcp.CallToolRequest) (*m
 		return textResult(fmt.Sprintf("list frames: %v", err), true)
 	}
 
-	refByUUID := map[frameid.ID]string{}
+	refsByUUID := map[frameid.ID][]string{}
 	if names, err := refStore.List(); err == nil {
 		for _, name := range names {
 			if ref, err := refStore.Get(name); err == nil {
-				refByUUID[ref.UUID] = name
+				refsByUUID[ref.UUID] = append(refsByUUID[ref.UUID], name)
 			}
 		}
 	}
 
 	type frameInfo struct {
-		Name   string `json:"name"`
-		Status string `json:"status"`
+		UUID   string   `json:"uuid"`
+		Refs   []string `json:"refs"`
+		Status string   `json:"status"`
 	}
 	var frames []frameInfo
 	for _, uuid := range uuids {
-		name := uuid.String()
-		if refName, ok := refByUUID[uuid]; ok {
-			name = refName
+		refs := refsByUUID[uuid]
+		if refs == nil {
+			refs = []string{}
 		}
+		sort.Strings(refs)
 		sessionCount := getActiveFrameCount(framePathForUserUUID(user, uuid))
 		status := "stopped"
 		if sessionCount > 0 {
 			status = fmt.Sprintf("%d", sessionCount)
 		}
-		frames = append(frames, frameInfo{Name: name, Status: status})
+		frames = append(frames, frameInfo{UUID: uuid.String(), Refs: refs, Status: status})
 	}
 	if frames == nil {
 		frames = []frameInfo{}
@@ -760,41 +730,6 @@ func mcpListFramesToolHandler(ctx context.Context, req *mcp.CallToolRequest) (*m
 	out, err := json.Marshal(map[string]any{"frames": frames})
 	if err != nil {
 		return textResult(fmt.Sprintf("marshal frames: %v", err), true)
-	}
-	return textResult(string(out), false)
-}
-
-// mcpListRefsToolHandler is the ToolHandler for thundersnap_list_refs. It does
-// NOT launch a container. Mirrors handleListRefs' logic.
-func mcpListRefsToolHandler(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	user := mcpUserFromContext(ctx)
-	if user == "" {
-		return textResult("no MCP user resolved for request", true)
-	}
-	refStore := userRefStore(user)
-	names, err := refStore.List()
-	if err != nil {
-		return textResult(fmt.Sprintf("list refs: %v", err), true)
-	}
-	type refEntry struct {
-		Name    string   `json:"name"`
-		UUID    string   `json:"uuid"`
-		Autorun []string `json:"autorun,omitempty"`
-	}
-	var refs []refEntry
-	for _, name := range names {
-		ref, err := refStore.Get(name)
-		if err != nil {
-			continue
-		}
-		refs = append(refs, refEntry{Name: name, UUID: ref.UUID.String(), Autorun: ref.Autorun})
-	}
-	if refs == nil {
-		refs = []refEntry{}
-	}
-	out, err := json.Marshal(map[string]any{"refs": refs})
-	if err != nil {
-		return textResult(fmt.Sprintf("marshal refs: %v", err), true)
 	}
 	return textResult(string(out), false)
 }
@@ -810,14 +745,11 @@ func newMCPServer() *mcp.Server {
 		Title:   "Thundersnap Sandbox",
 		Version: mcpDaemonVersion,
 	}, &mcp.ServerOptions{
-		Instructions: "Use thundersnap_jobs for all shell command execution. Put every independent command in one " +
-			"launch array and include wait={until:\"all_exit\",include_output:true} to launch them all concurrently " +
-			"and receive their results in this single tool call. Omit wait to leave long-running jobs in the background; " +
-			"a later thundersnap_jobs call with wait can monitor them. Use thundersnap_jobs_list to recover status, " +
-			"thundersnap_view with job_id to inspect logs, and thundersnap_jobs_kill to stop jobs. Jobs belong to this " +
-			"Aperture conversation but may target different frames. Each job is a fresh non-PTY sh -c process: filesystem " +
-			"changes persist in the frame, but cd/export/shell state does not carry to another job. Run as user=\"user\" " +
-			"by default; use user=\"root\" only when administrative privileges are needed.",
+		Instructions: "Use jobs for shell execution. Launch entries run concurrently and must be independent. Put dependent " +
+			"steps in one multiline shell script, usually beginning with set -ex and one command per line. Every launch and " +
+			"file operation requires an explicit user (user or root). Wait using each job's byte offset; output is returned " +
+			"only through the last CR/LF while running, and through EOF after exit. A wait timeout never stops a job. " +
+			"Use jobs_list to recover status and jobs_kill only for immediate teardown.",
 	})
 
 	launchSchema := map[string]any{
@@ -827,29 +759,29 @@ func newMCPServer() *mcp.Server {
 			"frame":        map[string]any{"type": "string", "description": "Frame name or UUID. Defaults to the user's current/only frame."},
 			"workdir":      map[string]any{"type": "string", "description": "Initial working directory inside the frame (default /work); applies only to this job."},
 			"label":        map[string]any{"type": "string", "description": "Optional. Use mainly to distinguish several or long-running jobs; omit for quick commands."},
-			"user":         map[string]any{"type": "string", "enum": []string{"user", "root"}, "description": "Unix account inside the frame. Defaults to user; use root only for administrative operations."},
+			"user":         map[string]any{"type": "string", "enum": []string{"user", "root"}, "description": "Required Unix account inside the frame; use root only for administrative operations."},
 			"hard_timeout": map[string]any{"type": "integer", "description": "Total job lifetime in seconds (default/max 7200)."},
 		},
-		"required": []string{"command"},
+		"required":             []string{"command", "user"},
+		"additionalProperties": false,
 	}
 	waitSchema := map[string]any{
 		"type": "object",
 		"properties": map[string]any{
-			"job_ids":        map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Existing jobs to observe for a wait-only call. Omit when launch is present; newly launched jobs are selected automatically."},
-			"after_revision": map[string]any{"type": "integer", "description": "Latest revision already observed. Only newer events satisfy output or any_exit; ignored by all_exit."},
-			"until":          map[string]any{"type": "string", "enum": []string{"output", "any_exit", "all_exit"}, "description": "Wake condition (default any_exit). Use all_exit for foreground-style execution."},
-			"timeout":        map[string]any{"type": "integer", "description": "Wait duration in seconds (default 30, max 60). A timeout does not stop jobs."},
-			"include_output": map[string]any{"type": "boolean", "description": "Include up to the final 16KB of each selected job's combined output. Full output remains available through view(job_id)."},
-		},
+			"jobs": map[string]any{"type": "array", "items": map[string]any{"type": "object", "properties": map[string]any{
+				"id": map[string]any{"type": "string"}, "offset": map[string]any{"type": "integer", "minimum": 0},
+			}, "required": []string{"id", "offset"}, "additionalProperties": false}},
+			"until":   map[string]any{"type": "string", "enum": []string{"output", "any_exit", "all_exit"}},
+			"timeout": map[string]any{"type": "integer", "minimum": 1, "maximum": 60, "description": "Observation timeout; never stops jobs."},
+			"signal":  map[string]any{"type": "string", "enum": []string{"HUP", "INT", "TERM", "USR1", "USR2", "STOP", "CONT"}, "description": "Optional signal sent once to each selected running job's process group before waiting."},
+		}, "additionalProperties": false,
 	}
 	s.AddTool(&mcp.Tool{
-		Name: "thundersnap_jobs",
-		Description: "Launch shell jobs and optionally wait, all in one serialized request. For normal command execution, " +
-			"put every independent command in launch and set wait={until:\"all_exit\",include_output:true}; all jobs are " +
-			"started before waiting, so they run concurrently even if the MCP client schedules tool calls in parallel. " +
-			"Use launch without wait for background services. Use wait without launch to monitor existing job_ids. When " +
-			"launch and wait are both present, wait.job_ids must be omitted and exactly the newly launched jobs are selected. " +
-			"At least one of launch or wait is required. A wait timeout is a successful snapshot and never kills jobs.",
+		Name: "jobs",
+		Description: "Launch independent shell jobs concurrently and optionally wait. Put dependent steps in one multiline " +
+			"shell script (for example set -ex followed by one command per line). Wait jobs use raw combined-log byte offsets " +
+			"and return next_offset. While running, output ends after the last CR/LF; after exit, the final partial line is included. " +
+			"An optional wait signal is sent once without escalation. A wait timeout never stops jobs.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -860,7 +792,7 @@ func newMCPServer() *mcp.Server {
 	}, mcpJobsToolHandler)
 
 	s.AddTool(&mcp.Tool{
-		Name: "thundersnap_jobs_list",
+		Name: "jobs_list",
 		Description: "Return current status for background jobs belonging to this Aperture conversation, across every frame " +
 			"used by the conversation. Use this to recover forgotten job IDs, log paths, revisions, states, and exit codes. " +
 			"Omit job_ids to list all jobs in this conversation; jobs from other conversations are never included. " +
@@ -871,7 +803,7 @@ func newMCPServer() *mcp.Server {
 		}},
 	}, mcpJobsListToolHandler)
 	s.AddTool(&mcp.Tool{
-		Name: "thundersnap_jobs_kill",
+		Name: "jobs_kill",
 		Description: "Stop selected background jobs, including child and grandchild processes, then wait until teardown is " +
 			"observed before returning. This is conversation-scoped and does not affect unselected sibling jobs. Killing an " +
 			"already-terminal job is harmless. A returned state=killed confirms teardown; use jobs_list afterward if needed.",
@@ -882,9 +814,8 @@ func newMCPServer() *mcp.Server {
 
 	// view
 	s.AddTool(&mcp.Tool{
-		Name: "thundersnap_view",
-		Description: "Synchronously view either a path or a job log. Pass exactly one of path or job_id. With job_id, " +
-			"the job's frame and log path are inferred; stream may be combined (default), stdout, or stderr. For a file, " +
+		Name: "view",
+		Description: "Synchronously view a file or directory. For a file, " +
 			"prints lines with line numbers (use view_range [start, end], end=-1 for EOF), or use tail_lines for final " +
 			"lines of a running/completed log. For a directory, lists up to 200 entries (maxdepth 2). Output is truncated " +
 			"to 16K bytes. A non-zero exit such as file-not-found is an error result.",
@@ -895,15 +826,6 @@ func newMCPServer() *mcp.Server {
 					"type":        "string",
 					"description": "Absolute path inside the frame to view. Mutually exclusive with job_id.",
 				},
-				"job_id": map[string]any{
-					"type":        "string",
-					"description": "Conversation job ID whose log to view. Mutually exclusive with path; frame is inferred.",
-				},
-				"stream": map[string]any{
-					"type":        "string",
-					"enum":        []string{"combined", "stdout", "stderr"},
-					"description": "Log stream for job_id (default combined). Invalid with path.",
-				},
 				"view_range": map[string]any{
 					"type":        "array",
 					"items":       map[string]any{"type": "integer"},
@@ -913,20 +835,16 @@ func newMCPServer() *mcp.Server {
 					"type":        "integer",
 					"description": "Optional number of final lines to read; mutually exclusive with view_range.",
 				},
-				"frame": map[string]any{
-					"type":        "string",
-					"description": "Frame name or UUID. Defaults to the user's current/only frame.",
-				},
-			},
+				"frame": map[string]any{"type": "string"},
+				"user":  map[string]any{"type": "string", "enum": []string{"user", "root"}},
+			}, "required": []string{"path", "user"}, "additionalProperties": false,
 		},
 	}, mcpViewToolHandler)
 
 	// create_file
 	s.AddTool(&mcp.Tool{
-		Name: "thundersnap_create_file",
-		Description: "Synchronously create a file in a thundersnap frame with the given content; no background job ID is " +
-			"created. Overwrites if the file exists and creates parent directories. The operation runs as root, so use it " +
-			"for deliberate whole-file writes; files intended for user=\"user\" jobs may need ownership adjusted separately.",
+		Name:        "create_file",
+		Description: "Synchronously create or overwrite a file as the explicitly selected Unix user; creates parent directories.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -938,20 +856,19 @@ func newMCPServer() *mcp.Server {
 					"type":        "string",
 					"description": "The full text content of the file.",
 				},
-				"frame": map[string]any{
-					"type":        "string",
-					"description": "Frame name or UUID. Defaults to the user's current/only frame.",
-				},
+				"frame": map[string]any{"type": "string"},
+				"user":  map[string]any{"type": "string", "enum": []string{"user", "root"}},
 			},
-			"required": []string{"path", "file_text"},
+			"required":             []string{"path", "file_text", "user"},
+			"additionalProperties": false,
 		},
 	}, mcpCreateFileToolHandler)
 
 	// str_replace
 	s.AddTool(&mcp.Tool{
-		Name: "thundersnap_str_replace",
+		Name: "str_replace",
 		Description: "Synchronously replace exactly one occurrence of old_str in a frame file; no background job ID is " +
-			"created. The call fails if old_str occurs zero or multiple times, so use thundersnap_view first to capture enough " +
+			"created. The call fails if old_str occurs zero or multiple times, so use view first to capture enough " +
 			"unique context. Replacement is performed host-side as raw bytes and preserves the existing file mode and owner.",
 		InputSchema: map[string]any{
 			"type": "object",
@@ -979,28 +896,16 @@ func newMCPServer() *mcp.Server {
 
 	// list_frames
 	s.AddTool(&mcp.Tool{
-		Name: "thundersnap_list_frames",
-		Description: "List the caller's thundersnap frames (does NOT launch a " +
-			"container). Returns JSON {\"frames\":[{\"name\",\"status\"}]} where " +
+		Name: "list_frames",
+		Description: "List the caller's thundersnap frames and all refs pointing to each frame (does NOT launch a " +
+			"container). Returns JSON {\"frames\":[{\"uuid\",\"refs\",\"status\"}]} where refs may be empty and " +
 			"status is \"stopped\" or the active session count. Use this to pick " +
-			"a frame for the first bash/view/create_file/str_replace call.",
+			"a frame for the first jobs/view/create_file/str_replace call.",
 		InputSchema: map[string]any{
 			"type":       "object",
 			"properties": map[string]any{},
 		},
 	}, mcpListFramesToolHandler)
-
-	// list_refs
-	s.AddTool(&mcp.Tool{
-		Name: "thundersnap_list_refs",
-		Description: "List the caller's thundersnap refs (named frame pointers) " +
-			"(does NOT launch a container). Returns JSON " +
-			"{\"refs\":[{\"name\",\"uuid\",\"autorun\"}]}.",
-		InputSchema: map[string]any{
-			"type":       "object",
-			"properties": map[string]any{},
-		},
-	}, mcpListRefsToolHandler)
 
 	return s
 }

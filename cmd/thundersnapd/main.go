@@ -741,8 +741,8 @@ func main() {
 	// Prometheus metrics endpoint (OS-level + thundersnap counts).
 	registerMetrics(httpMux, *flagFsDir, *flagSnapsDir)
 
-	// MCP sandbox endpoint (thundersnap_jobs/view/create_file/str_replace/
-	// list_frames/list_refs). See mcp.go.
+	// MCP sandbox endpoint (jobs/view/create_file/str_replace/list_frames).
+	// See mcp.go.
 	mountMCP(httpMux)
 
 	httpServer := &http.Server{Handler: httpMux}

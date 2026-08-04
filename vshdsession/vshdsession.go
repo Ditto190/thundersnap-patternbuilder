@@ -140,6 +140,8 @@ func servePTY(conn io.Writer, reader io.Reader, cmd *exec.Cmd, postStart func(pi
 					continue
 				}
 				pty.Setsize(ptmx, &pty.Winsize{Rows: ws.Rows, Cols: ws.Cols, X: ws.X, Y: ws.Y})
+			case vshdproto.FrameSignal:
+				signalProcessGroup(cmd, payload, logf)
 			}
 		}
 	}()
@@ -189,10 +191,10 @@ func servePipe(conn io.Writer, reader io.Reader, cmd *exec.Cmd, postStart func(p
 	cmd.Stdout = &frameWriter{conn: conn, typ: vshdproto.FrameStdout, mu: &writeMu}
 	cmd.Stderr = &frameWriter{conn: conn, typ: vshdproto.FrameStderr, mu: &writeMu}
 
-	// Put the child in its own process group so disconnect can reap the
-	// whole tree (command + backgrounded children) with kill(-pgid). See
-	// ensureProcessGroup.
-	ensureProcessGroup(cmd)
+	// Put the child in a fresh Unix session, matching PTY sessions and making
+	// it the session/process-group leader. Signals and disconnect cleanup can
+	// then target the whole ordinary job with kill(-pgid).
+	ensureSession(cmd)
 
 	if err := cmd.Start(); err != nil {
 		logf.logf("start command: %v", err)
@@ -225,43 +227,42 @@ func servePipe(conn io.Writer, reader io.Reader, cmd *exec.Cmd, postStart func(p
 				killChildOnDisconnect(cmd, logf)
 				return
 			}
-			if typ == vshdproto.FrameStdin {
-				// Empty FrameStdin is the EOF marker from the daemon
+			switch typ {
+			case vshdproto.FrameStdin:
+				// Empty FrameStdin is the EOF marker from the daemon.
 				if len(payload) == 0 {
 					return
 				}
 				if _, werr := stdin.Write(payload); werr != nil {
 					return
 				}
+			case vshdproto.FrameSignal:
+				signalProcessGroup(cmd, payload, logf)
 			}
 		}
 	}()
 
 	code := waitExitCode(cmd)
+	// A remote shell/session ending hangs up ordinary background jobs that stayed
+	// in its process group. Processes that deliberately detached into another
+	// session (setsid/nohup) retain normal Unix daemon semantics.
+	_ = killProcessGroup(cmd, syscall.SIGHUP)
 	vshdproto.WriteFrame(conn, vshdproto.FrameExit, vshdproto.EncodeExit(code))
 	logf.logf("command exited (code %d)", code)
 }
 
-// ensureProcessGroup puts cmd in its own process group (Setpgid) so that on
-// client disconnect the whole session tree — the command AND any backgrounded
-// children it forked (e.g. `sleep 30 &` inside `sh -c '...'`) — can be reaped
-// with a single kill(-pgid) instead of orphaning the grandchildren. Without
-// this, killChildOnDisconnect only signals the direct child: a shell that ran
-// `sleep N &` exits on SIGHUP but the backgrounded sleep is reparented to
-// init and keeps running, leaking until the frame is destroyed.
-//
-// It is a no-op if the caller already set SysProcAttr (e.g. a future caller
-// that needs a different PGID policy); otherwise it sets Setpgid so the child
-// becomes the leader of a fresh PG with PGID == child PID.
-func ensureProcessGroup(cmd *exec.Cmd) {
+// ensureSession starts cmd as a fresh session and process-group leader, just
+// like pty.Start does for terminal sessions. This shared vshdsession path is
+// used by MCP, SSH container sessions, and direct VM/host sessions.
+func ensureSession(cmd *exec.Cmd) {
 	if cmd.SysProcAttr == nil {
 		cmd.SysProcAttr = &syscall.SysProcAttr{}
 	}
-	cmd.SysProcAttr.Setpgid = true
+	cmd.SysProcAttr.Setsid = true
 }
 
 // killProcessGroup sends sig to every process in cmd's process group. cmd must
-// have been started with Setpgid (see ensureProcessGroup) so that
+// lead a fresh session/process group (see ensureSession) so that
 // -cmd.Process.Pid denotes the group. Signalling an already-dead group is
 // harmless (the kernel returns ESRCH, which we ignore).
 func killProcessGroup(cmd *exec.Cmd, sig syscall.Signal) error {
@@ -269,6 +270,17 @@ func killProcessGroup(cmd *exec.Cmd, sig syscall.Signal) error {
 		return nil
 	}
 	return syscall.Kill(-cmd.Process.Pid, sig)
+}
+
+func signalProcessGroup(cmd *exec.Cmd, payload []byte, logf Logf) {
+	n, err := vshdproto.DecodeSignal(payload)
+	if err != nil || n <= 0 {
+		logf.logf("bad signal frame: %v", err)
+		return
+	}
+	if err := killProcessGroup(cmd, syscall.Signal(n)); err != nil {
+		logf.logf("signal process group %d with %d: %v", cmd.Process.Pid, n, err)
+	}
 }
 
 // killChildOnDisconnect signals cmd's process group to exit because the client
@@ -281,9 +293,8 @@ func killProcessGroup(cmd *exec.Cmd, sig syscall.Signal) error {
 // child exits.
 //
 // Killing the whole group (not just the direct child) is what reaps
-// backgrounded grandchildren — the core MCP timeout/cancellation requirement
-// (and the SSH-disconnect-from-a-backgrounded-command case that previously
-// leaked).
+// backgrounded grandchildren that remain in the session's process group. A
+// deliberately detached setsid/nohup process may survive, as on a Unix shell.
 func killChildOnDisconnect(cmd *exec.Cmd, logf Logf) {
 	if cmd.Process == nil {
 		return
