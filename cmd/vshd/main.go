@@ -34,6 +34,7 @@ import (
 	"github.com/mdlayher/vsock"
 	"github.com/tailscale/thundersnap/cgroup"
 	"github.com/tailscale/thundersnap/containerns"
+	"github.com/tailscale/thundersnap/tsm"
 	"github.com/tailscale/thundersnap/vshdproto"
 	"github.com/tailscale/thundersnap/vshdsession"
 )
@@ -381,7 +382,15 @@ func handleConnection(conn io.ReadWriteCloser) {
 	}
 
 	// Direct VM/host session (no container): vshd is the TLV endpoint.
-	vshdsession.Serve(conn, reader, cmd, wantPTY, postStart, logf)
+	ptyOwnerUID := -1
+	if wantPTY {
+		if ui := tsm.LookupUser("/", runAsUser); ui != nil {
+			ptyOwnerUID = int(ui.UID)
+		} else if runAsUser == "root" {
+			ptyOwnerUID = 0
+		}
+	}
+	vshdsession.Serve(conn, reader, cmd, wantPTY, ptyOwnerUID, postStart, logf)
 }
 
 // spliceContainerSession runs the wrapped inner `ts session-serve` command and
@@ -523,7 +532,7 @@ func buildSessionCmd(rootPrefix, runAsUser string, cmdArgs []string, wantPTY boo
 		ptyFlag = "1"
 	}
 	serveArgs := append([]string{
-		"session-serve", ptyFlag, strconv.Itoa(len(argv)),
+		"session-serve", ptyFlag, runAsUser, strconv.Itoa(len(argv)),
 	}, argv...)
 	// TODO: --keep-dev-caps is currently always passed to allow running
 	// thundersnap recursively inside a thundersnap container (for development).

@@ -44,12 +44,14 @@ func (l Logf) logf(format string, args ...any) {
 // Serve runs cmd, proxying it to the client over conn/reader using vshdproto TLV
 // framing. wantPTY selects a pty session (FrameStdin/FrameWinsize -> pty, pty
 // output -> FrameStdout) versus a pipe session (FrameStdin -> stdin, stdout and
-// stderr framed separately). postStart, when non-nil, is invoked with the
-// started child's PID immediately after the command starts (used to apply
-// cgroup limits in host mode). logf, when non-nil, receives diagnostic logs.
-func Serve(conn io.Writer, reader io.Reader, cmd *exec.Cmd, wantPTY bool, postStart func(pid int), logf Logf) {
+// stderr framed separately). For PTY sessions, ptyOwnerUID is the uid that must
+// own the slave before cmd starts; pass -1 to leave its ownership unchanged.
+// postStart, when non-nil, is invoked with the started child's PID immediately
+// after the command starts (used to apply cgroup limits in host mode). logf,
+// when non-nil, receives diagnostic logs.
+func Serve(conn io.Writer, reader io.Reader, cmd *exec.Cmd, wantPTY bool, ptyOwnerUID int, postStart func(pid int), logf Logf) {
 	if wantPTY {
-		servePTY(conn, reader, cmd, postStart, logf)
+		servePTY(conn, reader, cmd, ptyOwnerUID, postStart, logf)
 	} else {
 		servePipe(conn, reader, cmd, postStart, logf)
 	}
@@ -57,7 +59,7 @@ func Serve(conn io.Writer, reader io.Reader, cmd *exec.Cmd, wantPTY bool, postSt
 
 // servePTY starts cmd on a pty and bridges it to the TLV stream:
 // FrameStdin -> pty, FrameWinsize -> pty.Setsize, pty output -> FrameStdout.
-func servePTY(conn io.Writer, reader io.Reader, cmd *exec.Cmd, postStart func(pid int), logf Logf) {
+func servePTY(conn io.Writer, reader io.Reader, cmd *exec.Cmd, ptyOwnerUID int, postStart func(pid int), logf Logf) {
 	// The client (the daemon's proxyVshdSessionGeneric) sends the initial
 	// FrameWinsize as the FIRST frame of a PTY session, before any stdin. Read
 	// it here and create the pty at that size with pty.StartWithSize, so the
@@ -90,8 +92,31 @@ func servePTY(conn io.Writer, reader io.Reader, cmd *exec.Cmd, postStart func(pi
 		initSize = &pty.Winsize{Rows: 24, Cols: 80}
 	}
 
-	ptmx, err := pty.StartWithSize(cmd, initSize)
+	ptmx, tty, err := pty.Open()
+	if err == nil {
+		if err = pty.Setsize(ptmx, initSize); err == nil && ptyOwnerUID >= 0 {
+			// devpts creates the slave for the allocating (root) session-serve
+			// process. Transfer only its owner, retaining the devpts-selected tty
+			// group and mode, before a child such as `su - user` drops privilege.
+			err = tty.Chown(ptyOwnerUID, -1)
+		}
+	}
+	if err == nil {
+		cmd.Stdin, cmd.Stdout, cmd.Stderr = tty, tty, tty
+		if cmd.SysProcAttr == nil {
+			cmd.SysProcAttr = &syscall.SysProcAttr{}
+		}
+		cmd.SysProcAttr.Setsid = true
+		cmd.SysProcAttr.Setctty = true
+		err = cmd.Start()
+	}
+	if tty != nil {
+		_ = tty.Close()
+	}
 	if err != nil {
+		if ptmx != nil {
+			_ = ptmx.Close()
+		}
 		logf.logf("failed to start pty: %v", err)
 		vshdproto.WriteFrame(conn, vshdproto.FrameStderr, []byte("vshd: failed to start shell: "+err.Error()+"\n"))
 		vshdproto.WriteFrame(conn, vshdproto.FrameExit, vshdproto.EncodeExit(1))

@@ -10,15 +10,17 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/tailscale/thundersnap/tsm"
 	"github.com/tailscale/thundersnap/vshdsession"
 )
 
 // cmdSessionServe is the in-container endpoint of a vshd session. vshd runs it
 // (via nsenter + drop-caps-and-run --chroot) as:
 //
-//	ts session-serve <ptyFlag> <argc> <arg0> <arg1> ...
+//	ts session-serve <ptyFlag> <ptyOwner> <argc> <arg0> <arg1> ...
 //
-// where ptyFlag is "1" for a PTY session and "0" otherwise, and the args are the
+// where ptyFlag is "1" for a PTY session and "0" otherwise, ptyOwner is the
+// resolved Unix username (or empty), and the args are the
 // final command to run (e.g. "su - user" or a shell). It speaks the vshdproto
 // TLV protocol on its own stdin/stdout, which vshd splices verbatim to/from the
 // network connection. Crucially, because session-serve runs AFTER the chroot
@@ -26,17 +28,27 @@ import (
 // container's own devpts instance, so it is visible as /dev/pts/N inside the
 // container (and `ps` shows the real pts as the controlling terminal).
 func cmdSessionServe(args []string) {
-	if len(args) < 2 {
-		fmt.Fprintln(os.Stderr, "error: session-serve requires <ptyFlag> <argc> [args...]")
+	if len(args) < 3 {
+		fmt.Fprintln(os.Stderr, "error: session-serve requires <ptyFlag> <ptyOwner> <argc> [args...]")
 		os.Exit(1)
 	}
 	wantPTY := args[0] == "1"
-	argc, err := strconv.Atoi(args[1])
+	ptyOwnerUID := -1
+	if wantPTY && args[1] != "" {
+		if ui := tsm.LookupUser("/", args[1]); ui != nil {
+			ptyOwnerUID = int(ui.UID)
+		} else if args[1] == "root" {
+			ptyOwnerUID = 0
+		}
+		// Unknown users are rejected by the eventual su command, preserving its
+		// framed non-zero exit and diagnostic. Only known users need a chown.
+	}
+	argc, err := strconv.Atoi(args[2])
 	if err != nil || argc < 0 {
-		fmt.Fprintf(os.Stderr, "error: session-serve: invalid argc %q\n", args[1])
+		fmt.Fprintf(os.Stderr, "error: session-serve: invalid argc %q\n", args[2])
 		os.Exit(1)
 	}
-	rest := args[2:]
+	rest := args[3:]
 	if len(rest) < argc {
 		fmt.Fprintf(os.Stderr, "error: session-serve: expected %d args, got %d\n", argc, len(rest))
 		os.Exit(1)
@@ -60,7 +72,7 @@ func cmdSessionServe(args []string) {
 	// vshd splices our stdin/stdout to the client connection; serve the session
 	// over them. logf is nil (diagnostics, if any, go to our stderr which vshd
 	// surfaces in its own log).
-	vshdsession.Serve(os.Stdout, os.Stdin, cmd, wantPTY, nil, nil)
+	vshdsession.Serve(os.Stdout, os.Stdin, cmd, wantPTY, ptyOwnerUID, nil, nil)
 }
 
 // cmdAutorunRun runs one attempt and, only after a non-zero exit, leaves a

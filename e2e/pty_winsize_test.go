@@ -28,6 +28,33 @@ import (
 // This single test guards the shared vshdsession.servePTY / relay echo path;
 // the container and VM session paths share it, so we do not duplicate the
 // check on the VM path.
+func testContainerNonRootPtyJobControl(t *testing.T, d *daemonInstance) {
+	createFrameViaDaemon(t, d, "userpty")
+	client, session, out, stdin := startPtyShellUser(t, d, "user@userpty")
+	defer client.Close()
+	defer session.Close()
+	if _, err := stdin.Write([]byte("echo NONROOT-PTY-OK; exit\n")); err != nil {
+		t.Fatalf("write command: %v", err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- session.Wait() }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("non-root PTY session: %v (output %q)", err, out.String())
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatalf("timeout waiting for non-root PTY; output=%q", out.String())
+	}
+	got := out.String()
+	if !strings.Contains(got, "NONROOT-PTY-OK") {
+		t.Fatalf("non-root PTY command output missing: %q", got)
+	}
+	if strings.Contains(got, "can't access tty") || strings.Contains(got, "job control turned off") {
+		t.Fatalf("non-root shell could not access its PTY: %q", got)
+	}
+}
+
 func testContainerPtyEcho(t *testing.T, d *daemonInstance) {
 	createFrameViaDaemon(t, d, "echopty")
 

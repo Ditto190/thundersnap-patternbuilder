@@ -64,6 +64,7 @@ func TestContainer(t *testing.T) {
 		{"ContainerIsolationOverSSH", testContainerIsolationOverSSH},
 
 		// PTY relay invariants (echo, winsize, write ordering, raw mode, pts).
+		{"ContainerNonRootPtyJobControl", testContainerNonRootPtyJobControl},
 		{"ContainerPtyEcho", testContainerPtyEcho},
 		{"ContainerPtyWinsize", testContainerPtyWinsize},
 		{"ContainerPtyWriteOrder", testContainerPtyWriteOrder},
