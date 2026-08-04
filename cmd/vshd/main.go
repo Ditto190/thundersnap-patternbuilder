@@ -476,28 +476,21 @@ func buildSessionCmd(rootPrefix, runAsUser string, cmdArgs []string, wantPTY boo
 		// Interactive root shell: run /bin/sh -l directly (avoids needing su).
 		argv = []string{"/bin/sh", "-l"}
 	case len(cmdArgs) == 0:
-		// Interactive login shell for a non-root user.
-		if prefix := exportPrefix(env); prefix != "" {
-			// `su -` resets the environment for a real su (busybox/util-linux),
-			// dropping any session vars set on the su process. Inject them
-			// INSIDE the -c command — after su has cleared env — then exec an
-			// interactive login shell that inherits them. ts's built-in su
-			// also preserves THUNDERSNAP_* via identityEnv, so this is a
-			// harmless extra layer for minimal frames and the load-bearing
-			// trick for frames that ship a real su.
-			argv = []string{"su", "-", runAsUser, "-c", prefix + "exec /bin/sh -l"}
-		} else {
-			argv = []string{"su", "-", runAsUser}
-		}
+		// Use our in-frame su directly rather than the image's su. In particular,
+		// do not use `su - user -c "...; exec sh -l"`: util-linux su puts its
+		// -c child in a process-group arrangement that makes dash disable job
+		// control, and both su's login shell and the exec'd shell read profiles.
+		// ts su drops uid/gid and execs the user's login shell directly, preserving
+		// THUNDERSNAP_* through identityEnv and reading the profile exactly once.
+		argv = []string{"/bin/ts", "su", "-", runAsUser}
 	case runAsUser == "root":
 		// Run the command directly as root.
 		argv = cmdArgs
 	default:
-		// Run the command via a login shell for the target user. Inject session
-		// vars as exports inside the -c command so they survive `su -`'s env
-		// reset (see the interactive case above for the full rationale).
-		prefix := exportPrefix(env)
-		argv = []string{"su", "-", runAsUser, "-c", prefix + quoteArgsForSh(cmdArgs)}
+		// Use the same deterministic in-frame privilege drop for command sessions.
+		// identityEnv preserves session descriptors, so no extra login-shell export
+		// wrapper is needed.
+		argv = []string{"/bin/ts", "su", "-", runAsUser, "-c", quoteArgsForSh(cmdArgs)}
 	}
 
 	if rootPrefix == "" {

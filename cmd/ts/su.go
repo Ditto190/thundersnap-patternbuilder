@@ -148,19 +148,17 @@ func runAsSu(args []string) {
 	// the caller; set the identity vars to the target user.
 	env := identityEnv(user, home, shell)
 
-	// Build argv for the exec. For a login shell, argv[0] is "-" + the shell
-	// basename (e.g. "-sh") so the shell enters login mode; otherwise it is the
-	// bare basename. With -c, run "shell -c cmd".
+	// Build argv for the exec. Pass -l explicitly rather than relying only on a
+	// leading '-' in argv[0]: multicall shells such as busybox may consume argv0
+	// while dispatching the sh applet and otherwise lose login mode. The common
+	// shells used in frames (dash, bash, busybox ash, and ts sh) accept -l.
 	shellBase := filepath.Base(shell)
-	argv0 := shellBase
+	argv := []string{shellBase}
 	if login {
-		argv0 = "-" + shellBase
+		argv = append(argv, "-l")
 	}
-	var argv []string
 	if cmd != "" {
-		argv = []string{shellBase, "-c", cmd}
-	} else {
-		argv = []string{argv0}
+		argv = append(argv, "-c", cmd)
 	}
 
 	if err := unix.Exec(shell, argv, env); err != nil {

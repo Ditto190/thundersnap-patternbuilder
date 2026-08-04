@@ -30,6 +30,13 @@ import (
 // check on the VM path.
 func testContainerNonRootPtyJobControl(t *testing.T, d *daemonInstance) {
 	createFrameViaDaemon(t, d, "userpty")
+	// Exercise a real POSIX shell, not the minimal ts /bin/sh implementation:
+	// ash diagnoses the process-group bug and reads /etc/profile on login.
+	installBusyboxAppletsInFrame(t, d, "userpty", "ash", "sed")
+	setup := "sed -i 's#^user:\\([^:]*:\\)\\{5\\}[^:]*$#user:x:1000:1000::/home/user:/bin/ash#' /etc/passwd; echo PROFILE-ONCE >> /etc/profile"
+	if out, exit, err := sshExec(t, d, "root@userpty", setup); err != nil || exit != 0 {
+		t.Fatalf("install real login shell/profile marker: exit=%d err=%v out=%q", exit, err, out)
+	}
 	client, session, out, stdin := startPtyShellUser(t, d, "user@userpty")
 	defer client.Close()
 	defer session.Close()
@@ -52,6 +59,9 @@ func testContainerNonRootPtyJobControl(t *testing.T, d *daemonInstance) {
 	}
 	if strings.Contains(got, "can't access tty") || strings.Contains(got, "job control turned off") {
 		t.Fatalf("non-root shell could not access its PTY: %q", got)
+	}
+	if n := strings.Count(got, "PROFILE-ONCE"); n != 1 {
+		t.Fatalf("non-root login read /etc/profile %d times, want once: %q", n, got)
 	}
 }
 
