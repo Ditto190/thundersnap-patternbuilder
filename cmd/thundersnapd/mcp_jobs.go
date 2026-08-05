@@ -469,7 +469,7 @@ func mcpBashToolHandler(ctx context.Context, req *mcp.CallToolRequest) (*mcp.Cal
 // already exist. Never overwrite that output: consume IDs until mkdir reserves
 // a new job directory atomically.
 func createMCPJobLog(l *mcpJobList, key mcpJobScopeKey, rootFS string) (id, logDirInFrame string, combined *os.File, err error) {
-	logRootInFrame := filepath.Join("/.thundersnap/jobs", mcpJobScopeDir(key))
+	logRootInFrame := filepath.Join("/tmp/.ts/jobs", mcpJobScopeDir(key))
 	logRootHost := filepath.Join(rootFS, strings.TrimPrefix(logRootInFrame, "/"))
 	if !isWithinRootFS(logRootHost, rootFS) {
 		return "", "", nil, fmt.Errorf("internal job log path escaped frame")

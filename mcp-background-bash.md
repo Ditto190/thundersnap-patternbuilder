@@ -154,7 +154,7 @@ immediate kill if needed.
 Each job owns a directory inside its resolved frame:
 
 ```text
-/.thundersnap/jobs/<conversation-scope-hash>/<job-id>/
+/tmp/.ts/jobs/<conversation-scope-hash>/<job-id>/
     combined.log
     stdout.log
     stderr.log

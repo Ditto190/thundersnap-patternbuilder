@@ -29,8 +29,7 @@ experiment. Over time we need to improve the quality of all the components.
     `THUNDERSNAP_VM_DIR`
 - This project workspace may be using the 'jj' tool instead of git. Always
   check for jj first.
-- When making commit messages, in general use the form "dir(s): what
-  changed" for the summary line, and 1-2 paragraphs about what specifically
-  and why. Don't write pages but don't assume one line is enough.
+- Commit messages: first line in the form "dir(s): what changed". Then 
+  1-2 paragraphs about what/why. Try to keep line length <=72.
 - Before assuming you can't run a command for lack of privileges, try `sudo`
   first. This environment has passwordless sudo.

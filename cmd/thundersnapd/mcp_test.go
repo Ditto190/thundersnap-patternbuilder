@@ -290,7 +290,7 @@ func TestMCPJobScopeFromRequest(t *testing.T) {
 func TestCreateMCPJobLogSkipsPersistentIDs(t *testing.T) {
 	rootFS := t.TempDir()
 	key := mcpJobScopeKey{user: "alice", conversation: "conversation"}
-	logRoot := filepath.Join(rootFS, ".thundersnap", "jobs", mcpJobScopeDir(key))
+	logRoot := filepath.Join(rootFS, "tmp", ".ts", "jobs", mcpJobScopeDir(key))
 	if err := os.MkdirAll(filepath.Join(logRoot, "j1"), 0700); err != nil {
 		t.Fatal(err)
 	}
@@ -308,7 +308,7 @@ func TestCreateMCPJobLogSkipsPersistentIDs(t *testing.T) {
 	if id != "j2" {
 		t.Errorf("id = %q, want j2", id)
 	}
-	if want := filepath.Join("/.thundersnap/jobs", mcpJobScopeDir(key), "j2"); logDir != want {
+	if want := filepath.Join("/tmp/.ts/jobs", mcpJobScopeDir(key), "j2"); logDir != want {
 		t.Errorf("log dir = %q, want %q", logDir, want)
 	}
 	if got, err := os.ReadFile(oldLog); err != nil || string(got) != "old output\n" {

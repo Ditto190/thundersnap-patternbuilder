@@ -18,6 +18,22 @@ deliberately deferred. Cross them off as they land.
   subvols are by definition incomplete/un-indexed, so they are always safe to
   delete. (deepseek-v4-pro review, MEDIUM.)
 
+## Temporary-file lifecycle
+
+- [ ] **Automatically age out files under `/tmp`.** Add tmpreaper-style
+      retention (or the equivalent systemd-tmpfiles policy) so MCP job logs and
+      other abandoned temporary files do not accumulate indefinitely.
+- [ ] **Consider clearing `/tmp` when container-init exits.** Decide whether a
+      container namespace lifetime is the right ownership boundary, taking care
+      not to delete files still used by concurrent sessions in the same frame.
+- [ ] **Consider mounting `/tmp` as tmpfs.** Evaluate memory limits, large MCP
+      job output, concurrency, and whether temporary data should survive a
+      container-init restart before changing the backing store.
+- [ ] **Exclude `/tmp` from the content-addressable snap index.** Even while
+      btrfs snapshots still include `/tmp`, `ts snap` must not hash or publish
+      it as indexed snapshot content, so temporary MCP logs and similar files
+      are not replicated through the content-addressable store.
+
 ## `ts go` sessions / docker-image hygiene
 
 Surfaced while building the `nix` ref (see `README.nix.md` footguns #18–#20).
