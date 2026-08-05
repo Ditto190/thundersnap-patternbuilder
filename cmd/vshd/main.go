@@ -556,17 +556,20 @@ func buildSessionCmd(rootPrefix, runAsUser string, cmdArgs []string, wantPTY boo
 	return cmd, release, nil
 }
 
-// sessionEnv returns the environment for a session command, adding TERM for PTY
-// sessions and merging in any daemon-supplied KEY=VAL entries (which take
-// precedence over the inherited environment). The merged env propagates to
-// the final shell because every exec in the nsenter -> session-serve chain
-// uses os.Environ().
+const sessionPath = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+// sessionEnv returns the environment for a session command, setting a
+// deterministic PATH, adding TERM for PTY sessions, and merging in any
+// daemon-supplied KEY=VAL entries. The session must not inherit PATH from vshd:
+// service managers may omit /bin, but a minimal frame contains ts only as
+// /bin/ts. The merged env propagates to the final shell because every exec in
+// the nsenter -> session-serve chain uses os.Environ().
 func sessionEnv(wantPTY bool, env []string) []string {
-	out := os.Environ()
+	out := mergeEnv(os.Environ(), env)
 	if wantPTY {
-		out = append(out, "TERM=xterm-256color")
+		out = mergeEnv(out, []string{"TERM=xterm-256color"})
 	}
-	return mergeEnv(out, env)
+	return mergeEnv(out, []string{"PATH=" + sessionPath})
 }
 
 // mergeEnv returns base with each KEY=VAL from extra overriding any existing

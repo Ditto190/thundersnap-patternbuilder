@@ -66,6 +66,37 @@ func TestQuoteArgsForSh(t *testing.T) {
 	}
 }
 
+func TestSessionEnvSetsPath(t *testing.T) {
+	t.Setenv("PATH", "/usr/sbin:/usr/bin")
+
+	env := sessionEnv(false, nil)
+	if got := envValue(env, "PATH"); got != sessionPath {
+		t.Fatalf("PATH = %q, want %q", got, sessionPath)
+	}
+}
+
+func TestSessionEnvPathCannotBeOverridden(t *testing.T) {
+	t.Setenv("PATH", "/inherited")
+
+	env := sessionEnv(true, []string{"PATH=/explicit"})
+	if got := envValue(env, "PATH"); got != sessionPath {
+		t.Fatalf("PATH = %q, want %q", got, sessionPath)
+	}
+	if got := envValue(env, "TERM"); got != "xterm-256color" {
+		t.Fatalf("TERM = %q, want xterm-256color", got)
+	}
+}
+
+func envValue(env []string, key string) string {
+	prefix := key + "="
+	for _, entry := range env {
+		if strings.HasPrefix(entry, prefix) {
+			return strings.TrimPrefix(entry, prefix)
+		}
+	}
+	return ""
+}
+
 func TestExportPrefix(t *testing.T) {
 	tests := []struct {
 		name string

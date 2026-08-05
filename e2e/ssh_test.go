@@ -104,6 +104,10 @@ func startDaemon(t *testing.T, env *testEnv) *daemonInstance {
 	cmd.Stdout = os.Stderr
 	cmd.Stderr = os.Stderr
 	cmd.Dir = env.root
+	// Match service-manager environments that omit /bin. A nil:nil:nil frame
+	// has ts only at /bin/ts, so its session PATH must be established by
+	// thundersnap rather than inherited from the daemon's launcher.
+	cmd.Env = envWithOverride(os.Environ(), "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin")
 
 	t.Logf("Starting daemon: %s %v", cmd.Path, cmd.Args[1:])
 
@@ -188,6 +192,18 @@ func getFreePort() (int, error) {
 	}
 	defer l.Close()
 	return l.Addr().(*net.TCPAddr).Port, nil
+}
+
+func envWithOverride(base []string, override string) []string {
+	key, _, _ := strings.Cut(override, "=")
+	prefix := key + "="
+	out := make([]string, 0, len(base)+1)
+	for _, entry := range base {
+		if !strings.HasPrefix(entry, prefix) {
+			out = append(out, entry)
+		}
+	}
+	return append(out, override)
 }
 
 // sshConfig returns an SSH client config for connecting to the test daemon.
@@ -655,6 +671,17 @@ func testSSHContainerBasic(t *testing.T, d *daemonInstance) {
 		t.Errorf("echo in default frame: expected exit code 0, got %d (output: %q)", exitCode, output)
 	}
 	t.Logf("echo output (default frame): %s", output)
+
+	// A bare ts must resolve through the empty frame's own PATH. The e2e daemon
+	// is deliberately launched without /bin in PATH, reproducing systemd setups
+	// where inheriting the daemon environment made /bin/ts unreachable.
+	output, exitCode, err = sshExec(t, d, "root@", "ts ping")
+	if err != nil {
+		t.Fatalf("bare ts in default frame failed: %v", err)
+	}
+	if exitCode != 0 {
+		t.Fatalf("bare ts in default frame: expected exit code 0, got %d (output: %q)", exitCode, output)
+	}
 
 	// Create a new frame using ts frame, with a ref name
 	// ts frame --ref=testframe <snapshot-spec>
