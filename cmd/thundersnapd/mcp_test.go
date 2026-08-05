@@ -287,6 +287,38 @@ func TestMCPJobScopeFromRequest(t *testing.T) {
 	}
 }
 
+func TestCreateMCPJobLogSkipsPersistentIDs(t *testing.T) {
+	rootFS := t.TempDir()
+	key := mcpJobScopeKey{user: "alice", conversation: "conversation"}
+	logRoot := filepath.Join(rootFS, ".thundersnap", "jobs", mcpJobScopeDir(key))
+	if err := os.MkdirAll(filepath.Join(logRoot, "j1"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	oldLog := filepath.Join(logRoot, "j1", "combined.log")
+	if err := os.WriteFile(oldLog, []byte("old output\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	list := newMCPJobList() // Models a fresh daemon whose nextID reset to zero.
+	id, logDir, log, err := createMCPJobLog(list, key, rootFS)
+	if err != nil {
+		t.Fatalf("createMCPJobLog: %v", err)
+	}
+	log.Close()
+	if id != "j2" {
+		t.Errorf("id = %q, want j2", id)
+	}
+	if want := filepath.Join("/.thundersnap/jobs", mcpJobScopeDir(key), "j2"); logDir != want {
+		t.Errorf("log dir = %q, want %q", logDir, want)
+	}
+	if got, err := os.ReadFile(oldLog); err != nil || string(got) != "old output\n" {
+		t.Errorf("old log changed: content=%q err=%v", got, err)
+	}
+	if _, err := os.Stat(filepath.Join(logRoot, "j2", "combined.log")); err != nil {
+		t.Errorf("new combined log: %v", err)
+	}
+}
+
 func TestTruncateUTF8(t *testing.T) {
 	t.Run("under limit unchanged", func(t *testing.T) {
 		if got := truncateUTF8("hello", 100, "..."); got != "hello" {

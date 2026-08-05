@@ -420,25 +420,9 @@ func mcpBashToolHandler(ctx context.Context, req *mcp.CallToolRequest) (*mcp.Cal
 	}()
 
 	l := mcpJobs.list(key)
-	l.mu.Lock()
-	l.nextID++
-	id := fmt.Sprintf("j%d", l.nextID)
-	l.mu.Unlock()
-
-	logDirInFrame := filepath.Join("/.thundersnap/jobs", mcpJobScopeDir(key), id)
-	logDirHost := filepath.Join(rootFS, strings.TrimPrefix(logDirInFrame, "/"))
-	if !isWithinRootFS(logDirHost, rootFS) {
-		return textResult("internal job log path escaped frame", true)
-	}
-	if err := os.MkdirAll(logDirHost, 0700); err != nil {
-		return textResult(fmt.Sprintf("create job log directory: %v", err), true)
-	}
-	openLog := func(name string) (*os.File, error) {
-		return os.OpenFile(filepath.Join(logDirHost, name), os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0600)
-	}
-	combined, err := openLog("combined.log")
+	id, logDirInFrame, combined, err := createMCPJobLog(l, key, rootFS)
 	if err != nil {
-		return textResult(fmt.Sprintf("create combined log: %v", err), true)
+		return textResult(err.Error(), true)
 	}
 	closeLogs := func() { combined.Close() }
 
@@ -477,6 +461,43 @@ func mcpBashToolHandler(ctx context.Context, req *mcp.CallToolRequest) (*mcp.Cal
 	go collectMCPJob(l, j, conn, combined, func() { controlServers.releaseControlServer(rootFS) })
 
 	return jsonToolResult(map[string]any{"job_id": id, "revision": revision, "job": status}, false)
+}
+
+// createMCPJobLog allocates a process-local job ID that is also unused in the
+// target frame. Logs outlive the daemon (and may be copied when a frame is
+// cloned), while nextID does not, so after a restart the first candidate can
+// already exist. Never overwrite that output: consume IDs until mkdir reserves
+// a new job directory atomically.
+func createMCPJobLog(l *mcpJobList, key mcpJobScopeKey, rootFS string) (id, logDirInFrame string, combined *os.File, err error) {
+	logRootInFrame := filepath.Join("/.thundersnap/jobs", mcpJobScopeDir(key))
+	logRootHost := filepath.Join(rootFS, strings.TrimPrefix(logRootInFrame, "/"))
+	if !isWithinRootFS(logRootHost, rootFS) {
+		return "", "", nil, fmt.Errorf("internal job log path escaped frame")
+	}
+	if err := os.MkdirAll(logRootHost, 0700); err != nil {
+		return "", "", nil, fmt.Errorf("create job log root: %w", err)
+	}
+
+	for {
+		l.mu.Lock()
+		l.nextID++
+		id = fmt.Sprintf("j%d", l.nextID)
+		l.mu.Unlock()
+
+		logDirInFrame = filepath.Join(logRootInFrame, id)
+		logDirHost := filepath.Join(logRootHost, id)
+		if err := os.Mkdir(logDirHost, 0700); os.IsExist(err) {
+			continue
+		} else if err != nil {
+			return "", "", nil, fmt.Errorf("create job log directory: %w", err)
+		}
+		combined, err = os.OpenFile(filepath.Join(logDirHost, "combined.log"), os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0600)
+		if err != nil {
+			_ = os.Remove(logDirHost)
+			return "", "", nil, fmt.Errorf("create combined log: %w", err)
+		}
+		return id, logDirInFrame, combined, nil
+	}
 }
 
 func requestMCPJobStop(l *mcpJobList, j *mcpJob, reason mcpJobState) {
