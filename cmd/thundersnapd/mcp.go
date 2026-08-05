@@ -785,7 +785,7 @@ func newMCPServer() *mcp.Server {
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
-				"launch": map[string]any{"type": "array", "items": launchSchema, "description": "Jobs to start in array order. Commands run concurrently after they are started."},
+				"launch": map[string]any{"type": "array", "items": launchSchema, "description": "Jobs to start in array order. Commands run concurrently after they are started. For sequential finite work, include wait in this same call rather than launching first and making a separate wait call."},
 				"wait":   waitSchema,
 			},
 		},

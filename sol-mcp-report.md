@@ -8,7 +8,7 @@ I used the Thundersnap tools to clone `github.com/apenwarr/isochronous` into the
 
 ## Friction encountered
 
-### I issued dependent jobs too early
+### [DONE] I issued dependent jobs too early
 
 I initially submitted repository inspection, compilation, and dependency installation together through `multi_tool_use.parallel`. Those operations were not independent: compilation required both the clone and the packages to finish first. As a result, the first build job ran before `make` and `file` were installed and failed immediately.
 
@@ -20,7 +20,7 @@ After the successful build, I ran `./isoping 2>&1 | head -100`, expecting usage 
 
 I learned that a `wait` timeout is only an observation timeout and never terminates the process. That behavior is documented, but it is important enough that it may deserve extra prominence in returned timeout results, perhaps with text such as “job remains running; call jobs_kill to stop it.”
 
-### I malformed several `view` calls
+### [DONE] I malformed several `view` calls
 
 I tried to view ordinary files while passing `stream`, which is valid only for job logs. I also populated mutually exclusive or irrelevant fields with empty values (`job_id: ""`, `tail_lines: 0`) rather than omitting them. The calls failed with `stream is only valid with job_id`.
 
@@ -31,19 +31,19 @@ The distinction is:
 
 This was the clearest API usability problem. JSON-schema clients often encourage filling every property, and empty strings are not treated as absent. Separate tools such as `thundersnap_view_file` and `thundersnap_view_job`, or a discriminated union schema, would make misuse harder. More specific validation—“for file viewing, omit stream and job_id; empty values still count as supplied”—would also help.
 
-### The large parallel tool call amplified mistakes
+### [DONE] The large parallel tool call amplified mistakes
 
 I bundled too many calls into one `multi_tool_use.parallel` invocation, including duplicate malformed `view` attempts. Since all calls were dispatched together, I could not use the first error to correct the later calls. This created noisy failures and unnecessary work.
 
 I learned to use parallel calls only for genuinely independent, already-understood operations. For a new API or a dependency chain, smaller sequential calls are safer and usually faster overall because errors do not multiply.
 
-### Incremental job revisions required careful tracking
+### [DONE] Incremental job revisions required careful tracking
 
 For the long-running `isoping` client, `jobs` returned a conversation-level `revision`, and subsequent waits needed `after_revision` set to the latest observed value. This worked, but the relationship between the top-level revision and individual job output was initially not intuitive.
 
 I learned to retain the latest returned `revision`, then call `jobs` with the existing `job_ids`, `after_revision` equal to that revision, `until: "output"`, and a short timeout. An example showing a complete launch → incremental wait → incremental wait → kill lifecycle would be valuable.
 
-### Killing a job does not necessarily produce the program’s signal-handling summary
+### [DONE] Killing a job does not necessarily produce the program’s signal-handling summary
 
 I killed the first `isoping` process with `jobs_kill`. The captured output stopped, but `isoping` did not print its SIGINT summary. `jobs_kill` is designed for reliable process-tree teardown, not graceful application interruption.
 
@@ -67,9 +67,9 @@ For a workflow like this, I would now proceed sequentially: first list frames, t
 
 ## Potential API improvements
 
-The highest-value improvements would be a discriminated-union or split API for file viewing versus job-log viewing; clearer timeout-result messaging that explicitly says the job is still running; a documented end-to-end example for incremental output revisions; graceful signal delivery separate from forced process-tree teardown; and warnings against putting dependency chains into concurrent launch arrays.
+The highest-value improvements would be a [DONE] discriminated-union or split API for file viewing versus job-log viewing; clearer timeout-result messaging that explicitly says the job is still running; a [DONE] simpler replacement for incremental output revisions; [DONE] graceful signal delivery separate from forced process-tree teardown; and [DONE] warnings against putting dependency chains into concurrent launch arrays.
 
-### A killed `go run` job left its compiled child serving traffic
+### [DONE] A killed `go run` job left its compiled child serving traffic
 
 While iterating on the isoping web app, the server was launched as `go run ./cmd/isoping-web`. I later called `jobs_kill` on that job and launched a replacement. The replacement appeared to start successfully, but exited almost immediately with exit code 0 while an HTTP server continued answering on port 8080. Requests showed that the listener was still serving the old 1,024-byte HTML rather than the newly compiled responsive page.
 
@@ -81,7 +81,7 @@ The reliable workaround was to avoid `go run` for a long-running managed service
 
 Potential improvements include putting each job in a dedicated cgroup or PID namespace and terminating all members of that group, rather than relying only on a process tree that can change during teardown. After killing, the API could report surviving descendants or processes still holding sockets inherited from the job. Documentation could warn that compiler/runner wrappers such as `go run`, `npm`, and shell launchers are riskier for persistent services and recommend building then execing the final binary. Application examples should also check the error returned by `ListenAndServe`, since a printed startup URL does not prove that binding succeeded.
 
-### `create_file` produced a root-owned file that normal jobs could not edit
+### [DONE] `create_file` produced a root-owned file that normal jobs could not edit
 
 The report was originally written with `thundersnap_create_file`. That operation runs as root, so `/work/thundersnap/sol-mcp-report.md` was owned by root. Later, a normal `jobs` command running as the default `user` account tried to append to it and failed with `Permission denied`. I had to repeat the append as root.
 
