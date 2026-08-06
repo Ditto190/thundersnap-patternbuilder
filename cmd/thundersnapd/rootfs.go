@@ -257,16 +257,17 @@ func ensureFrameFS(rootFS string, meta *frames.Frame) error {
 	return nil
 }
 
-// configureIDDir makes the frame-local identity directory accessible to the
-// frame's default unprivileged user while keeping it private from other users.
-// It is deliberately applied even to an existing subvolume so frames created
-// by older versions (and fast forks) are repaired when they are assembled or
-// entered. The control socket itself is chmod 0666 by startControlServer.
+// configureIDDir makes the frame-local identity directory traversable but not
+// writable by unprivileged users. User-writable state belongs in the private
+// per-ref subvolumes under /id; files placed directly in /id are frame-local
+// and can disappear when a new frame is assembled. Apply this even to an
+// existing subvolume so older frames and fast forks are repaired in place.
+// The control socket itself is chmod 0666 by startControlServer.
 func configureIDDir(idPath string) {
-	if err := os.Chown(idPath, tsm.ThundersnapUID, tsm.ThundersnapGID); err != nil {
+	if err := os.Chown(idPath, 0, 0); err != nil {
 		log.Printf("Warning: failed to chown /id subvolume: %v", err)
 	}
-	if err := os.Chmod(idPath, 0700); err != nil {
+	if err := os.Chmod(idPath, 0755); err != nil {
 		log.Printf("Warning: failed to chmod /id subvolume: %v", err)
 	}
 }

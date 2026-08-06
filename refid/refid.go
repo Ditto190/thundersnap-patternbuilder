@@ -24,6 +24,7 @@ import (
 	"strings"
 
 	"github.com/tailscale/thundersnap/btrfsutil"
+	"github.com/tailscale/thundersnap/tsm"
 )
 
 // idDirName is the per-frame directory holding per-ref identity subvolumes.
@@ -48,15 +49,34 @@ func validateRefName(refName string) error {
 	return nil
 }
 
-// createSubvol creates a btrfs subvolume at path with 0700 permissions. The
-// 0700 chmod is what distinguishes it from btrfsutil.CreateSubvol: identity
-// subvolumes hold per-ref private state and must not be world-readable.
+// createSubvol creates a btrfs subvolume at path.
 func createSubvol(path string) error {
-	if err := btrfsutil.CreateSubvol(path); err != nil {
-		return err
+	return btrfsutil.CreateSubvol(path)
+}
+
+// configureIDDir keeps the top-level /id directory root-owned and
+// non-writable by frame users. Users may traverse it to reach the control
+// socket and their per-ref identity directories, but cannot put ephemeral
+// files directly in /id.
+func configureIDDir(path string) error {
+	if err := os.Chown(path, 0, 0); err != nil {
+		return fmt.Errorf("chown id directory %s: %w", path, err)
+	}
+	if err := os.Chmod(path, 0755); err != nil {
+		return fmt.Errorf("chmod id directory %s: %w", path, err)
+	}
+	return nil
+}
+
+// configureRefDir makes a per-ref identity directory private and writable by
+// the frame's default user. Apply it to existing subvolumes too so directories
+// created by older daemon versions are repaired in place.
+func configureRefDir(path string) error {
+	if err := os.Chown(path, tsm.ThundersnapUID, tsm.ThundersnapGID); err != nil {
+		return fmt.Errorf("chown ref identity directory %s: %w", path, err)
 	}
 	if err := os.Chmod(path, 0700); err != nil {
-		return fmt.Errorf("chmod subvolume %s: %w", path, err)
+		return fmt.Errorf("chmod ref identity directory %s: %w", path, err)
 	}
 	return nil
 }
@@ -88,19 +108,21 @@ func Path(framePath, refName string) string {
 	return filepath.Join(IDDir(framePath), refName)
 }
 
-// ensureIDSubvol makes sure <framePath>/id exists and is a btrfs subvolume,
-// creating it (0700) if necessary. A plain directory left over from a snapshot
-// is replaced with a fresh subvolume.
+// ensureIDSubvol makes sure <framePath>/id exists as a root-owned, 0755 btrfs
+// subvolume. A plain directory left over from a snapshot is replaced with a
+// fresh subvolume.
 func ensureIDSubvol(framePath string) error {
 	idPath := IDDir(framePath)
-	if btrfsutil.IsSubvolume(idPath) {
-		return nil
+	if !btrfsutil.IsSubvolume(idPath) {
+		// Not (yet) a subvolume: drop any leftover plain directory, then create it.
+		if err := removeIfPlainDir(idPath); err != nil {
+			return err
+		}
+		if err := createSubvol(idPath); err != nil {
+			return err
+		}
 	}
-	// Not (yet) a subvolume: drop any leftover plain directory, then create it.
-	if err := removeIfPlainDir(idPath); err != nil {
-		return err
-	}
-	return createSubvol(idPath)
+	return configureIDDir(idPath)
 }
 
 // Ensure creates the identity subvolume for refName in framePath if it does
@@ -115,15 +137,17 @@ func Ensure(framePath, refName string) error {
 		return err
 	}
 	refPath := Path(framePath, refName)
-	if btrfsutil.IsSubvolume(refPath) {
-		return nil
+	if !btrfsutil.IsSubvolume(refPath) {
+		// A leftover plain directory (e.g. from an older layout) is replaced so the
+		// ref state is always a real subvolume that snapshots exclude.
+		if err := removeIfPlainDir(refPath); err != nil {
+			return err
+		}
+		if err := createSubvol(refPath); err != nil {
+			return err
+		}
 	}
-	// A leftover plain directory (e.g. from an older layout) is replaced so the
-	// ref state is always a real subvolume that snapshots exclude.
-	if err := removeIfPlainDir(refPath); err != nil {
-		return err
-	}
-	return createSubvol(refPath)
+	return configureRefDir(refPath)
 }
 
 // Move relocates refName's identity subvolume from srcFramePath to
@@ -172,7 +196,7 @@ func Move(srcFramePath, dstFramePath, refName string) error {
 	if err := os.Rename(src, dst); err != nil {
 		return fmt.Errorf("move ref id subvolume %s -> %s: %w", src, dst, err)
 	}
-	return nil
+	return configureRefDir(dst)
 }
 
 // Remove deletes refName's identity subvolume from framePath, if present.

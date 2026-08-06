@@ -429,9 +429,11 @@ func testSnapDeleteSucceedsAndFrameIntact(t *testing.T, d *daemonInstance) {
 }
 
 // TestRefMoveAndForceDelete verifies the ref lifecycle over SSH: create a ref,
-// move it to another frame, confirm it points at the new frame, then
-// force-delete it and confirm it is gone. This exercises the daemon's ref
-// handlers (which call into refid.Ensure/Move/Remove on real btrfs) through
+// write its private identity state as the unprivileged frame user, move it to
+// another frame, confirm the state remains user-accessible there, then
+// force-delete it and confirm it is gone. It also verifies that users cannot
+// put ephemeral files directly in the root of /id. This exercises the daemon's
+// ref handlers (which call into refid.Ensure/Move/Remove on real btrfs) through
 // the SSH front door. Replaces not_e2e refid_test.go's three tests (which
 // called refid package functions directly on hand-rolled subvolumes).
 func testRefMoveAndForceDelete(t *testing.T, d *daemonInstance) {
@@ -451,6 +453,17 @@ func testRefMoveAndForceDelete(t *testing.T, d *daemonInstance) {
 		t.Errorf("moveme resolves to %q, want %q", strings.TrimSpace(out), uuidA)
 	}
 
+	// The root of /id is deliberately not user-writable: durable identity state
+	// belongs in the user-owned per-ref directory. Verify both sides using an
+	// actual user@ session rather than inspecting host-side ownership metadata.
+	out, exit, err = sshExec(t, d, "user@refmvA", "if echo misplaced > /id/misplaced 2>/dev/null; then exit 9; fi; echo private-state > /id/moveme/state && read state < /id/moveme/state && echo $state")
+	if err != nil || exit != 0 {
+		t.Fatalf("user access to /id/moveme: err=%v exit=%d out=%q", err, exit, out)
+	}
+	if !strings.Contains(out, "private-state") {
+		t.Fatalf("user could not read state written under /id/moveme: out=%q", out)
+	}
+
 	// Move the ref to B and confirm it now resolves to B.
 	if _, exit, err := sshExec(t, d, "root@refmvA", "ts ref move moveme "+uuidB); err != nil || exit != 0 {
 		t.Fatalf("ts ref move: err=%v exit=%d", err, exit)
@@ -462,7 +475,14 @@ func testRefMoveAndForceDelete(t *testing.T, d *daemonInstance) {
 	if strings.TrimSpace(out) != uuidB {
 		t.Errorf("moveme after move resolves to %q, want %q", strings.TrimSpace(out), uuidB)
 	}
-	t.Logf("ref move OK: moveme -> %s", uuidB)
+	out, exit, err = sshExec(t, d, "user@moveme", "read state < /id/moveme/state && echo $state && echo updated >> /id/moveme/state")
+	if err != nil || exit != 0 {
+		t.Fatalf("user access to moved /id/moveme: err=%v exit=%d out=%q", err, exit, out)
+	}
+	if !strings.Contains(out, "private-state") {
+		t.Fatalf("moved identity state not readable by user: out=%q", out)
+	}
+	t.Logf("ref move OK with user-writable identity state: moveme -> %s", uuidB)
 
 	// Force-delete the ref and confirm it is gone. The getopt parser does not
 	// permute flags after positionals, so --force must precede the name.
@@ -564,8 +584,9 @@ func testFrameHomeWorkSymlink(t *testing.T, d *daemonInstance) {
 func testFrameIdNotCloned(t *testing.T, d *daemonInstance) {
 
 	createFrameViaDaemon(t, d, "idclone")
-	// Write a secret into /id. /id is root-owned (the identity subvolume), so
-	// write as root.
+	// Files directly under /id are discouraged (per-ref identity state belongs
+	// under /id/<ref>), but root can still create one to verify that the whole
+	// top-level identity subvolume remains excluded from snapshots.
 	if out, exit, err := sshExec(t, d, "root@idclone", "echo super-secret > /id/secret.key"); err != nil || exit != 0 {
 		t.Fatalf("write /id/secret.key: err=%v exit=%d out=%q", err, exit, out)
 	}

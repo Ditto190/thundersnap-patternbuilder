@@ -169,9 +169,12 @@ that should always exist in precisely one frame. For example, Tailscale’s
 [tsnet](https://tailscale.com/docs/features/tsnet) library maintains
 per-node state information that uniquely identify a given node. The state
 for a given ref is in `/id/<ref>/` inside the frame the ref currently points
-to. If you move a ref to a different frame, that directory moves too (and
-all processes inside the old frame are terminated so that there’s no
-leftover key material floating around in RAM).
+to. These per-ref directories are private and writable by the frame's default
+user. The root of `/id` is deliberately not user-writable: files placed there
+are tied only to that frame and will not follow a ref, so applications should
+always put identity state in `/id/<ref>/`. If you move a ref to a different
+frame, that directory moves too (and all processes inside the old frame are
+terminated so that there’s no leftover key material floating around in RAM).
 
 This lets you do blue-green deployments for example:
 

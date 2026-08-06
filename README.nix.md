@@ -390,8 +390,10 @@ channel.
    --help` prints `unknown option: -` and the usage. To learn a
    subcommand's options, run it with no args / bad args and read the
    usage it prints, or read `cmd/ts/main.go`.
-2. **`ts` commands do not need `sudo`.** `/id` is private to the default
-   frame user, but that user owns it and can reach `/id/thunder.sock`.
+2. **`ts` commands do not need `sudo`.** The root of `/id` is not
+   user-writable, but users can traverse it to reach `/id/thunder.sock` and
+   their private, user-owned `/id/<ref>` directories. Put persistent identity
+   state in `/id/<ref>`, not directly in `/id`.
 3. **`ts go` sessions are unprivileged.** They log in as `user` (uid
    7575), `HOME=/home`, `shell` = `/bin/sh` (older `deb` ref, alpine) or
    `/bin/bash` (`debian:latest`/trixie) — not root. This is why
