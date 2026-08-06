@@ -3293,14 +3293,43 @@ func parseSourceFrames(user string, req CreateRequest) ([3]string, error) {
 	return out, nil
 }
 
-// cloneLiveFrameComponents creates a frame from live component subvolumes.
+// cloneLiveFrameComponents captures each named source frame like `ts snap -q`,
+// then builds the new frame from the captured temporary subvolumes. This both
+// records/indexes each source in the background and gives creation a stable
+// point-in-time view without waiting for content-addressable IDs.
 func cloneLiveFrameComponents(dst string, meta *frames.Frame, sources [3]string) error {
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		return err
 	}
+
+	q := globalSnapQueue
+	q.mu.Lock()
+	locked := true
+	defer func() {
+		if locked {
+			q.mu.Unlock()
+		}
+	}()
+
+	jobs := make(map[string]*snapJob)
+	for _, source := range sources {
+		if source == "" || jobs[source] != nil {
+			continue
+		}
+		job, err := q.captureSnapJobLocked(source, "", nil)
+		if err != nil {
+			return fmt.Errorf("capture source frame %s: %w", filepath.Base(source), err)
+		}
+		jobs[source] = job
+	}
+
 	rootSource := sources[0]
 	if rootSource != "" {
-		if err := btrfsSnapshot(rootSource, dst, false); err != nil {
+		rootTmp := jobs[rootSource].componentTmp(compRoot)
+		if rootTmp == "" {
+			return fmt.Errorf("source frame %s has no root component", filepath.Base(rootSource))
+		}
+		if err := btrfsSnapshot(rootTmp, dst, false); err != nil {
 			return err
 		}
 	} else if meta.Rootfs != "" {
@@ -3329,7 +3358,13 @@ func cloneLiveFrameComponents(dst string, meta *frames.Frame, sources [3]string)
 		source := sources[i+1]
 		snap := []string{meta.Home, meta.Work}[i]
 		if source != "" {
-			if err := btrfsSnapshot(filepath.Join(source, name), target, false); err != nil {
+			kind := []componentKind{compHome, compWork}[i]
+			tmp := jobs[source].componentTmp(kind)
+			if tmp == "" {
+				if err := btrfsCreateSubvol(target); err != nil {
+					return err
+				}
+			} else if err := btrfsSnapshot(tmp, target, false); err != nil {
 				return err
 			}
 		} else if snap != "" {
@@ -3342,6 +3377,9 @@ func cloneLiveFrameComponents(dst string, meta *frames.Frame, sources [3]string)
 			return err
 		}
 	}
+	q.mu.Unlock()
+	locked = false
+
 	if err := writeFrameSidecar(dst, meta); err != nil {
 		return err
 	}

@@ -787,6 +787,10 @@ type CreateStreamEvent struct {
 func doCreate(sockPath, snapshotSpec, isolation, refName string, sourceFrames ...string) (string, error) {
 	client := thunderclient.NewHTTPClient(sockPath)
 	render := newProgressRenderer()
+	quick := false
+	for _, source := range sourceFrames {
+		quick = quick || source != ""
+	}
 
 	// Build URL with streaming enabled
 	url := "http://localhost/create?stream=1"
@@ -830,7 +834,9 @@ func doCreate(sockPath, snapshotSpec, isolation, refName string, sourceFrames ..
 
 		switch {
 		case event.Type == "progress":
-			render.progress(event.Message)
+			if !quick {
+				render.progress(event.Message)
+			}
 		case event.Type == "result":
 			lastEvent = event
 		case event.Type == "" && event.Status != "":
@@ -845,7 +851,9 @@ func doCreate(sockPath, snapshotSpec, isolation, refName string, sourceFrames ..
 		return "", fmt.Errorf("read stream: %w", err)
 	}
 
-	render.finish()
+	if !quick {
+		render.finish()
+	}
 
 	// Check result
 	if lastEvent.Type != "result" {

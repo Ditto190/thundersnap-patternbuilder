@@ -245,8 +245,16 @@ func testFrameHomeWorkSpec(t *testing.T, d *daemonInstance) {
 	// Take root and home from the ref and work from the same frame addressed by
 	// UUID. This is equivalent to hwspec:hwspec:hwspec, while covering both
 	// accepted frame naming forms.
-	if out, exit, err := sshExec(t, d, "root@hwspec", "ts frame --ref=hwchild hwspec:hwspec:"+hwUUID); err != nil || exit != 0 {
-		t.Fatalf("ts frame ref:ref:uuid: err=%v exit=%d out=%q", err, exit, out)
+	frameOut, frameErr, exit, err := sshExecSplit(t, d, "root@hwspec", "ts frame --ref=hwchild hwspec:hwspec:"+hwUUID)
+	if err != nil || exit != 0 {
+		t.Fatalf("ts frame ref:ref:uuid: err=%v exit=%d stdout=%q stderr=%q", err, exit, frameOut, frameErr)
+	}
+	if frameErr != "" {
+		t.Fatalf("quick frame-component clone printed progress to stderr: %q", frameErr)
+	}
+	goOut, goErr, goExit, goRunErr := sshExecSplit(t, d, "root@hwspec", `ts go hwspec:hwspec:hwspec -c "true"`)
+	if goRunErr != nil || goExit != 0 || goErr != "" {
+		t.Fatalf("quick ts go clone: err=%v exit=%d stdout=%q stderr=%q", goRunErr, goExit, goOut, goErr)
 	}
 
 	out, exit, err := sshExec(t, d, "root@hwchild", "read r < /r.txt && read h < /home/h.txt && read w < /work/w.txt && echo $r $h $w")
@@ -257,6 +265,21 @@ func testFrameHomeWorkSpec(t *testing.T, d *daemonInstance) {
 		t.Errorf("hwchild markers = %q, want live root, home, and work markers", out)
 	} else {
 		t.Logf("hwchild has live root, home, and work content from named frame")
+	}
+
+	// Using hwspec as a component also performs a quick background snap of it.
+	// Creation did not need its content ID, but the queued index eventually
+	// records that point in the source frame's history.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		logOut, logExit, logErr := sshExec(t, d, "root@hwspec", "ts log")
+		if logErr == nil && logExit == 0 && strings.TrimSpace(logOut) != "" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("component source background snap was not recorded: err=%v exit=%d output=%q", logErr, logExit, logOut)
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 }
 
