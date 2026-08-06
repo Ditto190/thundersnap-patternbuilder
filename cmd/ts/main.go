@@ -699,14 +699,14 @@ func cmdFrame(args []string) {
 		return
 	}
 
-	// Handle empty components by inheriting from current frame, then create
-	snapshotSpec, err := resolveSnapTriplet(*sockPath, spec)
+	// Resolve snap/frame/ref components, then create.
+	snapshotSpec, sourceFrames, err := resolveFrameTriplet(*sockPath, spec)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
 
-	uuid, err := doCreate(*sockPath, snapshotSpec, *isolation, *refName)
+	uuid, err := doCreate(*sockPath, snapshotSpec, *isolation, *refName, sourceFrames[:]...)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
@@ -722,11 +722,14 @@ func frameUsage() {
 	fmt.Fprintln(os.Stderr, "       ts frame <root:home:work>           create frame from snap triplet")
 	fmt.Fprintln(os.Stderr, "       ts frame --delete <uuid>            delete a frame")
 	fmt.Fprintln(os.Stderr, "")
-	fmt.Fprintln(os.Stderr, "snap triplet syntax (exactly two colons):")
-	fmt.Fprintln(os.Stderr, "  - empty components inherit from current frame")
-	fmt.Fprintln(os.Stderr, "  - ts frame <snap>::        replace root, keep /home and /work")
-	fmt.Fprintln(os.Stderr, "  - ts frame :<snap>:        replace /home only")
-	fmt.Fprintln(os.Stderr, "  - ts frame ::              current frame (identity)")
+	fmt.Fprintln(os.Stderr, "triplet syntax (exactly two colons):")
+	fmt.Fprintln(os.Stderr, "  - each component may be a snap, frame UUID, or ref")
+	fmt.Fprintln(os.Stderr, "  - a frame/ref contributes its root, home, or work component by position")
+	fmt.Fprintln(os.Stderr, "  - empty components use the corresponding component of the current frame")
+	fmt.Fprintln(os.Stderr, "  - nil explicitly requests an empty component")
+	fmt.Fprintln(os.Stderr, "  - ts frame nil:deb:nil     empty root/work, /home from ref deb")
+	fmt.Fprintln(os.Stderr, "  - ts frame a:b:c           root from a, home from b, work from c")
+	fmt.Fprintln(os.Stderr, "  - ts frame ::              fork the current frame")
 	fmt.Fprintln(os.Stderr, "")
 	fmt.Fprintln(os.Stderr, "options:")
 	fmt.Fprintln(os.Stderr, "  --ref <name>         create a ref pointing at the new frame")
@@ -759,6 +762,9 @@ type CreateRequest struct {
 	SnapshotSpec string `json:"snapshot_spec"` // <root>:<home>:<work>
 	Isolation    string `json:"isolation,omitempty"`
 	RefName      string `json:"ref_name,omitempty"` // optional ref to create
+	RootfsFrame  string `json:"rootfs_frame,omitempty"`
+	HomeFrame    string `json:"home_frame,omitempty"`
+	WorkFrame    string `json:"work_frame,omitempty"`
 }
 
 // CreateResponse is the response from /create
@@ -778,7 +784,7 @@ type CreateStreamEvent struct {
 	Path    string `json:"path,omitempty"`
 }
 
-func doCreate(sockPath, snapshotSpec, isolation, refName string) (string, error) {
+func doCreate(sockPath, snapshotSpec, isolation, refName string, sourceFrames ...string) (string, error) {
 	client := thunderclient.NewHTTPClient(sockPath)
 	render := newProgressRenderer()
 
@@ -792,6 +798,9 @@ func doCreate(sockPath, snapshotSpec, isolation, refName string) (string, error)
 		SnapshotSpec: snapshotSpec,
 		Isolation:    isolation,
 		RefName:      refName,
+	}
+	if len(sourceFrames) == 3 {
+		req.RootfsFrame, req.HomeFrame, req.WorkFrame = sourceFrames[0], sourceFrames[1], sourceFrames[2]
 	}
 	body, err := json.Marshal(req)
 	if err != nil {
@@ -1004,47 +1013,79 @@ func doResolveFrame(sockPath, spec string) (string, error) {
 	return result.UUID, nil
 }
 
-// resolveSnapTriplet resolves a snap triplet spec by filling in empty components
-// from the current frame. Returns a fully resolved spec like "abc:def:ghi".
+// resolveSnapTriplet resolves each component as either a snap ID, a frame UUID,
+// or a ref. A frame/ref contributes its corresponding root, home, or work snap;
+// an empty component names the current frame, and "nil" remains explicitly
+// empty. Returns a snap-only spec like "abc:def:ghi".
 func resolveSnapTriplet(sockPath, spec string) (string, error) {
+	resolved, _, err := resolveFrameTriplet(sockPath, spec)
+	return resolved, err
+}
+
+// resolveFrameTriplet also returns the source frame UUID for each component.
+// The daemon uses these to clone the named frame's live component rather than
+// merely cloning the snapshot from which that frame was originally created.
+func resolveFrameTriplet(sockPath, spec string) (string, [3]string, error) {
 	parts := strings.Split(spec, ":")
 	if len(parts) != 3 {
-		return "", fmt.Errorf("invalid snap triplet: expected exactly 2 colons")
+		return "", [3]string{}, fmt.Errorf("invalid snap triplet: expected exactly 2 colons")
 	}
 
-	root, home, work := parts[0], parts[1], parts[2]
-
-	// If all three are specified, no need to look up current frame
-	if root != "" && home != "" && work != "" {
-		return spec, nil
-	}
-
-	// Get current frame info for inheritance
-	current, err := doGetCurrentFrameInfo(sockPath)
-	if err != nil {
-		return "", fmt.Errorf("get current frame for inheritance: %w", err)
-	}
-
-	// Fill in empty components from current frame
-	if root == "" {
-		root = current.Rootfs
-	}
-	if home == "" {
-		home = current.Home
-	}
-	if work == "" {
-		work = current.Work
-	}
-
-	// Format for the create API (empty strings become "nil" for that API)
-	formatSnap := func(s string) string {
-		if s == "" {
-			return "nil"
+	var sources [3]string
+	var current *GetFrameResponse
+	for i, part := range parts {
+		if part == "nil" {
+			continue
 		}
-		return s
-	}
 
-	return fmt.Sprintf("%s:%s:%s", formatSnap(root), formatSnap(home), formatSnap(work)), nil
+		var frame *GetFrameResponse
+		if part == "" {
+			if current == nil {
+				var err error
+				current, err = doGetCurrentFrameInfo(sockPath)
+				if err != nil {
+					return "", sources, fmt.Errorf("get current frame: %w", err)
+				}
+			}
+			frame = current
+			sources[i] = current.UUID
+		} else {
+			resolved, err := doResolveFrameInfo(sockPath, part)
+			if err != nil {
+				return "", sources, err
+			}
+			if !resolved.Exists {
+				continue // Not a frame or ref: leave this component as a snap ID.
+			}
+			frame = &GetFrameResponse{Rootfs: resolved.Rootfs, Home: resolved.Home, Work: resolved.Work}
+			sources[i] = resolved.UUID
+		}
+
+		switch i {
+		case 0:
+			parts[i] = frame.Rootfs
+		case 1:
+			parts[i] = frame.Home
+		case 2:
+			parts[i] = frame.Work
+		}
+		if parts[i] == "" {
+			parts[i] = "nil"
+		}
+	}
+	return strings.Join(parts, ":"), sources, nil
+}
+
+func doResolveFrameInfo(sockPath, spec string) (*ResolveFrameResponse, error) {
+	result, err := thunderclient.PostJSON[ResolveFrameRequest, ResolveFrameResponse](
+		sockPath, "/resolve-frame", ResolveFrameRequest{Spec: spec})
+	if err != nil {
+		return nil, err
+	}
+	if result.Status != "ok" {
+		return nil, fmt.Errorf("%s", result.Message)
+	}
+	return &result, nil
 }
 
 // ListFramesResponse is the response from /list-frames
@@ -2230,13 +2271,13 @@ func cmdGo(args []string) {
 			createdNewFrame = true
 			forkedFromCurrent = true
 		} else {
-			// Snap triplet - create new frame
-			snapshotSpec, err := resolveSnapTriplet(*sockPath, spec)
+			// Snap/frame/ref triplet - create new frame.
+			snapshotSpec, sourceFrames, err := resolveFrameTriplet(*sockPath, spec)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "error: %v\n", err)
 				os.Exit(1)
 			}
-			targetUUID, err = doCreate(*sockPath, snapshotSpec, parsed.isolation, "")
+			targetUUID, err = doCreate(*sockPath, snapshotSpec, parsed.isolation, "", sourceFrames[:]...)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "error: %v\n", err)
 				os.Exit(1)

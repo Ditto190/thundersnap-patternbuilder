@@ -3033,6 +3033,12 @@ type CreateRequest struct {
 	HomeSnap   string `json:"home,omitempty"`      // Home snap ID (empty = new empty subvolume)
 	WorkSnap   string `json:"work,omitempty"`      // Work snap ID (empty = new empty subvolume)
 	Isolation  string `json:"isolation,omitempty"` // "vm", "container", "none"
+
+	// Optional live frame component sources. When set, the corresponding
+	// component is cloned directly from that frame instead of from a snap.
+	RootfsFrame string `json:"rootfs_frame,omitempty"`
+	HomeFrame   string `json:"home_frame,omitempty"`
+	WorkFrame   string `json:"work_frame,omitempty"`
 }
 
 // parseFrameSpec parses a frame spec string "rootfs:home:work" into components.
@@ -3218,6 +3224,11 @@ func (c *controlServer) handleCreateWithUUID(w http.ResponseWriter, req CreateRe
 		Work:      workSpec,
 		Isolation: req.Isolation,
 	}
+	sourceFrames, err := parseSourceFrames(user, req)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, CreateResponse{Status: "error", Message: err.Error()})
+		return
+	}
 
 	// Persist the metadata sidecar through the per-user store FIRST: it writes
 	// fs/<user>/<uuid>.jsonc (stamping CreatedAt), which buildFrameFS then reads
@@ -3239,7 +3250,7 @@ func (c *controlServer) handleCreateWithUUID(w http.ResponseWriter, req CreateRe
 	}
 
 	// Assemble the frame's filesystem from the (already-written) sidecar.
-	if err := buildFrameFS(framePath, frameMeta); err != nil {
+	if err := buildFrameFS(framePath, frameMeta, sourceFrames); err != nil {
 		log.Printf("create frame failed: %v", err)
 		writeJSON(w, http.StatusInternalServerError, CreateResponse{
 			Status:  "error",
@@ -3267,6 +3278,81 @@ func (c *controlServer) handleCreateWithUUID(w http.ResponseWriter, req CreateRe
 	})
 }
 
+func parseSourceFrames(user string, req CreateRequest) ([3]string, error) {
+	var out [3]string
+	for i, value := range []string{req.RootfsFrame, req.HomeFrame, req.WorkFrame} {
+		if value == "" {
+			continue
+		}
+		id, err := frameid.Parse(value)
+		if err != nil || !userFrameStore(user).Exists(id) {
+			return out, fmt.Errorf("source frame %q not found", value)
+		}
+		out[i] = framePathForUserUUID(user, id)
+	}
+	return out, nil
+}
+
+// cloneLiveFrameComponents creates a frame from live component subvolumes.
+func cloneLiveFrameComponents(dst string, meta *frames.Frame, sources [3]string) error {
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return err
+	}
+	rootSource := sources[0]
+	if rootSource != "" {
+		if err := btrfsSnapshot(rootSource, dst, false); err != nil {
+			return err
+		}
+	} else if meta.Rootfs != "" {
+		if err := btrfsSnapshot(filepath.Join(*flagSnapsDir, meta.Rootfs), dst, false); err != nil {
+			return err
+		}
+	} else {
+		if err := btrfsCreateSubvol(dst); err != nil {
+			return err
+		}
+		if err := setupMinimalRootfs(dst); err != nil {
+			return err
+		}
+	}
+	removeComponent := func(path string) error {
+		if isSubvolume(path) {
+			return btrfsDeleteSubvol(path)
+		}
+		return os.RemoveAll(path)
+	}
+	for i, name := range []string{"home", "work"} {
+		target := filepath.Join(dst, name)
+		if err := removeComponent(target); err != nil {
+			return err
+		}
+		source := sources[i+1]
+		snap := []string{meta.Home, meta.Work}[i]
+		if source != "" {
+			if err := btrfsSnapshot(filepath.Join(source, name), target, false); err != nil {
+				return err
+			}
+		} else if snap != "" {
+			if err := btrfsSnapshot(filepath.Join(*flagSnapsDir, snap), target, false); err != nil {
+				return err
+			}
+		} else if err := btrfsCreateSubvol(target); err != nil {
+			return err
+		} else if err := os.Chown(target, tsm.ThundersnapUID, tsm.ThundersnapGID); err != nil {
+			return err
+		}
+	}
+	if err := writeFrameSidecar(dst, meta); err != nil {
+		return err
+	}
+	finalizeFrameRootfs(dst)
+	idPath := filepath.Join(dst, "id")
+	if err := removeComponent(idPath); err != nil {
+		return err
+	}
+	return btrfsCreateSubvol(idPath)
+}
+
 // handleCreateStreamingWithUUID handles streaming create for UUID-based frames.
 // The metadata sidecar has already been written by the caller via the per-user
 // frames.Store; this only assembles the filesystem and binds the optional ref.
@@ -3282,8 +3368,9 @@ func handleCreateStreamingWithUUID(w http.ResponseWriter, req CreateRequest, fra
 	// Check if this is a blank container
 	isBlank, _ := hasBlankRootfs(req.SnapshotSpec)
 
-	// For non-blank containers, check/download the rootfs snap
-	if !isBlank {
+	// For non-blank snap-based roots, check/download the rootfs snap. A live
+	// frame source is cloned directly and does not require that metadata snap.
+	if !isBlank && req.RootfsFrame == "" {
 		snapshotPath := filepath.Join(*flagSnapsDir, frameMeta.Rootfs)
 		if _, err := os.Stat(snapshotPath); err != nil {
 			// Try to download from mesh
@@ -3303,7 +3390,13 @@ func handleCreateStreamingWithUUID(w http.ResponseWriter, req CreateRequest, fra
 	pw.writeProgress("Creating frame...")
 
 	// Assemble the frame's filesystem from the (already-written) sidecar.
-	if err := buildFrameFS(framePath, frameMeta); err != nil {
+	user := filepath.Base(filepath.Dir(framePath))
+	sourceFrames, err := parseSourceFrames(user, req)
+	if err != nil {
+		pw.writeResultWithUUID("error", "", err.Error(), "")
+		return
+	}
+	if err := buildFrameFS(framePath, frameMeta, sourceFrames); err != nil {
 		pw.writeResultWithUUID("error", "", err.Error(), "")
 		return
 	}
@@ -3444,8 +3537,12 @@ func createFrame(framePath, snapshotID, homeSnap, workSnap, isolation string) er
 // (e.g. via the per-user frames.Store). Unlike createFrame, it does not write
 // the sidecar itself, so it is safe to call after frames.Store.Create without
 // colliding on fs/<user>/<uuid>.jsonc.
-func buildFrameFS(framePath string, meta *frames.Frame) error {
-	if err := ensureFrameFS(framePath, meta); err != nil {
+func buildFrameFS(framePath string, meta *frames.Frame, sourceFrames ...[3]string) error {
+	if len(sourceFrames) == 1 && (sourceFrames[0][0] != "" || sourceFrames[0][1] != "" || sourceFrames[0][2] != "") {
+		if err := cloneLiveFrameComponents(framePath, meta, sourceFrames[0]); err != nil {
+			return err
+		}
+	} else if err := ensureFrameFS(framePath, meta); err != nil {
 		return err
 	}
 	if err := copyTsBinary(framePath); err != nil {

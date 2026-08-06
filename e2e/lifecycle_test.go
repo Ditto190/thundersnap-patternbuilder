@@ -226,8 +226,14 @@ func testFrameFromSnapPreservesContent(t *testing.T, d *daemonInstance) {
 // TestWorkflowHomeWorkSeparation (which used a fake control server).
 func testFrameHomeWorkSpec(t *testing.T, d *daemonInstance) {
 
-	createFrameViaDaemon(t, d, "hwspec")
+	hwUUID := createFrameViaDaemon(t, d, "hwspec")
 
+	// Distinct live markers in every component. Do not snap before creating the
+	// child: this catches accidentally using the source frame's stale metadata
+	// snaps instead of its live component subvolumes.
+	if out, exit, err := sshExec(t, d, "root@hwspec", "echo ROOT-MARKER > /r.txt"); err != nil || exit != 0 {
+		t.Fatalf("write root marker: err=%v exit=%d out=%q", err, exit, out)
+	}
 	// Distinct markers in /home and /work (the home subvolume is /home).
 	if out, exit, err := sshExec(t, d, "root@hwspec", "echo HOME-MARKER > /home/h.txt"); err != nil || exit != 0 {
 		t.Fatalf("write home marker: err=%v exit=%d out=%q", err, exit, out)
@@ -236,23 +242,21 @@ func testFrameHomeWorkSpec(t *testing.T, d *daemonInstance) {
 		t.Fatalf("write work marker: err=%v exit=%d out=%q", err, exit, out)
 	}
 
-	triplet := tsSnapWait(t, d, "hwspec")
-	_, homeSnap, workSnap := snapTriplet(t, triplet)
-	t.Logf("hwspec snap home=%s work=%s", homeSnap, workSnap)
-
-	// New frame: empty root, but reuse the home and work snaps.
-	if _, exit, err := sshExec(t, d, "root@hwspec", "ts frame --ref=hwchild nil:"+homeSnap+":"+workSnap); err != nil || exit != 0 {
-		t.Fatalf("ts frame nil:home:work: err=%v exit=%d", err, exit)
+	// Take root and home from the ref and work from the same frame addressed by
+	// UUID. This is equivalent to hwspec:hwspec:hwspec, while covering both
+	// accepted frame naming forms.
+	if out, exit, err := sshExec(t, d, "root@hwspec", "ts frame --ref=hwchild hwspec:hwspec:"+hwUUID); err != nil || exit != 0 {
+		t.Fatalf("ts frame ref:ref:uuid: err=%v exit=%d out=%q", err, exit, out)
 	}
 
-	out, exit, err := sshExec(t, d, "root@hwchild", "read h < /home/h.txt && read w < /work/w.txt && echo $h $w")
+	out, exit, err := sshExec(t, d, "root@hwchild", "read r < /r.txt && read h < /home/h.txt && read w < /work/w.txt && echo $r $h $w")
 	if err != nil || exit != 0 {
 		t.Fatalf("read markers in hwchild: err=%v exit=%d out=%q", err, exit, out)
 	}
-	if !strings.Contains(out, "HOME-MARKER") || !strings.Contains(out, "WORK-MARKER") {
-		t.Errorf("hwchild markers = %q, want both HOME-MARKER and WORK-MARKER", out)
+	if !strings.Contains(out, "ROOT-MARKER") || !strings.Contains(out, "HOME-MARKER") || !strings.Contains(out, "WORK-MARKER") {
+		t.Errorf("hwchild markers = %q, want live root, home, and work markers", out)
 	} else {
-		t.Logf("hwchild has both home and work content from snap")
+		t.Logf("hwchild has live root, home, and work content from named frame")
 	}
 }
 
