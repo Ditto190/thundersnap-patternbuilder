@@ -2944,17 +2944,17 @@ type ListFramesResponse struct {
 	Error  string      `json:"error,omitempty"`
 }
 
-// FrameInfo contains info about a single frame
+// FrameInfo contains info about a single frame.
 type FrameInfo struct {
-	Name   string `json:"name"`
-	Status string `json:"status"` // "stopped" or number of processes
+	UUID   string   `json:"uuid"`
+	Status string   `json:"status"` // "stopped" or number of sessions
+	Refs   []string `json:"refs,omitempty"`
 }
 
 // handleListFrames handles GET /list-frames - list the requesting user's
-// frames with status. Frames are stored at fs/<user>/<uuid> with a
-// fs/<user>/<uuid>.jsonc sidecar; each is reported by its bound ref name when
-// one exists, otherwise by its UUID. Legacy non-UUID dirs are ignored by the
-// per-user frames.Store.List().
+// frames with status and all refs pointing to each frame. Frames are stored at
+// fs/<user>/<uuid> with a fs/<user>/<uuid>.jsonc sidecar. Legacy non-UUID dirs
+// are ignored by the per-user frames.Store.List().
 func (c *controlServer) handleListFrames(w http.ResponseWriter, r *http.Request) {
 	if !requireMethod(w, r, http.MethodGet) {
 		return
@@ -2981,23 +2981,23 @@ func (c *controlServer) handleListFrames(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	// Build a UUID -> ref-name map so frames are reported by their ref.
-	refByUUID := map[frameid.ID]string{}
+	// Build a UUID -> refs map. Store.List returns names alphabetically, but
+	// sort each group explicitly so this response keeps that contract even if
+	// the store implementation changes.
+	refsByUUID := map[frameid.ID][]string{}
 	if names, err := refStore.List(); err == nil {
 		for _, name := range names {
 			if ref, err := refStore.Get(name); err == nil {
-				refByUUID[ref.UUID] = name
+				refsByUUID[ref.UUID] = append(refsByUUID[ref.UUID], name)
 			}
 		}
+	}
+	for uuid := range refsByUUID {
+		sort.Strings(refsByUUID[uuid])
 	}
 
 	var frameInfos []FrameInfo
 	for _, uuid := range uuids {
-		name := uuid.String()
-		if refName, ok := refByUUID[uuid]; ok {
-			name = refName
-		}
-
 		// Determine status based on active control servers.
 		sessionCount := getActiveFrameCount(framePathForUserUUID(user, uuid))
 		status := "stopped"
@@ -3006,8 +3006,9 @@ func (c *controlServer) handleListFrames(w http.ResponseWriter, r *http.Request)
 		}
 
 		frameInfos = append(frameInfos, FrameInfo{
-			Name:   name,
+			UUID:   uuid.String(),
 			Status: status,
+			Refs:   refsByUUID[uuid],
 		})
 	}
 

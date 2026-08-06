@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/pkg/sftp"
+	"github.com/tailscale/thundersnap/frameid"
 	"github.com/tailscale/thundersnap/snaphash"
 	"golang.org/x/crypto/ssh"
 )
@@ -693,6 +694,11 @@ func testSSHContainerBasic(t *testing.T, d *daemonInstance) {
 		t.Errorf("ts frame: expected exit code 0, got %d (output: %q)", exitCode, output)
 	}
 	t.Logf("ts frame output: %s", output)
+	testFrameUUID := parseFrameUUID(t, output)
+	output, exitCode, err = sshExec(t, d, "root@", "ts ref create alpharef "+testFrameUUID)
+	if err != nil || exitCode != 0 {
+		t.Fatalf("create second ref: err=%v exit=%d output=%q", err, exitCode, output)
+	}
 
 	// Now SSH to the newly created frame
 	output, exitCode, err = sshExec(t, d, "testframe", "echo hello from testframe")
@@ -835,11 +841,51 @@ func testSSHContainerBasic(t *testing.T, d *daemonInstance) {
 	if exitCode != 0 {
 		t.Errorf("ts frames: expected exit code 0, got %d (output: %q)", exitCode, output)
 	}
-	// Should list our frame
-	if !strings.Contains(output, "testframe") {
-		t.Errorf("ts frames: expected output to contain 'testframe', got: %q", output)
+	// Every line is <stopped|n> <uuid> [refs...], with refs alphabetical.
+	wantSuffix := testFrameUUID + " alpharef testframe"
+	var referencedLine string
+	for _, line := range strings.Split(strings.TrimSpace(output), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			t.Fatalf("ts frames: malformed line %q", line)
+		}
+		if len(line) < 9 || line[7:9] != "  " {
+			t.Fatalf("ts frames: status column is not fixed-width in %q", line)
+		}
+		if _, err := frameid.Parse(fields[1]); err != nil {
+			t.Fatalf("ts frames: second field in %q is not a UUID: %v", line, err)
+		}
+		if strings.HasSuffix(line, wantSuffix) {
+			referencedLine = line
+		}
+	}
+	if referencedLine == "" {
+		t.Fatalf("ts frames: missing frame suffix %q in %q", wantSuffix, output)
 	}
 	t.Logf("ts frames output: %s", output)
+
+	// `ts refs` has the identical format, but omits unreferenced frames.
+	refsOutput, refsExit, refsErr := sshExec(t, d, "testframe", "ts refs")
+	if refsErr != nil || refsExit != 0 {
+		t.Fatalf("ts refs: err=%v exit=%d output=%q", refsErr, refsExit, refsOutput)
+	}
+	frameLines := make(map[string]bool)
+	for _, line := range strings.Split(strings.TrimSpace(output), "\n") {
+		frameLines[line] = true
+	}
+	foundReferenced := false
+	for _, line := range strings.Split(strings.TrimSpace(refsOutput), "\n") {
+		if !frameLines[line] {
+			t.Fatalf("ts refs line %q is not identical to a ts frames line", line)
+		}
+		if len(strings.Fields(line)) < 3 {
+			t.Fatalf("ts refs included frame without refs: %q", line)
+		}
+		foundReferenced = foundReferenced || line == referencedLine
+	}
+	if !foundReferenced {
+		t.Fatalf("ts refs missing %q in %q", referencedLine, refsOutput)
+	}
 
 	// Test session count: open a long-running session and verify ts frames
 	// reports the active session count correctly.

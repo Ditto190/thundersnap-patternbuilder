@@ -1056,8 +1056,9 @@ type ListFramesResponse struct {
 
 // FrameInfo contains info about a single frame
 type FrameInfo struct {
-	Name   string `json:"name"`
-	Status string `json:"status"` // "stopped" or "running"
+	UUID   string   `json:"uuid"`
+	Status string   `json:"status"` // "stopped" or number of sessions
+	Refs   []string `json:"refs,omitempty"`
 }
 
 func doListFrames(sockPath string) error {
@@ -1078,17 +1079,28 @@ func doListFrames(sockPath string) error {
 		return fmt.Errorf("%s", result.Error)
 	}
 
-	// Sort by name for consistent output
-	sort.Slice(result.Frames, func(i, j int) bool {
-		return result.Frames[i].Name < result.Frames[j].Name
-	})
-
-	// Print with fixed-width status column
-	for _, frame := range result.Frames {
-		fmt.Printf("%-7s  %s\n", frame.Status, frame.Name)
-	}
+	printFrames(result.Frames, false)
 
 	return nil
+}
+
+// printFrames emits the common `frames`/`refs` format. Frames are sorted by
+// UUID and refs within a frame are sorted alphabetically.
+func printFrames(frames []FrameInfo, refsOnly bool) {
+	sort.Slice(frames, func(i, j int) bool {
+		return frames[i].UUID < frames[j].UUID
+	})
+	for _, frame := range frames {
+		if refsOnly && len(frame.Refs) == 0 {
+			continue
+		}
+		sort.Strings(frame.Refs)
+		fmt.Printf("%-7s  %s", frame.Status, frame.UUID)
+		for _, ref := range frame.Refs {
+			fmt.Printf(" %s", ref)
+		}
+		fmt.Println()
+	}
 }
 
 func cmdWhoHas(args []string) {
@@ -1813,22 +1825,21 @@ func getRefs(sockPath string) ([]RefListEntry, error) {
 }
 
 func doListRefs(sockPath string) error {
-	refs, err := getRefs(sockPath)
+	client := thunderclient.NewHTTPClient(sockPath)
+	resp, err := client.Get("http://localhost/list-frames")
 	if err != nil {
-		return err
+		return fmt.Errorf("request failed: %w", err)
 	}
-	if len(refs) == 0 {
-		fmt.Println("(no refs)")
-		return nil
-	}
+	defer resp.Body.Close()
 
-	for _, ref := range refs {
-		if len(ref.Autorun) > 0 {
-			fmt.Printf("%s -> %s [autorun: %s]\n", ref.Name, ref.UUID, strings.Join(ref.Autorun, " "))
-		} else {
-			fmt.Printf("%s -> %s\n", ref.Name, ref.UUID)
-		}
+	var result ListFramesResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return fmt.Errorf("decode response: %w", err)
 	}
+	if result.Status != "ok" {
+		return fmt.Errorf("%s", result.Error)
+	}
+	printFrames(result.Frames, true)
 	return nil
 }
 

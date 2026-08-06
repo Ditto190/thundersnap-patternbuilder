@@ -15,7 +15,7 @@ import (
 )
 
 // TestAutorunBasic tests that the ts autorun command correctly stores the
-// autorun configuration and that it's displayed in ts refs.
+// autorun configuration and that it's displayed by ts autoruns.
 func testAutorunBasic(t *testing.T, d *daemonInstance) {
 
 	// Create frame via daemon (true e2e - no manual data structure manipulation)
@@ -47,24 +47,16 @@ func testAutorunBasic(t *testing.T, d *daemonInstance) {
 		t.Errorf("ts autorun printed output on success: %q", output)
 	}
 
-	// Verify the autorun is listed via ts refs
-	output, exitCode, err = sshExec(t, d, "root@autoref", "ts refs")
-	if err != nil {
-		t.Fatalf("ts refs failed: %v", err)
+	// Verify the autorun is listed via ts autoruns. `ts refs` is deliberately
+	// limited to frame status, UUID, and ref names.
+	output, exitCode, err = sshExec(t, d, "root@autoref", "ts autoruns")
+	if err != nil || exitCode != 0 {
+		t.Fatalf("ts autoruns failed: exit=%d err=%v output=%s", exitCode, err, output)
 	}
-	if exitCode != 0 {
-		t.Fatalf("ts refs returned exit code %d: %s", exitCode, output)
-	}
-	// The output should show the autorun config
-	if !strings.Contains(output, "autorun:") {
-		t.Errorf("expected autorun to be shown in refs output, got: %s", output)
-	}
-	// The autorun command might be displayed with or without quotes depending on how
-	// the daemon serializes it. Check for the essential parts.
 	if !strings.Contains(output, "/bin/sh") || !strings.Contains(output, "echo hello") {
-		t.Errorf("expected autorun command in refs output, got: %s", output)
+		t.Errorf("expected autorun command in autoruns output, got: %s", output)
 	}
-	t.Logf("ts refs (after autorun set): %s", output)
+	t.Logf("ts autoruns (after autorun set): %s", output)
 }
 
 // TestAutorunRefMove tests that when a ref is moved, the reflog records the move.
@@ -86,13 +78,10 @@ func testAutorunRefMove(t *testing.T, d *daemonInstance) {
 	}
 	t.Logf("Set autorun on moveref: %s", output)
 
-	// Verify autorun is shown
-	output, exitCode, err = sshExec(t, d, "root@moveref", "ts refs")
-	if err != nil || exitCode != 0 {
-		t.Fatalf("ts refs failed: exit=%d err=%v output=%s", exitCode, err, output)
-	}
-	if !strings.Contains(output, "autorun:") {
-		t.Errorf("expected autorun in refs, got: %s", output)
+	// Verify autorun is shown.
+	output, exitCode, err = sshExec(t, d, "root@moveref", "ts autoruns")
+	if err != nil || exitCode != 0 || !strings.Contains(output, "echo running") {
+		t.Fatalf("ts autoruns failed: exit=%d err=%v output=%s", exitCode, err, output)
 	}
 
 	// Now move the ref to frame2 using ts ref move
@@ -114,11 +103,11 @@ func testAutorunRefMove(t *testing.T, d *daemonInstance) {
 	if !strings.Contains(output, frameUUID2) {
 		t.Errorf("expected ref to point to %s, got: %s", frameUUID2, output)
 	}
-	// Autorun config should still be there
-	if !strings.Contains(output, "autorun:") {
-		t.Errorf("expected autorun to persist after move, got: %s", output)
-	}
 	t.Logf("Refs after move: %s", output)
+	output, exitCode, err = sshExec(t, d, "root@moveref", "ts autoruns")
+	if err != nil || exitCode != 0 || !strings.Contains(output, "echo running") {
+		t.Errorf("expected autorun to persist after move: exit=%d err=%v output=%s", exitCode, err, output)
+	}
 
 	// Verify reflog shows the move
 	output, exitCode, err = sshExec(t, d, "root@moveref", "ts reflog moveref")
@@ -143,7 +132,7 @@ func testAutorunStop(t *testing.T, d *daemonInstance) {
 	createFrameViaDaemon(t, d, "stopref")
 
 	// Set autorun
-	autorunScript := "ts autorun --ref stopref /bin/sh -c 'echo hello'"
+	autorunScript := "ts autorun --ref stopref /bin/sh -c 'echo stop-marker'"
 	output, exitCode, err := sshExec(t, d, "root@stopref", autorunScript)
 	if err != nil {
 		t.Fatalf("ts autorun failed: %v", err)
@@ -152,15 +141,11 @@ func testAutorunStop(t *testing.T, d *daemonInstance) {
 		t.Fatalf("ts autorun returned exit code %d: %s", exitCode, output)
 	}
 
-	// Verify autorun is shown in refs
-	output, exitCode, err = sshExec(t, d, "root@stopref", "ts refs")
-	if err != nil {
-		t.Fatalf("ts refs failed: %v", err)
+	// Verify autorun is shown.
+	output, exitCode, err = sshExec(t, d, "root@stopref", "ts autoruns")
+	if err != nil || exitCode != 0 || !strings.Contains(output, "echo stop-marker") {
+		t.Fatalf("autorun not shown: exit=%d err=%v output=%s", exitCode, err, output)
 	}
-	if !strings.Contains(output, "autorun:") {
-		t.Errorf("autorun not shown in refs output: %s", output)
-	}
-	t.Logf("Refs before stop: %s", output)
 
 	// Now stop the autorun
 	output, exitCode, err = sshExec(t, d, "root@stopref", "ts autorun --ref stopref --stop")
@@ -172,18 +157,14 @@ func testAutorunStop(t *testing.T, d *daemonInstance) {
 	}
 	t.Logf("Stopped autorun: %s", output)
 
-	// Verify autorun is no longer shown in refs
-	output, exitCode, err = sshExec(t, d, "root@stopref", "ts refs")
-	if err != nil {
-		t.Fatalf("ts refs failed: %v", err)
+	// Verify autorun is no longer shown.
+	output, exitCode, err = sshExec(t, d, "root@stopref", "ts autoruns")
+	if err != nil || exitCode != 0 {
+		t.Fatalf("ts autoruns failed: exit=%d err=%v output=%s", exitCode, err, output)
 	}
-	// Check if the autorun config is actually still there for stopref specifically
-	for _, line := range strings.Split(output, "\n") {
-		if strings.Contains(line, "stopref") && strings.Contains(line, "autorun:") {
-			t.Errorf("autorun should be cleared for stopref, but refs still shows: %s", line)
-		}
+	if strings.Contains(output, "echo stop-marker") {
+		t.Errorf("autorun should be cleared, got: %s", output)
 	}
-	t.Logf("Refs after stop:\n%s", output)
 }
 
 // TestAutorunWithNonExistentRef tests that setting autorun on a non-existent ref fails.
@@ -207,7 +188,8 @@ func testAutorunWithNonExistentRef(t *testing.T, d *daemonInstance) {
 	t.Logf("Autorun on non-existent ref (exit %d): %s", exitCode, output)
 }
 
-// TestAutorunShowsInRefs tests that refs with autorun configs are displayed correctly.
+// TestAutorunShowsInRefs tests that refs remain listed independently of autorun
+// configuration and that the configured command appears in ts autoruns.
 func testAutorunShowsInRefs(t *testing.T, d *daemonInstance) {
 
 	// Create two frames via daemon (true e2e - no manual data structure manipulation)
@@ -226,30 +208,16 @@ func testAutorunShowsInRefs(t *testing.T, d *daemonInstance) {
 		t.Fatalf("ts refs failed: exit=%d err=%v output=%s", exitCode, err, output)
 	}
 
-	lines := strings.Split(strings.TrimSpace(output), "\n")
-	var foundWithAutorun, foundWithoutAutorun bool
-	for _, line := range lines {
-		if strings.Contains(line, "ref-with-autorun") {
-			foundWithAutorun = true
-			if !strings.Contains(line, "autorun:") {
-				t.Errorf("ref-with-autorun should show autorun config, got: %s", line)
-			}
-		}
-		if strings.Contains(line, "ref-without-autorun") {
-			foundWithoutAutorun = true
-			if strings.Contains(line, "autorun:") {
-				t.Errorf("ref-without-autorun should NOT show autorun config, got: %s", line)
-			}
-		}
+	if !strings.Contains(output, "ref-with-autorun") || !strings.Contains(output, "ref-without-autorun") {
+		t.Errorf("both refs should be listed: %s", output)
 	}
-
-	if !foundWithAutorun {
-		t.Errorf("ref-with-autorun not found in output: %s", output)
+	if strings.Contains(output, "autorun:") {
+		t.Errorf("refs output should contain only frame fields: %s", output)
 	}
-	if !foundWithoutAutorun {
-		t.Errorf("ref-without-autorun not found in output: %s", output)
+	output, exitCode, err = sshExec(t, d, "root@ref-with-autorun", "ts autoruns")
+	if err != nil || exitCode != 0 || !strings.Contains(output, "echo test") {
+		t.Errorf("configured command missing from autoruns: exit=%d err=%v output=%s", exitCode, err, output)
 	}
-	t.Logf("Refs output:\n%s", output)
 }
 
 // TestAutorunMultiWordCommand tests that autorun commands with multiple arguments
