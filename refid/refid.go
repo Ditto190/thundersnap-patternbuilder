@@ -150,6 +150,34 @@ func Ensure(framePath, refName string) error {
 	return configureRefDir(refPath)
 }
 
+// RepairOwnership reapplies the ownership contract to a frame's existing /id
+// tree. The daemon calls this whenever it prepares a frame for entry so
+// per-ref subvolumes created by older versions are repaired without requiring
+// the ref to be recreated or moved. Non-directory entries such as
+// thunder.sock are ignored.
+func RepairOwnership(framePath string) error {
+	if err := ensureIDSubvol(framePath); err != nil {
+		return err
+	}
+	entries, err := os.ReadDir(IDDir(framePath))
+	if err != nil {
+		return fmt.Errorf("read id directory: %w", err)
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		path := Path(framePath, entry.Name())
+		if !btrfsutil.IsSubvolume(path) {
+			continue
+		}
+		if err := configureRefDir(path); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // Move relocates refName's identity subvolume from srcFramePath to
 // dstFramePath, preserving its contents. If the source subvolume does not
 // exist, Move ensures a fresh empty one at the destination instead (the ref had

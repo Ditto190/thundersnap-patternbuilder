@@ -13,6 +13,7 @@ import (
 	"strings"
 
 	"github.com/tailscale/thundersnap/frames"
+	"github.com/tailscale/thundersnap/refid"
 	"github.com/tailscale/thundersnap/tsm"
 )
 
@@ -23,6 +24,11 @@ import (
 func prepareContainerRootFS(rootFS, baseUserFS string) error {
 	if err := ensureRootFS(rootFS, baseUserFS); err != nil {
 		return fmt.Errorf("set up root filesystem: %w", err)
+	}
+	// Frame entry is the upgrade boundary for persistent identity subvolumes:
+	// repair /id and every existing /id/<ref> before starting a user session.
+	if err := refid.RepairOwnership(rootFS); err != nil {
+		return fmt.Errorf("repair identity directory ownership: %w", err)
 	}
 
 	// Ensure /proc mount point exists in the rootfs

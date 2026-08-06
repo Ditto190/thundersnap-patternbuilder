@@ -464,6 +464,20 @@ func testRefMoveAndForceDelete(t *testing.T, d *daemonInstance) {
 		t.Fatalf("user could not read state written under /id/moveme: out=%q", out)
 	}
 
+	// Simulate an identity subvolume left root-owned by an older daemon. The
+	// next frame entry must repair it before starting the user@ session.
+	installBusyboxAppletInFrame(t, d, "refmvA", "chown")
+	if out, exit, err := sshExec(t, d, "root@refmvA", "chown 0:0 /id/moveme"); err != nil || exit != 0 {
+		t.Fatalf("make legacy root-owned /id/moveme: err=%v exit=%d out=%q", err, exit, out)
+	}
+	out, exit, err = sshExec(t, d, "user@refmvA", "echo repaired >> /id/moveme/state && read state < /id/moveme/state && echo $state")
+	if err != nil || exit != 0 {
+		t.Fatalf("frame entry did not repair /id/moveme: err=%v exit=%d out=%q", err, exit, out)
+	}
+	if !strings.Contains(out, "private-state") {
+		t.Fatalf("repaired identity state not readable by user: out=%q", out)
+	}
+
 	// Move the ref to B and confirm it now resolves to B.
 	if _, exit, err := sshExec(t, d, "root@refmvA", "ts ref move moveme "+uuidB); err != nil || exit != 0 {
 		t.Fatalf("ts ref move: err=%v exit=%d", err, exit)
